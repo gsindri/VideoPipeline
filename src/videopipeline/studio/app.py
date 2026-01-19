@@ -5,59 +5,16 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
-import yaml
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..analysis_audio import compute_audio_analysis
+from ..analysis_highlights import compute_highlights_analysis
 from ..project import Project, add_selection, create_or_load_project, get_project_data, load_npz
+from ..profile import load_profile
 from .jobs import JOB_MANAGER
 from .range import ranged_file_response
-
-
-def load_profile(profile_path: Optional[Path]) -> Dict[str, Any]:
-    if profile_path is None:
-        # Built-in default gaming profile
-        return {
-            "analysis": {
-                "audio": {
-                    "sample_rate": 16000,
-                    "hop_seconds": 0.5,
-                    "smooth_seconds": 3.0,
-                    "top": 12,
-                    "min_gap_seconds": 20.0,
-                    "pre_seconds": 8.0,
-                    "post_seconds": 22.0,
-                    "skip_start_seconds": 10.0,
-                }
-            },
-            "export": {
-                "template": "vertical_blur",
-                "width": 1080,
-                "height": 1920,
-                "fps": 30,
-                "crf": 20,
-                "preset": "veryfast",
-                "normalize_audio": False,
-            },
-            "captions": {
-                "enabled": False,
-                "model_size": "small",
-                "language": None,
-                "device": "cpu",
-                "compute_type": "int8",
-            },
-        }
-
-    profile_path = Path(profile_path)
-    if not profile_path.exists():
-        raise FileNotFoundError(f"Profile not found: {profile_path}")
-
-    data = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("Profile YAML must be a mapping")
-    return data
 
 
 def create_app(
@@ -120,6 +77,42 @@ def create_app(
         threading.Thread(target=runner, daemon=True).start()
         return JSONResponse({"job_id": job.id})
 
+    @app.post("/api/analyze/highlights")
+    def api_analyze_highlights(body: Dict[str, Any] = Body(default={})):  # type: ignore[valid-type]
+        analysis_cfg = profile.get("analysis", {})
+        body = body or {}
+        audio_cfg = {**analysis_cfg.get("audio", {}), **(body.get("audio") or {})}
+        motion_cfg = {**analysis_cfg.get("motion", {}), **(body.get("motion") or {})}
+        scenes_cfg = {**analysis_cfg.get("scenes", {}), **(body.get("scenes") or {})}
+        highlights_cfg = {**analysis_cfg.get("highlights", {}), **(body.get("highlights") or {})}
+
+        job = JOB_MANAGER.create("analyze_highlights")
+
+        def runner() -> None:
+            JOB_MANAGER._set(job, status="running", progress=0.0, message="analyzing highlights")  # type: ignore[attr-defined]
+
+            def on_prog(frac: float) -> None:
+                JOB_MANAGER._set(job, progress=frac, message="analyzing highlights")  # type: ignore[attr-defined]
+
+            try:
+                result = compute_highlights_analysis(
+                    proj,
+                    audio_cfg=audio_cfg,
+                    motion_cfg=motion_cfg,
+                    scenes_cfg=scenes_cfg,
+                    highlights_cfg=highlights_cfg,
+                    include_chat=True,
+                    on_progress=on_prog,
+                )
+                JOB_MANAGER._set(job, status="succeeded", progress=1.0, message="done", result=result)  # type: ignore[attr-defined]
+            except Exception as e:
+                JOB_MANAGER._set(job, status="failed", message=f"{type(e).__name__}: {e}")  # type: ignore[attr-defined]
+
+        import threading
+
+        threading.Thread(target=runner, daemon=True).start()
+        return JSONResponse({"job_id": job.id})
+
     @app.get("/api/audio/timeline")
     def api_audio_timeline(max_points: int = 2000) -> JSONResponse:
         if not proj.audio_features_path.exists():
@@ -144,6 +137,36 @@ def create_app(
             proj_data.get("analysis", {})
             .get("audio", {})
             .get("config", {})
+            .get("hop_seconds", profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
+        )
+
+        return JSONResponse({"ok": True, "hop_seconds": hop_s, "indices": idx.tolist(), "scores": down.tolist()})
+
+    @app.get("/api/highlights/timeline")
+    def api_highlights_timeline(max_points: int = 2000) -> JSONResponse:
+        if not proj.highlights_features_path.exists():
+            return JSONResponse({"ok": False, "reason": "no_highlights_analysis"}, status_code=404)
+
+        data = load_npz(proj.highlights_features_path)
+        scores = data.get("combined_scores")
+        if scores is None:
+            return JSONResponse({"ok": False, "reason": "missing_scores"}, status_code=404)
+
+        scores = scores.astype(float)
+        n = len(scores)
+        if n <= 0:
+            return JSONResponse({"ok": False, "reason": "empty"}, status_code=404)
+
+        step = max(1, int(n / max(1, int(max_points))))
+        idx = np.arange(0, n, step)
+        down = scores[idx]
+
+        proj_data = get_project_data(proj)
+        hop_s = float(
+            proj_data.get("analysis", {})
+            .get("highlights", {})
+            .get("config", {})
+            .get("audio", {})
             .get("hop_seconds", profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
         )
 
