@@ -10,9 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from ..exporter import ExportSpec, run_ffmpeg_export
-from ..project import Project, record_export
-from ..subtitles import write_ass
+from ..exporter import ExportSpec, HookTextSpec, LayoutPipSpec, run_ffmpeg_export
+from ..layouts import get_facecam_rect
+from ..metadata import build_metadata, derive_hook_text, write_metadata
+from ..project import Project, get_project_data, record_export
+from ..subtitles import SubtitleSegment, write_ass
 from ..transcribe import TranscribeConfig, WhisperNotInstalledError, load_transcript_json, save_transcript_json, transcribe_segment
 
 
@@ -95,6 +97,8 @@ class JobManager:
         preset: str,
         normalize_audio: bool,
         whisper_cfg: Optional[TranscribeConfig] = None,
+        hook_cfg: Optional[Dict[str, Any]] = None,
+        pip_cfg: Optional[Dict[str, Any]] = None,
     ) -> Job:
         job = self.create("export")
 
@@ -109,25 +113,48 @@ class JobManager:
                 export_dir.mkdir(parents=True, exist_ok=True)
                 out_path = export_dir / f"{sel_id}_{template}_{width}x{height}.mp4"
 
+                proj_data = get_project_data(proj)
+                facecam = get_facecam_rect(proj_data.get("layout", {}))
+
                 subtitles_ass = None
+                segments: Optional[list[SubtitleSegment]] = None
                 if with_captions:
                     self._set(job, message="transcribing")
                     # Cache transcript per selection
                     tjson = proj.analysis_dir / "transcripts" / f"{sel_id}_{int(start_s)}_{int(end_s)}.json"
                     if tjson.exists():
-                        segs = load_transcript_json(tjson)
+                        segments = load_transcript_json(tjson)
                     else:
                         if whisper_cfg is None:
                             whisper_cfg_local = TranscribeConfig()
                         else:
                             whisper_cfg_local = whisper_cfg
 
-                        segs = transcribe_segment(video_path, start_s=start_s, end_s=end_s, cfg=whisper_cfg_local)
-                        save_transcript_json(tjson, segs, whisper_cfg_local)
+                        segments = transcribe_segment(video_path, start_s=start_s, end_s=end_s, cfg=whisper_cfg_local)
+                        save_transcript_json(tjson, segments, whisper_cfg_local)
 
                     self._set(job, message="rendering captions")
                     ass_path = proj.analysis_dir / "subtitles" / f"{sel_id}.ass"
-                    subtitles_ass = write_ass(segs, ass_path, playres_x=width, playres_y=height)
+                    subtitles_ass = write_ass(segments or [], ass_path, playres_x=width, playres_y=height)
+                else:
+                    tjson = proj.analysis_dir / "transcripts" / f"{sel_id}_{int(start_s)}_{int(end_s)}.json"
+                    if tjson.exists():
+                        segments = load_transcript_json(tjson)
+
+                hook_spec = None
+                if hook_cfg and bool(hook_cfg.get("enabled", False)):
+                    hook_text = hook_cfg.get("text")
+                    if not hook_text:
+                        hook_text = derive_hook_text(selection, segments)
+                    if hook_text:
+                        hook_spec = HookTextSpec(
+                            enabled=True,
+                            duration_seconds=float(hook_cfg.get("duration_seconds", 2.0)),
+                            text=str(hook_text),
+                            font=str(hook_cfg.get("font", "auto")),
+                            fontsize=int(hook_cfg.get("fontsize", 64)),
+                            y=int(hook_cfg.get("y", 120)),
+                        )
 
                 spec = ExportSpec(
                     video_path=video_path,
@@ -142,12 +169,24 @@ class JobManager:
                     preset=preset,
                     subtitles_ass=subtitles_ass,
                     normalize_audio=normalize_audio,
+                    layout_facecam=facecam,
+                    layout_pip=LayoutPipSpec(**pip_cfg) if pip_cfg else None,
+                    hook_text=hook_spec,
                 )
 
                 def on_prog(frac: float, msg: str) -> None:
                     self._set(job, progress=frac, message=msg)
 
                 run_ffmpeg_export(spec, on_progress=on_prog)
+
+                metadata = build_metadata(
+                    selection=selection,
+                    output_path=out_path,
+                    template=template,
+                    with_captions=with_captions,
+                    segments=segments,
+                )
+                write_metadata(out_path.with_suffix(".metadata.json"), metadata)
 
                 record_export(
                     proj,
@@ -159,6 +198,74 @@ class JobManager:
                 )
 
                 self._set(job, status="succeeded", progress=1.0, message="done", result={"output": str(out_path)})
+            except WhisperNotInstalledError as e:
+                self._set(job, status="failed", message=str(e), result={})
+            except Exception as e:
+                self._set(job, status="failed", message=f"{type(e).__name__}: {e}", result={})
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+        return job
+
+    def start_export_batch(
+        self,
+        *,
+        proj: Project,
+        selections: list[Dict[str, Any]],
+        export_dir: Path,
+        with_captions: bool,
+        template: str,
+        width: int,
+        height: int,
+        fps: int,
+        crf: int,
+        preset: str,
+        normalize_audio: bool,
+        whisper_cfg: Optional[TranscribeConfig] = None,
+        hook_cfg: Optional[Dict[str, Any]] = None,
+        pip_cfg: Optional[Dict[str, Any]] = None,
+    ) -> Job:
+        job = self.create("export_batch")
+
+        def runner() -> None:
+            total = max(1, len(selections))
+            self._set(job, status="running", progress=0.0, message=f"exporting 0/{total}")
+            try:
+                for idx, selection in enumerate(selections, start=1):
+                    subjob = self.start_export(
+                        proj=proj,
+                        selection=selection,
+                        export_dir=export_dir,
+                        with_captions=with_captions,
+                        template=template or selection.get("template") or "vertical_blur",
+                        width=width,
+                        height=height,
+                        fps=fps,
+                        crf=crf,
+                        preset=preset,
+                        normalize_audio=normalize_audio,
+                        whisper_cfg=whisper_cfg,
+                        hook_cfg=hook_cfg,
+                        pip_cfg=pip_cfg,
+                    )
+
+                    while True:
+                        time.sleep(0.2)
+                        job_child = self.get(subjob.id)
+                        if job_child is None:
+                            break
+                        if job_child.status in {"succeeded", "failed"}:
+                            break
+                        frac = (idx - 1 + job_child.progress) / total
+                        self._set(job, progress=frac, message=f"exporting {idx}/{total}")
+
+                    job_child = self.get(subjob.id)
+                    if job_child and job_child.status == "failed":
+                        raise RuntimeError(job_child.message)
+
+                    self._set(job, progress=idx / total, message=f"exporting {idx}/{total}")
+
+                self._set(job, status="succeeded", progress=1.0, message="done", result={"count": len(selections)})
             except WhisperNotInstalledError as e:
                 self._set(job, status="failed", message=str(e), result={})
             except Exception as e:

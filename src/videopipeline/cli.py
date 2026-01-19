@@ -4,14 +4,17 @@ import argparse
 import json
 import webbrowser
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from .analysis_chat import compute_chat_analysis
 from .analysis_highlights import compute_highlights_analysis
 from .doctor import run_doctor
-from .exporter import ExportSpec, run_ffmpeg_export
+from .exporter import ExportSpec, HookTextSpec, LayoutPipSpec, run_ffmpeg_export
+from .layouts import get_facecam_rect
+from .metadata import build_metadata, derive_hook_text, write_metadata
 from .profile import load_profile
-from .project import create_or_load_project, get_project_data
+from .project import add_selection_from_candidate, create_or_load_project, get_project_data
+from .transcribe import TranscribeConfig, load_transcript_json, save_transcript_json, transcribe_segment
 
 
 def _fmt_time(seconds: float) -> str:
@@ -101,6 +104,128 @@ def cmd_export(args: argparse.Namespace) -> None:
     print("\nDone:", spec.output_path)
 
 
+def cmd_export_top(args: argparse.Namespace) -> None:
+    proj = create_or_load_project(args.video)
+    profile = load_profile(args.profile)
+    proj_data = get_project_data(proj)
+
+    highlights = proj_data.get("analysis", {}).get("highlights", {})
+    candidates = highlights.get("candidates") or []
+    if not candidates:
+        analysis_cfg = profile.get("analysis", {})
+        payload = compute_highlights_analysis(
+            proj,
+            audio_cfg=analysis_cfg.get("audio", {}),
+            motion_cfg=analysis_cfg.get("motion", {}),
+            scenes_cfg=analysis_cfg.get("scenes", {}),
+            highlights_cfg=analysis_cfg.get("highlights", {}),
+            include_chat=True,
+        )
+        candidates = payload.get("candidates", [])
+
+    top_n = max(1, int(args.top))
+    template = args.template or profile.get("export", {}).get("template", "vertical_blur")
+
+    facecam = get_facecam_rect(proj_data.get("layout", {}))
+    pip_cfg = profile.get("layout", {}).get("pip", {})
+    hook_cfg = profile.get("overlay", {}).get("hook_text", {})
+    export_cfg = profile.get("export", {})
+
+    created: list[dict[str, Any]] = []
+    for cand in candidates[:top_n]:
+        sel_id = add_selection_from_candidate(proj, candidate=cand, template=template, title="")
+        created.append(
+            {
+                "id": sel_id,
+                "start_s": cand["start_s"],
+                "end_s": cand["end_s"],
+                "template": template,
+                "candidate_rank": cand.get("rank"),
+                "candidate_score": cand.get("score"),
+                "candidate_peak_time_s": cand.get("peak_time_s"),
+            }
+        )
+
+    for idx, selection in enumerate(created, start=1):
+        start_s = float(selection["start_s"])
+        end_s = float(selection["end_s"])
+        out_path = proj.exports_dir / (
+            f"{selection['id']}_{template}_{export_cfg.get('width', 1080)}x{export_cfg.get('height', 1920)}.mp4"
+        )
+
+        segments = None
+        if args.with_captions:
+            cfg = TranscribeConfig(
+                model_size=str(profile.get("captions", {}).get("model_size", "small")),
+                language=profile.get("captions", {}).get("language"),
+                device=str(profile.get("captions", {}).get("device", "cpu")),
+                compute_type=str(profile.get("captions", {}).get("compute_type", "int8")),
+            )
+            tjson = proj.analysis_dir / "transcripts" / f"{selection['id']}_{int(start_s)}_{int(end_s)}.json"
+            if tjson.exists():
+                segments = load_transcript_json(tjson)
+            else:
+                segments = transcribe_segment(proj.video_path, start_s=start_s, end_s=end_s, cfg=cfg)
+                save_transcript_json(tjson, segments, cfg)
+            ass_path = proj.analysis_dir / "subtitles" / f"{selection['id']}.ass"
+            from .subtitles import write_ass
+
+            subtitles_ass = write_ass(
+                segments,
+                ass_path,
+                playres_x=int(export_cfg.get("width", 1080)),
+                playres_y=int(export_cfg.get("height", 1920)),
+            )
+        else:
+            subtitles_ass = None
+
+        hook_spec = None
+        if hook_cfg.get("enabled", False):
+            hook_text = hook_cfg.get("text") or derive_hook_text(selection, segments)
+            if hook_text:
+                hook_spec = HookTextSpec(
+                    enabled=True,
+                    duration_seconds=float(hook_cfg.get("duration_seconds", 2.0)),
+                    text=str(hook_text),
+                    font=str(hook_cfg.get("font", "auto")),
+                    fontsize=int(hook_cfg.get("fontsize", 64)),
+                    y=int(hook_cfg.get("y", 120)),
+                )
+
+        spec = ExportSpec(
+            video_path=proj.video_path,
+            start_s=start_s,
+            end_s=end_s,
+            output_path=out_path,
+            template=template,
+            width=int(export_cfg.get("width", 1080)),
+            height=int(export_cfg.get("height", 1920)),
+            fps=int(export_cfg.get("fps", 30)),
+            crf=int(export_cfg.get("crf", 20)),
+            preset=str(export_cfg.get("preset", "veryfast")),
+            normalize_audio=bool(export_cfg.get("normalize_audio", False)),
+            subtitles_ass=subtitles_ass,
+            layout_facecam=facecam,
+            layout_pip=LayoutPipSpec(**pip_cfg) if pip_cfg else None,
+            hook_text=hook_spec,
+        )
+
+        def on_prog(frac: float, msg: str) -> None:
+            pct = int(frac * 100)
+            print(f"\r[{idx}/{len(created)}] {pct:3d}% {msg:10s}", end="", flush=True)
+
+        run_ffmpeg_export(spec, on_progress=on_prog)
+        metadata = build_metadata(
+            selection=selection,
+            output_path=out_path,
+            template=template,
+            with_captions=args.with_captions,
+            segments=segments,
+        )
+        write_metadata(out_path.with_suffix(".metadata.json"), metadata)
+        print("\nDone:", out_path)
+
+
 def cmd_doctor(_: argparse.Namespace) -> None:
     rep = run_doctor()
     print("VideoPipeline doctor\n")
@@ -170,6 +295,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     e.add_argument("--normalize-audio", action="store_true")
     e.add_argument("--subtitles-ass", type=Path, default=None)
     e.set_defaults(func=cmd_export)
+
+    et = sub.add_parser("export-top", help="Create selections from top candidates and export them.")
+    et.add_argument("video", type=Path)
+    et.add_argument("--top", type=int, default=10)
+    et.add_argument("--template", type=str, default=None)
+    et.add_argument("--profile", type=Path, default=None)
+    et.add_argument("--with-captions", action="store_true")
+    et.set_defaults(func=cmd_export_top)
 
     d = sub.add_parser("doctor", help="Check local system dependencies (ffmpeg, optional whisper).")
     d.set_defaults(func=cmd_doctor)

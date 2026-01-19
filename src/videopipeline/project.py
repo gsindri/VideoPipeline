@@ -146,6 +146,7 @@ def create_or_load_project(video_path: Path, projects_root: Optional[Path] = Non
                 "duration_seconds": duration_s,
             },
             "analysis": {},
+            "layout": {},
             "selections": [],
             "exports": [],
         }
@@ -191,6 +192,46 @@ def add_selection(
                 "template": template,
             }
         )
+
+    return update_project(proj, _upd)
+
+
+def add_selection_from_candidate(
+    proj: Project,
+    *,
+    candidate: Dict[str, Any],
+    template: str,
+    title: str = "",
+) -> str:
+    import uuid
+
+    sel_id = uuid.uuid4().hex
+
+    def _upd(d: Dict[str, Any]) -> None:
+        d.setdefault("selections", [])
+        d["selections"].append(
+            {
+                "id": sel_id,
+                "created_at": utc_now_iso(),
+                "start_s": float(candidate.get("start_s")),
+                "end_s": float(candidate.get("end_s")),
+                "title": title,
+                "notes": "",
+                "template": template,
+                "candidate_rank": candidate.get("rank"),
+                "candidate_score": candidate.get("score"),
+                "candidate_peak_time_s": candidate.get("peak_time_s"),
+            }
+        )
+
+    update_project(proj, _upd)
+    return sel_id
+
+
+def set_layout_facecam(proj: Project, *, rect: Dict[str, float]) -> Dict[str, Any]:
+    def _upd(d: Dict[str, Any]) -> None:
+        d.setdefault("layout", {})
+        d["layout"]["facecam"] = rect
 
     return update_project(proj, _upd)
 

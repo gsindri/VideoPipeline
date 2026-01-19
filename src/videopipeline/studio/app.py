@@ -11,7 +11,8 @@ from fastapi.staticfiles import StaticFiles
 
 from ..analysis_audio import compute_audio_analysis
 from ..analysis_highlights import compute_highlights_analysis
-from ..project import Project, add_selection, create_or_load_project, get_project_data, load_npz
+from ..layouts import RectNorm
+from ..project import Project, add_selection, add_selection_from_candidate, create_or_load_project, get_project_data, load_npz, set_layout_facecam
 from ..profile import load_profile
 from .jobs import JOB_MANAGER
 from .range import ranged_file_response
@@ -41,6 +42,26 @@ def create_app(
     @app.get("/api/project")
     def api_project() -> JSONResponse:
         return JSONResponse(get_project_data(proj))
+
+    @app.get("/api/layout")
+    def api_layout() -> JSONResponse:
+        proj_data = get_project_data(proj)
+        return JSONResponse(proj_data.get("layout", {}))
+
+    @app.post("/api/layout/facecam")
+    def api_layout_facecam(body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        try:
+            rect = RectNorm(
+                x=float(body.get("x")),
+                y=float(body.get("y")),
+                w=float(body.get("w")),
+                h=float(body.get("h")),
+            )
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=f"invalid_rect: {e}")
+
+        data = set_layout_facecam(proj, rect=rect.to_dict())
+        return JSONResponse(data.get("layout", {}))
 
     @app.post("/api/analyze/audio")
     def api_analyze_audio(body: Dict[str, Any] = Body(default={})):  # type: ignore[valid-type]
@@ -189,6 +210,24 @@ def create_app(
         add_selection(proj, start_s=start_s, end_s=end_s, title=title, notes=notes, template=template)
         return JSONResponse(get_project_data(proj))
 
+    @app.post("/api/selections/from_candidates")
+    def api_selections_from_candidates(body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        top = int(body.get("top", 10))
+        template = str(body.get("template") or profile.get("export", {}).get("template", "vertical_blur"))
+
+        proj_data = get_project_data(proj)
+        highlights = proj_data.get("analysis", {}).get("highlights", {})
+        candidates = highlights.get("candidates") or []
+        if not candidates:
+            raise HTTPException(status_code=404, detail="no_candidates")
+
+        created_ids = []
+        for cand in candidates[: max(0, top)]:
+            title = cand.get("title") or ""
+            created_ids.append(add_selection_from_candidate(proj, candidate=cand, template=template, title=title))
+
+        return JSONResponse({"project": get_project_data(proj), "created_ids": created_ids})
+
     @app.patch("/api/selections/{selection_id}")
     def api_patch_selection(selection_id: str, body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
         from ..project import update_selection
@@ -220,6 +259,8 @@ def create_app(
 
         export_cfg = {**profile.get("export", {}), **(body.get("export") or {})}
         cap_cfg = {**profile.get("captions", {}), **(body.get("captions") or {})}
+        hook_cfg = {**profile.get("overlay", {}).get("hook_text", {}), **(body.get("hook_text") or {})}
+        pip_cfg = {**profile.get("layout", {}).get("pip", {}), **(body.get("pip") or {})}
 
         with_captions = bool(body.get("with_captions", cap_cfg.get("enabled", False)))
 
@@ -247,6 +288,54 @@ def create_app(
             preset=str(export_cfg.get("preset", "veryfast")),
             normalize_audio=bool(export_cfg.get("normalize_audio", False)),
             whisper_cfg=whisper_cfg,
+            hook_cfg=hook_cfg,
+            pip_cfg=pip_cfg,
+        )
+
+        return JSONResponse({"job_id": job.id})
+
+    @app.post("/api/export/batch")
+    def api_export_batch(body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        selection_ids = body.get("selection_ids") or []
+        export_cfg = {**profile.get("export", {}), **(body.get("export") or {})}
+        cap_cfg = {**profile.get("captions", {}), **(body.get("captions") or {})}
+        hook_cfg = {**profile.get("overlay", {}).get("hook_text", {}), **(body.get("hook_text") or {})}
+        pip_cfg = {**profile.get("layout", {}).get("pip", {}), **(body.get("pip") or {})}
+        with_captions = bool(body.get("with_captions", cap_cfg.get("enabled", False)))
+
+        whisper_cfg = None
+        if with_captions:
+            from ..transcribe import TranscribeConfig
+
+            whisper_cfg = TranscribeConfig(
+                model_size=str(cap_cfg.get("model_size", "small")),
+                language=cap_cfg.get("language"),
+                device=str(cap_cfg.get("device", "cpu")),
+                compute_type=str(cap_cfg.get("compute_type", "int8")),
+            )
+
+        proj_data = get_project_data(proj)
+        selections = proj_data.get("selections", [])
+        if selection_ids:
+            selections = [s for s in selections if s.get("id") in selection_ids]
+        if not selections:
+            raise HTTPException(status_code=404, detail="no_selections")
+
+        job = JOB_MANAGER.start_export_batch(
+            proj=proj,
+            selections=selections,
+            export_dir=proj.exports_dir,
+            with_captions=with_captions,
+            template=str(export_cfg.get("template", "vertical_blur")),
+            width=int(export_cfg.get("width", 1080)),
+            height=int(export_cfg.get("height", 1920)),
+            fps=int(export_cfg.get("fps", 30)),
+            crf=int(export_cfg.get("crf", 20)),
+            preset=str(export_cfg.get("preset", "veryfast")),
+            normalize_audio=bool(export_cfg.get("normalize_audio", False)),
+            whisper_cfg=whisper_cfg,
+            hook_cfg=hook_cfg,
+            pip_cfg=pip_cfg,
         )
 
         return JSONResponse({"job_id": job.id})
