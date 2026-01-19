@@ -34,13 +34,29 @@ analysis:
       max_post_seconds: 28
 
 export:
-  template: vertical_blur
+  template: vertical_streamer_pip
   width: 1080
   height: 1920
   fps: 30
   crf: 20
   preset: veryfast
   normalize_audio: false
+
+overlay:
+  hook_text:
+    enabled: true
+    duration_seconds: 2.0
+    text: null
+    font: auto
+    fontsize: 64
+    y: 120
+
+layout:
+  pip:
+    position: top_left
+    margin: 40
+    width_fraction: 0.28
+    border_px: 6
 
 captions:
   enabled: false

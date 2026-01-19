@@ -4,6 +4,9 @@ let project = null;
 let profile = null;
 let chart = null;
 let currentCandidate = null;
+let facecamRect = null;
+let lastBatchSelectionIds = [];
+let calibrating = false;
 
 const jobs = new Map();
 
@@ -274,6 +277,83 @@ async function refreshProject() {
   await refreshTimeline();
 }
 
+function updateFacecamStatus() {
+  const status = $('#facecamStatus');
+  if (!facecamRect) {
+    status.textContent = 'No facecam calibration yet.';
+    return;
+  }
+  status.textContent = `Facecam: x=${facecamRect.x.toFixed(3)}, y=${facecamRect.y.toFixed(3)}, w=${facecamRect.w.toFixed(3)}, h=${facecamRect.h.toFixed(3)}`;
+}
+
+function setupFacecamCanvas() {
+  const canvas = $('#facecamCanvas');
+  const v = $('#video');
+  const ctx = canvas.getContext('2d');
+
+  function resizeCanvas() {
+    canvas.width = v.clientWidth;
+    canvas.height = v.clientHeight;
+    drawRect();
+  }
+
+  function drawRect(tempRect = null) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const rect = tempRect || facecamRect;
+    if (!rect) return;
+    const x = rect.x * canvas.width;
+    const y = rect.y * canvas.height;
+    const w = rect.w * canvas.width;
+    const h = rect.h * canvas.height;
+    ctx.strokeStyle = 'rgba(79, 140, 255, 0.95)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(x, y, w, h);
+    ctx.setLineDash([]);
+  }
+
+  let dragging = false;
+  let start = null;
+
+  function normRectFromPoints(p1, p2) {
+    const x = clamp(Math.min(p1.x, p2.x) / canvas.width, 0, 1);
+    const y = clamp(Math.min(p1.y, p2.y) / canvas.height, 0, 1);
+    const w = clamp(Math.abs(p2.x - p1.x) / canvas.width, 0, 1);
+    const h = clamp(Math.abs(p2.y - p1.y) / canvas.height, 0, 1);
+    return { x, y, w, h };
+  }
+
+  canvas.onmousedown = (ev) => {
+    if (!calibrating) return;
+    dragging = true;
+    start = { x: ev.offsetX, y: ev.offsetY };
+  };
+
+  canvas.onmousemove = (ev) => {
+    if (!calibrating || !dragging || !start) return;
+    const temp = normRectFromPoints(start, { x: ev.offsetX, y: ev.offsetY });
+    drawRect(temp);
+  };
+
+  canvas.onmouseup = (ev) => {
+    if (!calibrating || !dragging || !start) return;
+    dragging = false;
+    const rect = normRectFromPoints(start, { x: ev.offsetX, y: ev.offsetY });
+    if (rect.w > 0.01 && rect.h > 0.01) {
+      facecamRect = rect;
+      updateFacecamStatus();
+      $('#btnSaveFacecam').disabled = false;
+      drawRect();
+    }
+  };
+
+  window.addEventListener('resize', resizeCanvas);
+  v.addEventListener('loadedmetadata', resizeCanvas);
+  resizeCanvas();
+
+  return { resizeCanvas, drawRect };
+}
+
 async function startAnalyzeJob() {
   $('#analysisStatus').textContent = 'Starting analysis...';
   const res = await apiJson('POST', '/api/analyze/highlights', {});
@@ -315,6 +395,8 @@ async function startExportJob(selectionId) {
 
 function wireUI() {
   const v = $('#video');
+  const canvas = $('#facecamCanvas');
+  const canvasApi = setupFacecamCanvas();
 
   v.addEventListener('timeupdate', () => {
     $('#timeReadout').textContent = `Now: ${fmtTime(v.currentTime)} / ${fmtTime(v.duration || 0)}`;
@@ -375,6 +457,67 @@ function wireUI() {
     }
   };
 
+  $('#btnCalibrateFacecam').onclick = async () => {
+    calibrating = !calibrating;
+    canvas.style.display = calibrating ? 'block' : 'none';
+    $('#btnCalibrateFacecam').textContent = calibrating ? 'Cancel calibration' : 'Calibrate facecam';
+    if (!calibrating) {
+      canvasApi.drawRect();
+    }
+  };
+
+  $('#btnSaveFacecam').onclick = async () => {
+    if (!facecamRect) return;
+    try {
+      await apiJson('POST', '/api/layout/facecam', facecamRect);
+      calibrating = false;
+      canvas.style.display = 'none';
+      $('#btnCalibrateFacecam').textContent = 'Calibrate facecam';
+      $('#btnSaveFacecam').disabled = true;
+      canvasApi.drawRect();
+      updateFacecamStatus();
+    } catch (e) {
+      alert(`Failed to save facecam: ${e}`);
+    }
+  };
+
+  $('#btnCreateSelections').onclick = async () => {
+    const top = Number($('#batchTopN').value || 10);
+    const template = $('#batchTemplate').value;
+    try {
+      const res = await apiJson('POST', '/api/selections/from_candidates', { top, template });
+      project = res.project;
+      lastBatchSelectionIds = res.created_ids || [];
+      renderSelections();
+      alert(`Created ${lastBatchSelectionIds.length} selections.`);
+    } catch (e) {
+      alert(`Failed to create selections: ${e}`);
+    }
+  };
+
+  $('#btnBatchExport').onclick = async () => {
+    try {
+      const exp = {
+        width: Number($('#expW').value),
+        height: Number($('#expH').value),
+        fps: Number($('#expFps').value),
+        crf: Number($('#expCrf').value),
+        preset: $('#expPreset').value,
+        template: $('#batchTemplate').value,
+        normalize_audio: $('#normalizeAudio').checked,
+      };
+      const withCaptions = $('#withCaptions').checked;
+      const res = await apiJson('POST', '/api/export/batch', {
+        selection_ids: lastBatchSelectionIds,
+        export: exp,
+        with_captions: withCaptions,
+      });
+      watchJob(res.job_id);
+    } catch (e) {
+      alert(`Batch export failed: ${e}`);
+    }
+  };
+
   // Keyboard shortcuts
   window.addEventListener('keydown', (ev) => {
     const tag = (ev.target && ev.target.tagName) ? ev.target.tagName.toLowerCase() : '';
@@ -415,6 +558,14 @@ async function main() {
 
   await refreshProject();
 
+  try {
+    const layout = await apiGet('/api/layout');
+    if (layout?.facecam) {
+      facecamRect = layout.facecam;
+      updateFacecamStatus();
+    }
+  } catch (_) {}
+
   // Set default builder from first candidate if exists
   const cands = project?.analysis?.highlights?.candidates || project?.analysis?.audio?.candidates || [];
   if (cands.length > 0) {
@@ -433,12 +584,14 @@ async function main() {
     $('#expPreset').value = profile.export.preset ?? 'veryfast';
     $('#normalizeAudio').checked = !!profile.export.normalize_audio;
     $('#template').value = profile.export.template ?? 'vertical_blur';
+    $('#batchTemplate').value = profile.export.template ?? 'vertical_blur';
   }
   if (profile?.captions) {
     $('#withCaptions').checked = !!profile.captions.enabled;
   }
 
   wireUI();
+  updateFacecamStatus();
 }
 
 main();

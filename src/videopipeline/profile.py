@@ -65,6 +65,24 @@ def default_profile() -> Dict[str, Any]:
             "device": "cpu",
             "compute_type": "int8",
         },
+        "overlay": {
+            "hook_text": {
+                "enabled": False,
+                "duration_seconds": 2.0,
+                "text": None,
+                "font": "auto",
+                "fontsize": 64,
+                "y": 120,
+            }
+        },
+        "layout": {
+            "pip": {
+                "position": "top_left",
+                "margin": 40,
+                "width_fraction": 0.28,
+                "border_px": 6,
+            }
+        },
     }
 
 
