@@ -14,10 +14,7 @@ def moving_average(x: np.ndarray, window: int) -> np.ndarray:
 
 
 def robust_z(x: np.ndarray) -> np.ndarray:
-    """
-    Robust z-score using median and MAD.
-    Falls back to std if MAD is tiny.
-    """
+    """Robust z-score using median and MAD."""
     med = np.median(x)
     mad = np.median(np.abs(x - med))
     if mad < 1e-9:
@@ -34,16 +31,8 @@ def is_local_max(x: np.ndarray, i: int) -> bool:
     return x[i] >= left and x[i] >= right
 
 
-def pick_top_peaks(
-    scores: np.ndarray,
-    *,
-    top_k: int,
-    min_gap_frames: int,
-) -> List[int]:
-    """
-    Greedy peak selection by score with minimum spacing.
-    Returns indices in descending score order.
-    """
+def pick_top_peaks(scores: np.ndarray, *, top_k: int, min_gap_frames: int) -> List[int]:
+    """Greedy peak selection by score with minimum spacing."""
     if top_k <= 0:
         return []
 
@@ -52,6 +41,8 @@ def pick_top_peaks(
 
     for idx in order:
         idx = int(idx)
+        if not np.isfinite(scores[idx]):
+            continue
         if scores[idx] <= 0:
             break
         if not is_local_max(scores, idx):

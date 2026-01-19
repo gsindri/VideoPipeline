@@ -4,11 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "videopipeline"
-version = "0.0.1"
+version = "0.0.2"
 description = "Personal highlight extraction + short-form export pipeline"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.23"]
+dependencies = [
+    "numpy>=1.23",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "PyYAML>=6.0",
+]
 
 [project.scripts]
 vp = "videopipeline.cli:main"
@@ -18,3 +23,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"videopipeline" = ["studio/static/*"]
