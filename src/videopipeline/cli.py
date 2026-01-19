@@ -3,24 +3,15 @@ from __future__ import annotations
 import argparse
 import json
 import webbrowser
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
-from .analysis_audio import compute_audio_analysis
+from .analysis_chat import compute_chat_analysis
+from .analysis_highlights import compute_highlights_analysis
 from .doctor import run_doctor
 from .exporter import ExportSpec, run_ffmpeg_export
+from .profile import load_profile
 from .project import create_or_load_project, get_project_data
-
-
-@dataclass(frozen=True)
-class CandidateClip:
-    rank: int
-    peak_time_s: float
-    start_s: float
-    end_s: float
-    score: float
-    peak_db: float
 
 
 def _fmt_time(seconds: float) -> str:
@@ -34,37 +25,37 @@ def _fmt_time(seconds: float) -> str:
 
 
 def _default_out_path(video_path: Path) -> Path:
-    return Path("outputs") / video_path.stem / "candidates_audio.json"
+    return Path("outputs") / video_path.stem / "candidates_highlights.json"
 
 
 def cmd_suggest(args: argparse.Namespace) -> None:
     proj = create_or_load_project(args.video)
+    profile = load_profile(args.profile)
+    analysis_cfg = profile.get("analysis", {})
 
-    payload = compute_audio_analysis(
+    payload = compute_highlights_analysis(
         proj,
-        sample_rate=args.sample_rate,
-        hop_s=args.hop,
-        smooth_s=args.smooth,
-        top=args.top,
-        min_gap_s=args.min_gap,
-        pre_s=args.pre,
-        post_s=args.post,
-        skip_start_s=args.skip_start,
+        audio_cfg=analysis_cfg.get("audio", {}),
+        motion_cfg=analysis_cfg.get("motion", {}),
+        scenes_cfg=analysis_cfg.get("scenes", {}),
+        highlights_cfg=analysis_cfg.get("highlights", {}),
+        include_chat=True,
     )
 
     out_path = args.out or _default_out_path(args.video)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    candidates = [CandidateClip(**c) for c in payload.get("candidates", [])]
+    candidates = payload.get("candidates", [])
 
     print(f"Wrote: {out_path}")
     print(f"Project: {proj.project_dir}")
     print()
-    print(f"{'Rank':>4}  {'Peak':>10}  {'Start':>10}  {'End':>10}  {'Score':>7}  {'dB':>7}")
+    print(f"{'Rank':>4}  {'Peak':>10}  {'Start':>10}  {'End':>10}  {'Score':>7}  {'Audio':>7}  {'Motion':>7}  {'Chat':>7}")
     for c in candidates:
+        breakdown = c.get("breakdown", {})
         print(
-            f"{c.rank:>4}  {_fmt_time(c.peak_time_s):>10}  {_fmt_time(c.start_s):>10}  {_fmt_time(c.end_s):>10}  {c.score:>7.2f}  {c.peak_db:>7.2f}"
+            f"{c.get('rank'):>4}  {_fmt_time(c.get('peak_time_s')):>10}  {_fmt_time(c.get('start_s')):>10}  {_fmt_time(c.get('end_s')):>10}  {c.get('score', 0.0):>7.2f}  {breakdown.get('audio', 0.0):>7.2f}  {breakdown.get('motion', 0.0):>7.2f}  {breakdown.get('chat', 0.0):>7.2f}"
         )
 
 
@@ -120,21 +111,40 @@ def cmd_doctor(_: argparse.Namespace) -> None:
     print("\nOK" if rep.ok else "\nNOT OK (fix missing requirements above)")
 
 
+def cmd_attach_chat(args: argparse.Namespace) -> None:
+    proj = create_or_load_project(args.video)
+    proj.analysis_dir.mkdir(parents=True, exist_ok=True)
+    dest = proj.chat_raw_path
+    dest.write_bytes(Path(args.chat).read_bytes())
+
+    hop_s = args.hop
+    if hop_s is None:
+        proj_data = get_project_data(proj)
+        hop_s = (
+            proj_data.get("analysis", {})
+            .get("audio", {})
+            .get("config", {})
+            .get("hop_seconds", 0.5)
+        )
+
+    compute_chat_analysis(
+        proj,
+        chat_path=dest,
+        hop_s=float(hop_s),
+        smooth_s=float(args.smooth),
+    )
+    print(f"Attached chat: {dest}")
+    print(f"Project: {proj.project_dir}")
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(prog="vp", description="VideoPipeline CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("suggest", help="Suggest highlight candidates from audio excitement peaks.")
+    p = sub.add_parser("suggest", help="Suggest highlight candidates from combined signals.")
     p.add_argument("video", type=Path)
-    p.add_argument("--sample-rate", type=int, default=16000)
-    p.add_argument("--hop", type=float, default=0.5)
-    p.add_argument("--smooth", type=float, default=3.0)
-    p.add_argument("--top", type=int, default=12)
-    p.add_argument("--min-gap", type=float, default=20.0)
-    p.add_argument("--pre", type=float, default=8.0)
-    p.add_argument("--post", type=float, default=22.0)
-    p.add_argument("--skip-start", type=float, default=10.0)
     p.add_argument("--out", type=Path, default=None)
+    p.add_argument("--profile", type=Path, default=None)
     p.set_defaults(func=cmd_suggest)
 
     s = sub.add_parser("studio", help="Launch the local review + export studio web app.")
@@ -163,6 +173,13 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     d = sub.add_parser("doctor", help="Check local system dependencies (ffmpeg, optional whisper).")
     d.set_defaults(func=cmd_doctor)
+
+    c = sub.add_parser("attach-chat", help="Attach chat JSON and compute chat features.")
+    c.add_argument("video", type=Path)
+    c.add_argument("chat", type=Path)
+    c.add_argument("--hop", type=float, default=None)
+    c.add_argument("--smooth", type=float, default=3.0)
+    c.set_defaults(func=cmd_attach_chat)
 
     args = parser.parse_args(argv)
     args.func(args)

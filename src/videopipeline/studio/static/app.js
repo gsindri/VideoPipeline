@@ -66,19 +66,21 @@ function renderCandidates() {
   const container = $('#candidates');
   container.innerHTML = '';
 
+  const highlights = project?.analysis?.highlights;
   const audio = project?.analysis?.audio;
-  const candidates = audio?.candidates || [];
+  const candidates = highlights?.candidates || audio?.candidates || [];
   if (candidates.length === 0) {
-    container.innerHTML = `<div class="small">No candidates yet. Click “Run / Re-run audio analysis”.</div>`;
+    container.innerHTML = `<div class="small">No candidates yet. Click “Analyze highlights”.</div>`;
     return;
   }
 
   for (const c of candidates) {
     const el = document.createElement('div');
     el.className = 'item';
+    const breakdown = c.breakdown ? ` • audio ${Number(c.breakdown.audio).toFixed(2)} / motion ${Number(c.breakdown.motion).toFixed(2)} / chat ${Number(c.breakdown.chat).toFixed(2)}` : '';
     el.innerHTML = `
       <div class="title">#${c.rank} • score ${c.score.toFixed(2)} <span class="badge">peak ${fmtTime(c.peak_time_s)}</span></div>
-      <div class="meta">Clip: ${fmtTime(c.start_s)} → ${fmtTime(c.end_s)} (${(c.end_s - c.start_s).toFixed(1)}s)</div>
+      <div class="meta">Clip: ${fmtTime(c.start_s)} → ${fmtTime(c.end_s)} (${(c.end_s - c.start_s).toFixed(1)}s)${breakdown}</div>
       <div class="actions">
         <button class="primary">Load</button>
         <button>Seek peak</button>
@@ -174,7 +176,7 @@ function watchJob(jobId) {
         const j = payload.job;
         jobs.set(j.id, j);
         renderJobs();
-        if (j.kind === 'analyze_audio' && j.status === 'succeeded') {
+        if ((j.kind === 'analyze_audio' || j.kind === 'analyze_highlights') && j.status === 'succeeded') {
           // refresh project and timeline
           refreshProject();
         }
@@ -195,8 +197,13 @@ function watchJob(jobId) {
 
 async function refreshTimeline() {
   try {
-    const t = await apiGet('/api/audio/timeline');
-    if (!t.ok) return;
+    let t = null;
+    try {
+      t = await apiGet('/api/highlights/timeline');
+    } catch (_) {
+      t = await apiGet('/api/audio/timeline');
+    }
+    if (!t || !t.ok) return;
 
     const hop = t.hop_seconds;
     const xs = t.indices.map(i => i * hop);
@@ -269,10 +276,18 @@ async function refreshProject() {
 
 async function startAnalyzeJob() {
   $('#analysisStatus').textContent = 'Starting analysis...';
-  const res = await apiJson('POST', '/api/analyze/audio', {});
+  const res = await apiJson('POST', '/api/analyze/highlights', {});
   const jobId = res.job_id;
   watchJob(jobId);
   $('#analysisStatus').textContent = `Analysis running (job ${jobId.slice(0,8)})...`;
+}
+
+async function startAnalyzeAudioJob() {
+  $('#analysisStatus').textContent = 'Starting audio analysis...';
+  const res = await apiJson('POST', '/api/analyze/audio', {});
+  const jobId = res.job_id;
+  watchJob(jobId);
+  $('#analysisStatus').textContent = `Audio analysis running (job ${jobId.slice(0,8)})...`;
 }
 
 async function startExportJob(selectionId) {
@@ -345,11 +360,18 @@ function wireUI() {
     renderSelections();
   };
 
-  $('#btnAnalyze').onclick = async () => {
+  $('#btnAnalyzeHighlights').onclick = async () => {
     try {
       await startAnalyzeJob();
     } catch (e) {
       alert(`Analysis failed: ${e}`);
+    }
+  };
+  $('#btnAnalyzeAudio').onclick = async () => {
+    try {
+      await startAnalyzeAudioJob();
+    } catch (e) {
+      alert(`Audio analysis failed: ${e}`);
     }
   };
 
@@ -394,7 +416,7 @@ async function main() {
   await refreshProject();
 
   // Set default builder from first candidate if exists
-  const cands = project?.analysis?.audio?.candidates || [];
+  const cands = project?.analysis?.highlights?.candidates || project?.analysis?.audio?.candidates || [];
   if (cands.length > 0) {
     currentCandidate = cands[0];
     setBuilder(cands[0].start_s, cands[0].end_s);

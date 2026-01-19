@@ -102,6 +102,26 @@ class Project:
         return self.analysis_dir / "audio_features.npz"
 
     @property
+    def motion_features_path(self) -> Path:
+        return self.analysis_dir / "motion_features.npz"
+
+    @property
+    def chat_features_path(self) -> Path:
+        return self.analysis_dir / "chat_features.npz"
+
+    @property
+    def highlights_features_path(self) -> Path:
+        return self.analysis_dir / "highlights_features.npz"
+
+    @property
+    def scenes_path(self) -> Path:
+        return self.analysis_dir / "scenes.json"
+
+    @property
+    def chat_raw_path(self) -> Path:
+        return self.analysis_dir / "chat_raw.json"
+
+    @property
     def exports_dir(self) -> Path:
         return self.project_dir / "exports"
 

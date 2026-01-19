@@ -60,6 +60,56 @@ def ffprobe_streams(video_path: Path) -> dict:
     return json.loads(out)
 
 
+def ffprobe_video_stream_info(video_path: Path) -> dict:
+    _require_cmd("ffprobe")
+    video_path = Path(video_path)
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height,avg_frame_rate,r_frame_rate",
+        "-print_format",
+        "json",
+        str(video_path),
+    ]
+    out = subprocess.check_output(cmd, text=True)
+    import json
+
+    data = json.loads(out)
+    streams = data.get("streams") or []
+    if not streams:
+        raise RuntimeError("ffprobe found no video streams")
+    stream = streams[0]
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    fps = _parse_ffprobe_fps(stream.get("avg_frame_rate") or "") or _parse_ffprobe_fps(stream.get("r_frame_rate") or "")
+    if not fps:
+        fps = 30.0
+    return {"width": width, "height": height, "fps": float(fps)}
+
+
+def _parse_ffprobe_fps(rate: str) -> float | None:
+    if not rate:
+        return None
+    if "/" in rate:
+        num, den = rate.split("/", 1)
+        try:
+            num_f = float(num)
+            den_f = float(den)
+        except ValueError:
+            return None
+        if den_f == 0:
+            return None
+        return num_f / den_f
+    try:
+        return float(rate)
+    except ValueError:
+        return None
+
+
 def _read_exact(stream: BinaryIO, nbytes: int) -> bytes:
     """Read exactly nbytes unless EOF occurs."""
     chunks: list[bytes] = []
@@ -134,6 +184,78 @@ def stream_audio_blocks_f32le(
                 break
             block = np.frombuffer(raw, dtype=params.dtype)
             yield block
+    except Exception:
+        proc.kill()
+        raise
+    finally:
+        try:
+            proc.stdout.close()  # type: ignore[union-attr]
+        except Exception:
+            pass
+
+        ret = proc.wait()
+        err = b""
+        try:
+            err = proc.stderr.read()  # type: ignore[union-attr]
+            proc.stderr.close()  # type: ignore[union-attr]
+        except Exception:
+            pass
+
+        if ret != 0:
+            msg = err.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"ffmpeg failed (exit={ret}). {msg}")
+
+
+def stream_video_frames_gray(
+    video_path: Path,
+    *,
+    fps: float,
+    width: int,
+    height: int,
+) -> Iterator[np.ndarray]:
+    _require_cmd("ffmpeg")
+    video_path = Path(video_path)
+
+    if fps <= 0:
+        raise ValueError("fps must be > 0")
+    if width <= 0 or height <= 0:
+        raise ValueError("width/height must be > 0")
+
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-i",
+        str(video_path),
+        "-vf",
+        f"fps={fps},scale={width}:{height},format=gray",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray",
+        "pipe:1",
+    ]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+
+    frame_bytes = width * height
+
+    try:
+        while True:
+            raw = _read_exact(proc.stdout, frame_bytes)
+            if not raw:
+                break
+            if len(raw) < frame_bytes:
+                break
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape((height, width))
+            yield frame
     except Exception:
         proc.kill()
         raise

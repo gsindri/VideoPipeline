@@ -32,13 +32,14 @@
       <div class="panel">
         <h2>Interest timeline</h2>
         <div class="row">
-          <button class="primary" id="btnAnalyze">Run / Re-run audio analysis</button>
+          <button class="primary" id="btnAnalyzeHighlights">Analyze highlights (audio+motion+scenes)</button>
+          <button id="btnAnalyzeAudio">Analyze audio only</button>
           <span class="small" id="analysisStatus"></span>
         </div>
         <div class="canvas-wrap">
           <canvas id="chart" height="120"></canvas>
         </div>
-        <p class="small">Higher score means “more hype” based on audio excitement.</p>
+        <p class="small">Higher score means more hype based on combined signals.</p>
       </div>
 
       <div class="panel">

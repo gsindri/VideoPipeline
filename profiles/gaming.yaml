@@ -8,6 +8,30 @@ analysis:
     pre_seconds: 8.0
     post_seconds: 22.0
     skip_start_seconds: 10.0
+  motion:
+    sample_fps: 3.0
+    scale_width: 160
+    smooth_seconds: 2.5
+  scenes:
+    enabled: true
+    threshold_z: 3.5
+    min_scene_len_seconds: 1.2
+    snap_window_seconds: 1.0
+  highlights:
+    top: 20
+    min_gap_seconds: 15.0
+    skip_start_seconds: 10.0
+    weights:
+      audio: 0.55
+      motion: 0.45
+      chat: 0.0
+    clip:
+      min_seconds: 12
+      max_seconds: 60
+      min_pre_seconds: 2
+      max_pre_seconds: 12
+      min_post_seconds: 4
+      max_post_seconds: 28
 
 export:
   template: vertical_blur
