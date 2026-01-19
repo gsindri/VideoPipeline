@@ -14,7 +14,7 @@ def _require_cmd(cmd: str) -> str:
     if not path:
         raise RuntimeError(
             f"Required executable '{cmd}' not found in PATH. "
-            "Install ffmpeg/ffprobe and ensure they are on PATH."
+            "Install ffmpeg/ffprobe and ensure they are available on PATH."
         )
     return path
 
@@ -40,8 +40,28 @@ def ffprobe_duration_seconds(video_path: Path) -> float:
         raise RuntimeError(f"ffprobe returned non-numeric duration: {out!r}") from e
 
 
+def ffprobe_streams(video_path: Path) -> dict:
+    """Return ffprobe JSON for streams/format (handy for future work)."""
+    _require_cmd("ffprobe")
+    video_path = Path(video_path)
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_streams",
+        "-show_format",
+        str(video_path),
+    ]
+    out = subprocess.check_output(cmd, text=True)
+    import json
+
+    return json.loads(out)
+
+
 def _read_exact(stream: BinaryIO, nbytes: int) -> bytes:
-    """Read exactly nbytes from stream unless EOF occurs."""
+    """Read exactly nbytes unless EOF occurs."""
     chunks: list[bytes] = []
     total = 0
     while total < nbytes:
@@ -67,8 +87,9 @@ def stream_audio_blocks_f32le(
     block_samples: int,
 ) -> Iterator[np.ndarray]:
     """
-    Stream mono float32 PCM blocks from ffmpeg without loading the whole audio into memory.
-    Yields numpy arrays of length block_samples (tail remainder is discarded).
+    Stream mono float32 PCM blocks from ffmpeg without loading whole audio into memory.
+
+    Yields numpy arrays of length block_samples. The final partial block is discarded.
     """
     _require_cmd("ffmpeg")
     video_path = Path(video_path)
@@ -101,7 +122,7 @@ def stream_audio_blocks_f32le(
     assert proc.stdout is not None
     assert proc.stderr is not None
 
-    bytes_per_sample = np.dtype(params.dtype).itemsize  # 4 for float32
+    bytes_per_sample = np.dtype(params.dtype).itemsize
     block_bytes = block_samples * bytes_per_sample * params.channels
 
     try:
@@ -110,7 +131,6 @@ def stream_audio_blocks_f32le(
             if not raw:
                 break
             if len(raw) < block_bytes:
-                # Discard partial final block for simplicity.
                 break
             block = np.frombuffer(raw, dtype=params.dtype)
             yield block
@@ -118,24 +138,18 @@ def stream_audio_blocks_f32le(
         proc.kill()
         raise
     finally:
-        # Ensure process is collected and errors reported.
-        stdout_close = proc.stdout
-        stderr_pipe = proc.stderr
-
-        if stdout_close:
-            try:
-                stdout_close.close()
-            except Exception:
-                pass
+        try:
+            proc.stdout.close()  # type: ignore[union-attr]
+        except Exception:
+            pass
 
         ret = proc.wait()
         err = b""
-        if stderr_pipe:
-            try:
-                err = stderr_pipe.read()
-                stderr_pipe.close()
-            except Exception:
-                pass
+        try:
+            err = proc.stderr.read()  # type: ignore[union-attr]
+            proc.stderr.close()  # type: ignore[union-attr]
+        except Exception:
+            pass
 
         if ret != 0:
             msg = err.decode("utf-8", errors="replace").strip()
