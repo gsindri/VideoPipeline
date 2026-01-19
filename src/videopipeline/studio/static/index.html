@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VideoPipeline Studio</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>VideoPipeline Studio</h1>
+    <span class="muted" id="projectInfo">Loading project...</span>
+    <span class="muted" style="margin-left:auto">
+      Shortcuts: <kbd>Space</kbd> play/pause, <kbd>I</kbd> set start, <kbd>O</kbd> set end, <kbd>[</kbd>/<kbd>]</kbd> nudge ±0.5s
+    </span>
+  </header>
+
+  <main>
+    <section id="left">
+      <div class="panel">
+        <h2>Source video</h2>
+        <video id="video" controls preload="metadata" src="/video"></video>
+        <div class="row" style="margin-top:10px">
+          <button id="btnSetStart">Set Start = current</button>
+          <button id="btnSetEnd">Set End = current</button>
+          <button id="btnSnapCandidate" title="Snap in/out to candidate">Snap to candidate</button>
+          <span class="small" id="timeReadout"></span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Interest timeline</h2>
+        <div class="row">
+          <button class="primary" id="btnAnalyze">Run / Re-run audio analysis</button>
+          <span class="small" id="analysisStatus"></span>
+        </div>
+        <div class="canvas-wrap">
+          <canvas id="chart" height="120"></canvas>
+        </div>
+        <p class="small">Higher score means “more hype” based on audio excitement.</p>
+      </div>
+
+      <div class="panel">
+        <h2>Clip builder</h2>
+        <div class="row">
+          <label>Start (s)
+            <input type="number" id="startS" step="0.1" />
+          </label>
+          <label>End (s)
+            <input type="number" id="endS" step="0.1" />
+          </label>
+          <label>Title
+            <input type="text" id="title" placeholder="Optional title" style="width:260px" />
+          </label>
+          <label>Template
+            <select id="template">
+              <option value="vertical_blur">vertical_blur (gaming default)</option>
+              <option value="vertical_crop_center">vertical_crop_center</option>
+              <option value="original">original</option>
+            </select>
+          </label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button class="primary" id="btnSaveSelection">Save selection</button>
+          <button id="btnNudgeBack">◀ -0.5s</button>
+          <button id="btnNudgeFwd">+0.5s ▶</button>
+          <span class="small">Tip: fine-tune with arrow keys in the inputs.</span>
+        </div>
+      </div>
+    </section>
+
+    <section id="right">
+      <div class="panel">
+        <h2>Top candidates</h2>
+        <div class="list" id="candidates"></div>
+      </div>
+
+      <div class="panel">
+        <h2>Selections</h2>
+        <div class="list" id="selections"></div>
+      </div>
+
+      <div class="panel">
+        <h2>Export</h2>
+        <div class="row">
+          <label>Width
+            <input type="number" id="expW" value="1080" />
+          </label>
+          <label>Height
+            <input type="number" id="expH" value="1920" />
+          </label>
+          <label>FPS
+            <input type="number" id="expFps" value="30" />
+          </label>
+          <label>CRF
+            <input type="number" id="expCrf" value="20" />
+          </label>
+          <label>Preset
+            <select id="expPreset">
+              <option>veryfast</option>
+              <option>faster</option>
+              <option>fast</option>
+              <option>medium</option>
+            </select>
+          </label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <label><input type="checkbox" id="withCaptions" /> Burn-in captions (Whisper)</label>
+          <label><input type="checkbox" id="normalizeAudio" /> Normalize audio</label>
+        </div>
+        <p class="small">Captions require optional dependency: <code>pip install -e '.[whisper]'</code></p>
+      </div>
+
+      <div class="panel">
+        <h2>Jobs</h2>
+        <div class="list" id="jobs"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
