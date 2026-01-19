@@ -18,6 +18,14 @@ dependencies = [
 [project.scripts]
 vp = "videopipeline.cli:main"
 
+[project.optional-dependencies]
+whisper = ["faster-whisper>=1.0.0"]
+
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.5.0",
+]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

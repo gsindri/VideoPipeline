@@ -1,0 +1,26 @@
+analysis:
+  audio:
+    sample_rate: 16000
+    hop_seconds: 0.5
+    smooth_seconds: 2.5
+    top: 18
+    min_gap_seconds: 15.0
+    pre_seconds: 6.0
+    post_seconds: 18.0
+    skip_start_seconds: 10.0
+
+export:
+  template: vertical_blur
+  width: 1080
+  height: 1920
+  fps: 30
+  crf: 20
+  preset: veryfast
+  normalize_audio: false
+
+captions:
+  enabled: false
+  model_size: small
+  language: null
+  device: cpu
+  compute_type: int8

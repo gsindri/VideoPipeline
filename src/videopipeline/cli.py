@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .analysis_audio import compute_audio_analysis
+from .doctor import run_doctor
 from .exporter import ExportSpec, run_ffmpeg_export
 from .project import create_or_load_project, get_project_data
 
@@ -109,6 +110,16 @@ def cmd_export(args: argparse.Namespace) -> None:
     print("\nDone:", spec.output_path)
 
 
+def cmd_doctor(_: argparse.Namespace) -> None:
+    rep = run_doctor()
+    print("VideoPipeline doctor\n")
+    for name, data in rep.checks.items():
+        print(f"- {name}:")
+        for k, v in data.items():
+            print(f"    {k}: {v}")
+    print("\nOK" if rep.ok else "\nNOT OK (fix missing requirements above)")
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(prog="vp", description="VideoPipeline CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -149,6 +160,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     e.add_argument("--normalize-audio", action="store_true")
     e.add_argument("--subtitles-ass", type=Path, default=None)
     e.set_defaults(func=cmd_export)
+
+    d = sub.add_parser("doctor", help="Check local system dependencies (ffmpeg, optional whisper).")
+    d.set_defaults(func=cmd_doctor)
 
     args = parser.parse_args(argv)
     args.func(args)
