@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import os
-import re
-import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Callable, Optional
 
 from .ffmpeg import _require_cmd, ffprobe_video_stream_info
 from .layouts import RectNorm
@@ -246,7 +244,7 @@ def build_ffmpeg_command(spec: ExportSpec) -> list[str]:
                 if vf == "null":
                     vf = draw
                 else:
-                    vf = f\"{vf},{draw}\"
+                    vf = f"{vf},{draw}"
 
     cmd: list[str] = [
         "ffmpeg",
@@ -262,8 +260,13 @@ def build_ffmpeg_command(spec: ExportSpec) -> list[str]:
     ]
 
     # Filters & frame rate
+    use_complex = vf != "null" and ";" in vf
     if vf != "null":
-        cmd += ["-vf", vf]
+        if use_complex:
+            vf = f"{vf}[vout]"
+            cmd += ["-filter_complex", vf, "-map", "[vout]", "-map", "0:a?"]
+        else:
+            cmd += ["-vf", vf]
 
     cmd += ["-r", str(spec.fps)]
 

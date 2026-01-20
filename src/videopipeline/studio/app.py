@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from ..analysis_audio import compute_audio_analysis
 from ..analysis_highlights import compute_highlights_analysis
 from ..layouts import RectNorm
-from ..project import Project, add_selection, add_selection_from_candidate, create_or_load_project, get_project_data, load_npz, set_layout_facecam
+from ..project import add_selection, add_selection_from_candidate, create_or_load_project, get_project_data, load_npz, set_layout_facecam
 from ..profile import load_profile
 from ..publisher.accounts import AccountStore
 from ..publisher.jobs import PublishJobStore
@@ -203,6 +203,8 @@ def create_app(
         step = max(1, int(n / max(1, int(max_points))))
         idx = np.arange(0, n, step)
         down = scores[idx]
+        if not np.isfinite(down).all():
+            down = np.where(np.isfinite(down), down, 0.0)
 
         proj_data = get_project_data(proj)
         hop_s = float(
@@ -232,6 +234,8 @@ def create_app(
         step = max(1, int(n / max(1, int(max_points))))
         idx = np.arange(0, n, step)
         down = scores[idx]
+        if not np.isfinite(down).all():
+            down = np.where(np.isfinite(down), down, 0.0)
 
         proj_data = get_project_data(proj)
         hop_s = float(
