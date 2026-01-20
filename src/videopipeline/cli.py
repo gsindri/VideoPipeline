@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
+import time
+import uuid
 import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -15,6 +19,12 @@ from .metadata import build_metadata, derive_hook_text, write_metadata
 from .profile import load_profile
 from .project import add_selection_from_candidate, create_or_load_project, get_project_data
 from .transcribe import TranscribeConfig, load_transcript_json, save_transcript_json, transcribe_segment
+from .publisher.accounts import AccountStore
+from .publisher.queue import PublishWorker
+from .publisher.secrets import delete_tokens, store_tokens
+from .publisher.state import accounts_path
+from .publisher.connectors.tiktok import build_authorize_url, build_pkce_pair, exchange_code
+from .publisher.presets import AccountPreset
 
 
 def _fmt_time(seconds: float) -> str:
@@ -262,6 +272,189 @@ def cmd_attach_chat(args: argparse.Namespace) -> None:
     print(f"Project: {proj.project_dir}")
 
 
+def cmd_accounts_list(_: argparse.Namespace) -> None:
+    store = AccountStore()
+    accounts = store.list()
+    if not accounts:
+        print("No accounts configured.")
+        return
+    for acct in accounts:
+        print(f"{acct.id}  {acct.platform}  {acct.label}")
+
+
+def cmd_accounts_add_youtube(args: argparse.Namespace) -> None:
+    from google_auth_oauthlib.flow import InstalledAppFlow
+
+    scopes = args.scopes.split(",") if args.scopes else ["https://www.googleapis.com/auth/youtube.upload"]
+    flow = InstalledAppFlow.from_client_secrets_file(str(args.client_secrets), scopes=scopes)
+    creds = flow.run_local_server(port=args.redirect_port)
+    tokens = {
+        "access_token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri": creds.token_uri,
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes": list(creds.scopes or []),
+    }
+    store = AccountStore()
+    account = store.add(platform="youtube", label=args.label or "YouTube")
+    store_tokens("youtube", account.id, tokens)
+    print(f"Added YouTube account: {account.id}")
+    print(f"Accounts file: {accounts_path()}")
+
+
+def cmd_accounts_add_tiktok(args: argparse.Namespace) -> None:
+    verifier, challenge = build_pkce_pair()
+    state = uuid.uuid4().hex
+    redirect_uri = f"http://127.0.0.1:{args.redirect_port}/callback"
+    scopes = args.scopes or "user.info.basic,video.upload"
+    url = build_authorize_url(
+        client_key=args.client_key,
+        redirect_uri=redirect_uri,
+        scopes=scopes,
+        state=state,
+        code_challenge=challenge,
+    )
+
+    code_holder: dict[str, str] = {}
+    done = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path.startswith("/callback"):
+                query = self.path.split("?", 1)[-1]
+                params = dict(pair.split("=", 1) for pair in query.split("&") if "=" in pair)
+                if params.get("state") != state:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Invalid state.")
+                    return
+                code = params.get("code")
+                if code:
+                    code_holder["code"] = code
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"Authorization received. You can close this window.")
+                    done.set()
+                    return
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b"Missing code.")
+
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+    server = HTTPServer(("127.0.0.1", args.redirect_port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    webbrowser.open(url)
+    print("Waiting for TikTok authorization...")
+    done.wait(timeout=180)
+    server.shutdown()
+
+    code = code_holder.get("code")
+    if not code:
+        raise RuntimeError("TikTok authorization timed out.")
+
+    token_payload = exchange_code(
+        client_key=args.client_key,
+        client_secret=args.client_secret,
+        code=code,
+        redirect_uri=redirect_uri,
+        code_verifier=verifier,
+    )
+    token_payload["client_key"] = args.client_key
+    token_payload["client_secret"] = args.client_secret
+    token_payload["expires_at"] = time.time() + float(token_payload.get("expires_in", 0))
+
+    store = AccountStore()
+    presets = AccountPreset(default_privacy="private").to_dict()
+    account = store.add(platform="tiktok", label=args.label or "TikTok", presets=presets)
+    store_tokens("tiktok", account.id, token_payload)
+    print(f"Added TikTok account: {account.id}")
+
+
+def cmd_accounts_remove(args: argparse.Namespace) -> None:
+    store = AccountStore()
+    account = store.get(args.account_id)
+    if not account:
+        print("Account not found.")
+        return
+    store.remove(args.account_id)
+    delete_tokens(account.platform, account.id)
+    print(f"Removed account: {args.account_id}")
+
+
+def cmd_publish(args: argparse.Namespace) -> None:
+    store = AccountStore()
+    account = store.get(args.account)
+    if not account:
+        raise RuntimeError("account_not_found")
+    worker = PublishWorker(account_store=store)
+    job = worker.queue_job(
+        platform=account.platform,
+        account_id=account.id,
+        file_path=args.export,
+        metadata_path=args.meta,
+    )
+    print(f"Queued job: {job.id}")
+    if not args.async_mode:
+        worker.run_once(job.id)
+        job = worker.job_store.get_job(job.id)
+        print(f"Job status: {job.status}")
+
+
+def cmd_publish_project(args: argparse.Namespace) -> None:
+    project_path = Path(args.project)
+    if not project_path.exists():
+        project_path = Path("outputs") / "projects" / args.project
+    project_file = project_path / "project.json"
+    if not project_file.exists():
+        raise RuntimeError("project_not_found")
+
+    proj_data = json.loads(project_file.read_text(encoding="utf-8"))
+    exports = proj_data.get("exports") or []
+    if not exports:
+        print("No exports to publish.")
+        return
+
+    store = AccountStore()
+    account = store.get(args.account)
+    if not account:
+        raise RuntimeError("account_not_found")
+    worker = PublishWorker(account_store=store)
+    queued = 0
+    for exp in exports:
+        output = Path(exp.get("output") or "")
+        meta = output.with_suffix(".metadata.json")
+        if not output.exists() or not meta.exists():
+            continue
+        worker.queue_job(
+            platform=account.platform,
+            account_id=account.id,
+            file_path=output,
+            metadata_path=meta,
+        )
+        queued += 1
+    print(f"Queued {queued} publish jobs.")
+
+
+def cmd_jobs_list(_: argparse.Namespace) -> None:
+    worker = PublishWorker()
+    jobs = worker.job_store.list_jobs()
+    for job in jobs:
+        print(
+            f"{job.id}  {job.status}  {job.platform}  {job.account_id}  "
+            f"{job.progress:.0%}  attempts={job.attempts}"
+        )
+
+
+def cmd_jobs_retry(args: argparse.Namespace) -> None:
+    worker = PublishWorker()
+    job = worker.job_store.retry(args.job_id)
+    print(f"Job {job.id} queued for retry.")
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(prog="vp", description="VideoPipeline CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -313,6 +506,57 @@ def main(argv: Optional[List[str]] = None) -> None:
     c.add_argument("--hop", type=float, default=None)
     c.add_argument("--smooth", type=float, default=3.0)
     c.set_defaults(func=cmd_attach_chat)
+
+    accounts = sub.add_parser("accounts", help="Manage publishing accounts.")
+    accounts_sub = accounts.add_subparsers(dest="accounts_cmd", required=True)
+
+    accounts_list = accounts_sub.add_parser("list", help="List configured accounts.")
+    accounts_list.set_defaults(func=cmd_accounts_list)
+
+    accounts_add = accounts_sub.add_parser("add", help="Add a new publishing account.")
+    accounts_add_sub = accounts_add.add_subparsers(dest="platform", required=True)
+
+    youtube_add = accounts_add_sub.add_parser("youtube", help="Add a YouTube account via OAuth.")
+    youtube_add.add_argument("--client-secrets", type=Path, required=True)
+    youtube_add.add_argument("--label", type=str, default=None)
+    youtube_add.add_argument("--scopes", type=str, default=None)
+    youtube_add.add_argument("--redirect-port", type=int, default=8080)
+    youtube_add.set_defaults(func=cmd_accounts_add_youtube)
+
+    tiktok_add = accounts_add_sub.add_parser("tiktok", help="Add a TikTok account via OAuth.")
+    tiktok_add.add_argument("--client-key", type=str, required=True)
+    tiktok_add.add_argument("--client-secret", type=str, required=True)
+    tiktok_add.add_argument("--label", type=str, default=None)
+    tiktok_add.add_argument("--redirect-port", type=int, default=3455)
+    tiktok_add.add_argument("--scopes", type=str, default=None)
+    tiktok_add.set_defaults(func=cmd_accounts_add_tiktok)
+
+    accounts_remove = accounts_sub.add_parser("remove", help="Remove an account.")
+    accounts_remove.add_argument("account_id", type=str)
+    accounts_remove.set_defaults(func=cmd_accounts_remove)
+
+    publish = sub.add_parser("publish", help="Queue a publish job for an exported clip.")
+    publish.add_argument("--account", type=str, required=True)
+    publish.add_argument("--export", type=Path, required=True)
+    publish.add_argument("--meta", type=Path, required=True)
+    publish.add_argument("--async", dest="async_mode", action="store_true")
+    publish.set_defaults(func=cmd_publish)
+
+    publish_project = sub.add_parser("publish-project", help="Queue publish jobs for a project.")
+    publish_project.add_argument("--project", type=str, required=True)
+    publish_project.add_argument("--account", type=str, required=True)
+    publish_project.add_argument("--all-exports", action="store_true")
+    publish_project.set_defaults(func=cmd_publish_project)
+
+    jobs = sub.add_parser("jobs", help="Manage publish jobs.")
+    jobs_sub = jobs.add_subparsers(dest="jobs_cmd", required=True)
+
+    jobs_list = jobs_sub.add_parser("list", help="List recent publish jobs.")
+    jobs_list.set_defaults(func=cmd_jobs_list)
+
+    jobs_retry = jobs_sub.add_parser("retry", help="Retry a publish job.")
+    jobs_retry.add_argument("job_id", type=str)
+    jobs_retry.set_defaults(func=cmd_jobs_retry)
 
     args = parser.parse_args(argv)
     args.func(args)

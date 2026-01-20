@@ -13,6 +13,10 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
     "PyYAML>=6.0",
+    "keyring>=24.3",
+    "requests>=2.31",
+    "google-auth>=2.29",
+    "google-auth-oauthlib>=1.2",
 ]
 
 [project.scripts]

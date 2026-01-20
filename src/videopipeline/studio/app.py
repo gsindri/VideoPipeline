@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -14,6 +15,9 @@ from ..analysis_highlights import compute_highlights_analysis
 from ..layouts import RectNorm
 from ..project import Project, add_selection, add_selection_from_candidate, create_or_load_project, get_project_data, load_npz, set_layout_facecam
 from ..profile import load_profile
+from ..publisher.accounts import AccountStore
+from ..publisher.jobs import PublishJobStore
+from ..publisher.queue import PublishWorker
 from .jobs import JOB_MANAGER
 from .range import ranged_file_response
 
@@ -27,6 +31,10 @@ def create_app(
     profile = load_profile(profile_path)
 
     app = FastAPI(title="VideoPipeline Studio")
+    account_store = AccountStore()
+    publish_store = PublishJobStore()
+    publish_worker = PublishWorker(job_store=publish_store, account_store=account_store)
+    publish_worker.start()
 
     static_dir = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
@@ -42,6 +50,49 @@ def create_app(
     @app.get("/api/project")
     def api_project() -> JSONResponse:
         return JSONResponse(get_project_data(proj))
+
+    @app.get("/api/publisher/accounts")
+    def api_publisher_accounts() -> JSONResponse:
+        accounts = [acct.to_dict() for acct in account_store.list()]
+        return JSONResponse(accounts)
+
+    @app.post("/api/publisher/publish")
+    def api_publisher_publish(body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        account_id = str(body.get("account_id") or "")
+        file_path = Path(body.get("file_path") or "")
+        metadata_path = Path(body.get("metadata_path") or "")
+        account = account_store.get(account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="account_not_found")
+        if not file_path.exists() or not metadata_path.exists():
+            raise HTTPException(status_code=404, detail="missing_file_or_metadata")
+        job = publish_worker.queue_job(
+            platform=account.platform,
+            account_id=account.id,
+            file_path=file_path,
+            metadata_path=metadata_path,
+        )
+        return JSONResponse({"job_id": job.id})
+
+    @app.get("/api/publisher/jobs")
+    def api_publisher_jobs() -> JSONResponse:
+        jobs = [job.to_dict() for job in publish_store.list_jobs()]
+        return JSONResponse(jobs)
+
+    @app.get("/api/publisher/jobs/stream")
+    def api_publisher_jobs_stream() -> StreamingResponse:
+        def event_stream():
+            last_seen: dict[str, str] = {}
+            while True:
+                jobs = publish_store.list_jobs()
+                for job in jobs:
+                    payload = json.dumps(job.to_dict())
+                    if last_seen.get(job.id) != job.updated_at:
+                        last_seen[job.id] = job.updated_at
+                        yield f"data: {payload}\n\n"
+                time.sleep(1.0)
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     @app.get("/api/layout")
     def api_layout() -> JSONResponse:
