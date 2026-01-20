@@ -44,6 +44,60 @@ This repository starts with a clean foundation (README, LICENSE, .gitignore). Th
 - Multiple destination accounts per platform
 - Dry-run/export-only mode when APIs are unavailable
 
+## Publisher layer (Step 6)
+
+The publisher layer turns exports (MP4 + metadata JSON from Step 5) into queued uploads with retry support.
+
+### State + security
+
+- Windows state lives in `%APPDATA%\\VideoPipeline\\`
+- macOS/Linux state lives in `~/.videopipeline/`
+- `accounts.json` stores account metadata (no secrets)
+- `publisher.sqlite` stores the publish queue and deduplication records
+- OAuth tokens are stored in the OS credential store via `keyring`
+
+### CLI: accounts
+
+```bash
+vp accounts list
+
+vp accounts add youtube --client-secrets path/to/client_secrets.json --label "Main YouTube"
+
+vp accounts add tiktok \
+  --client-key <client_key> \
+  --client-secret <client_secret> \
+  --redirect-port 3455 \
+  --scopes "user.info.basic,video.upload,video.publish" \
+  --label "Main TikTok"
+
+vp accounts remove <account_id>
+```
+
+### CLI: publish
+
+```bash
+vp publish --account <account_id> --export path/to/clip.mp4 --meta path/to/clip.metadata.json
+
+# Queue all exports from a project
+vp publish-project --project <project_id> --account <account_id>
+
+# Review the queue
+vp jobs list
+vp jobs retry <job_id>
+```
+
+### Studio API (minimum)
+
+- `GET /api/publisher/accounts`
+- `POST /api/publisher/publish`
+- `GET /api/publisher/jobs`
+- `GET /api/publisher/jobs/stream` (SSE)
+
+### Defaults + platform notes
+
+- YouTube uploads default to **private** to avoid unverified-project visibility issues.
+- TikTok supports both inbox upload (`video.upload`) and direct post (`video.publish`) flows.
+
 ## Repo conventions (proposed)
 
 
