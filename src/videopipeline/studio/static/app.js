@@ -8,6 +8,15 @@ let facecamRect = null;
 let lastBatchSelectionIds = [];
 let calibrating = false;
 let isStudioMode = false;
+let currentTab = 'edit';
+
+// Publish state
+let publishAccounts = [];
+let publishExports = [];
+let selectedAccountIds = new Set();
+let selectedExportIds = new Set();
+let publishJobsSSE = null;
+let publishJobs = new Map();
 
 const jobs = new Map();
 
@@ -689,6 +698,417 @@ function wireUI() {
   });
 }
 
+// =========================================================================
+// TAB SWITCHING
+// =========================================================================
+
+function switchTab(tabName) {
+  currentTab = tabName;
+
+  // Update tab buttons
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.tab === tabName);
+  });
+
+  // Show/hide tab content
+  const editContent = $('#editTabContent');
+  const publishContent = $('#publishTabContent');
+
+  if (tabName === 'edit') {
+    editContent.style.display = 'grid';
+    publishContent.style.display = 'none';
+  } else if (tabName === 'publish') {
+    editContent.style.display = 'none';
+    publishContent.style.display = 'grid';
+    // Load publish data when switching to tab
+    loadPublishData();
+    startPublishJobsSSE();
+  }
+}
+
+function wireTabUI() {
+  const tabEdit = $('#tabEdit');
+  const tabPublish = $('#tabPublish');
+
+  if (tabEdit) tabEdit.onclick = () => switchTab('edit');
+  if (tabPublish) tabPublish.onclick = () => switchTab('publish');
+}
+
+// =========================================================================
+// PUBLISH TAB FUNCTIONS
+// =========================================================================
+
+async function loadPublishData() {
+  await Promise.all([
+    loadPublishAccounts(),
+    loadPublishExports(),
+    loadPublishJobs(),
+  ]);
+  updatePublishSelectionInfo();
+}
+
+async function loadPublishAccounts() {
+  const container = $('#publishAccounts');
+  const noAccountsCard = $('#noAccountsCard');
+  container.innerHTML = '<div class="small">Loading accounts...</div>';
+
+  try {
+    const res = await apiGet('/api/publisher/accounts');
+    publishAccounts = res.accounts || [];
+
+    if (publishAccounts.length === 0) {
+      container.innerHTML = '';
+      noAccountsCard.style.display = 'block';
+      return;
+    }
+
+    noAccountsCard.style.display = 'none';
+    renderPublishAccounts();
+  } catch (e) {
+    container.innerHTML = `<div class="small">Error: ${e.message}</div>`;
+  }
+}
+
+function renderPublishAccounts() {
+  const container = $('#publishAccounts');
+  const platformFilter = $('#publishPlatformFilter').value;
+  const searchTerm = $('#publishAccountSearch').value.toLowerCase();
+
+  let filtered = publishAccounts;
+  if (platformFilter) {
+    filtered = filtered.filter(a => a.platform === platformFilter);
+  }
+  if (searchTerm) {
+    filtered = filtered.filter(a =>
+      a.label.toLowerCase().includes(searchTerm) ||
+      a.platform.toLowerCase().includes(searchTerm)
+    );
+  }
+
+  if (filtered.length === 0) {
+    container.innerHTML = '<div class="small">No matching accounts.</div>';
+    return;
+  }
+
+  container.innerHTML = '';
+  for (const account of filtered) {
+    const el = document.createElement('div');
+    el.className = 'selectable-item' + (selectedAccountIds.has(account.id) ? ' selected' : '');
+    el.innerHTML = `
+      <span class="checkbox"></span>
+      <span class="title">${account.label}</span>
+      <span class="badge" style="margin-left:8px">${account.platform}</span>
+    `;
+    el.onclick = () => toggleAccountSelection(account.id);
+    container.appendChild(el);
+  }
+}
+
+function toggleAccountSelection(accountId) {
+  if (selectedAccountIds.has(accountId)) {
+    selectedAccountIds.delete(accountId);
+  } else {
+    selectedAccountIds.add(accountId);
+  }
+  renderPublishAccounts();
+  updatePublishSelectionInfo();
+}
+
+async function loadPublishExports() {
+  const container = $('#publishExports');
+  container.innerHTML = '<div class="small">Loading exports...</div>';
+
+  try {
+    const res = await apiGet('/api/publisher/exports');
+    publishExports = res.exports || [];
+
+    if (publishExports.length === 0) {
+      container.innerHTML = '<div class="small">No exports yet. Export clips from the Edit tab first.</div>';
+      return;
+    }
+
+    renderPublishExports();
+  } catch (e) {
+    container.innerHTML = `<div class="small">Error: ${e.message}</div>`;
+  }
+}
+
+function renderPublishExports() {
+  const container = $('#publishExports');
+
+  if (publishExports.length === 0) {
+    container.innerHTML = '<div class="small">No exports yet.</div>';
+    return;
+  }
+
+  container.innerHTML = '';
+  for (const exp of publishExports) {
+    const el = document.createElement('div');
+    el.className = 'selectable-item' + (selectedExportIds.has(exp.export_id) ? ' selected' : '');
+    const dur = fmtTime(exp.duration_seconds || 0);
+    const sizeMB = ((exp.file_size_bytes || 0) / 1024 / 1024).toFixed(1);
+    el.innerHTML = `
+      <span class="checkbox"></span>
+      <div class="title">${exp.mp4_filename}</div>
+      <div class="meta">${dur} • ${sizeMB} MB • ${exp.template || 'unknown template'}</div>
+      <div class="meta small" style="margin-top:4px">${exp.title || '(no title)'}</div>
+    `;
+    el.onclick = () => toggleExportSelection(exp.export_id);
+    container.appendChild(el);
+  }
+}
+
+function toggleExportSelection(exportId) {
+  if (selectedExportIds.has(exportId)) {
+    selectedExportIds.delete(exportId);
+  } else {
+    selectedExportIds.add(exportId);
+  }
+  renderPublishExports();
+  updatePublishSelectionInfo();
+}
+
+function updatePublishSelectionInfo() {
+  const info = $('#publishSelectionInfo');
+  const numAccounts = selectedAccountIds.size;
+  const numExports = selectedExportIds.size;
+
+  if (numAccounts === 0 && numExports === 0) {
+    info.textContent = 'Select exports and accounts above';
+  } else if (numAccounts === 0) {
+    info.textContent = `${numExports} export(s) selected — select accounts`;
+  } else if (numExports === 0) {
+    info.textContent = `${numAccounts} account(s) selected — select exports`;
+  } else {
+    const totalJobs = numAccounts * numExports;
+    info.textContent = `${numExports} export(s) × ${numAccounts} account(s) = ${totalJobs} job(s)`;
+  }
+}
+
+async function queuePublish() {
+  if (selectedAccountIds.size === 0) {
+    alert('Please select at least one account.');
+    return;
+  }
+  if (selectedExportIds.size === 0) {
+    alert('Please select at least one export.');
+    return;
+  }
+
+  const options = {
+    privacy: $('#publishPrivacy').value,
+  };
+
+  const titleOverride = $('#publishTitleOverride').value.trim();
+  if (titleOverride) options.title_override = titleOverride;
+
+  const descOverride = $('#publishDescOverride').value.trim();
+  if (descOverride) options.description_override = descOverride;
+
+  const hashtags = $('#publishHashtags').value.trim();
+  if (hashtags) options.hashtags_append = hashtags;
+
+  const stagger = parseInt($('#publishStagger').value, 10) || 0;
+
+  try {
+    const res = await apiJson('POST', '/api/publisher/queue_batch', {
+      account_ids: Array.from(selectedAccountIds),
+      export_ids: Array.from(selectedExportIds),
+      options,
+      stagger_seconds: stagger,
+    });
+
+    alert(`Queued ${res.total} publish job(s)!`);
+
+    // Clear selections
+    selectedAccountIds.clear();
+    selectedExportIds.clear();
+    renderPublishAccounts();
+    renderPublishExports();
+    updatePublishSelectionInfo();
+
+    // Refresh jobs
+    await loadPublishJobs();
+  } catch (e) {
+    alert(`Failed to queue publish: ${e.message}`);
+  }
+}
+
+async function loadPublishJobs() {
+  const container = $('#publishJobs');
+
+  try {
+    const res = await apiGet('/api/publisher/jobs?project_only=true&limit=50');
+    const jobsList = res.jobs || [];
+
+    publishJobs.clear();
+    for (const j of jobsList) {
+      publishJobs.set(j.id, j);
+    }
+
+    renderPublishJobs();
+  } catch (e) {
+    container.innerHTML = `<div class="small">Error: ${e.message}</div>`;
+  }
+}
+
+function renderPublishJobs() {
+  const container = $('#publishJobs');
+
+  if (publishJobs.size === 0) {
+    container.innerHTML = '<div class="small">No publish jobs yet.</div>';
+    return;
+  }
+
+  container.innerHTML = '';
+  const sorted = Array.from(publishJobs.values()).sort((a, b) =>
+    a.created_at < b.created_at ? 1 : -1
+  );
+
+  for (const job of sorted) {
+    const el = document.createElement('div');
+    el.className = 'item';
+
+    const pct = Math.round((job.progress || 0) * 100);
+    const account = publishAccounts.find(a => a.id === job.account_id);
+    const accountLabel = account ? account.label : job.account_id.slice(0, 8);
+    const fileName = job.file_path.split(/[/\\]/).pop();
+
+    let statusClass = job.status;
+    let actions = '';
+
+    if (job.status === 'failed' || job.status === 'canceled') {
+      actions = `<button class="retry-btn" data-job-id="${job.id}">Retry</button>`;
+    } else if (job.status === 'queued' || job.status === 'running') {
+      actions = `<button class="cancel-btn danger" data-job-id="${job.id}">Cancel</button>`;
+    }
+
+    let resultInfo = '';
+    if (job.status === 'succeeded' && job.remote_url) {
+      resultInfo = `<a href="${job.remote_url}" target="_blank" class="small">Open on ${job.platform}</a>`;
+    } else if (job.status === 'succeeded' && job.remote_id) {
+      resultInfo = `<span class="small">ID: ${job.remote_id}</span>`;
+    }
+
+    let errorInfo = '';
+    if (job.last_error) {
+      errorInfo = `<div class="small" style="color:var(--danger);margin-top:4px">${job.last_error}</div>`;
+    }
+
+    el.innerHTML = `
+      <div class="title">
+        <span class="status-badge ${statusClass}">${job.status}</span>
+        ${fileName} → ${accountLabel}
+      </div>
+      <div class="meta">${job.platform} • attempts: ${job.attempts}</div>
+      ${job.status === 'running' ? `
+        <div class="progress" style="margin-top:8px"><div style="width:${pct}%"></div></div>
+        <div class="small" style="margin-top:4px">${pct}%</div>
+      ` : ''}
+      ${resultInfo ? `<div style="margin-top:6px">${resultInfo}</div>` : ''}
+      ${errorInfo}
+      ${actions ? `<div class="actions" style="margin-top:8px">${actions}</div>` : ''}
+    `;
+
+    // Wire up buttons
+    const retryBtn = el.querySelector('.retry-btn');
+    if (retryBtn) {
+      retryBtn.onclick = (e) => {
+        e.stopPropagation();
+        retryPublishJob(job.id);
+      };
+    }
+
+    const cancelBtn = el.querySelector('.cancel-btn');
+    if (cancelBtn) {
+      cancelBtn.onclick = (e) => {
+        e.stopPropagation();
+        cancelPublishJob(job.id);
+      };
+    }
+
+    container.appendChild(el);
+  }
+}
+
+async function retryPublishJob(jobId) {
+  try {
+    const res = await apiJson('POST', `/api/publisher/jobs/${jobId}/retry`, {});
+    publishJobs.set(res.job.id, res.job);
+    renderPublishJobs();
+  } catch (e) {
+    alert(`Failed to retry job: ${e.message}`);
+  }
+}
+
+async function cancelPublishJob(jobId) {
+  if (!confirm('Cancel this job?')) return;
+  try {
+    const res = await apiJson('POST', `/api/publisher/jobs/${jobId}/cancel`, {});
+    publishJobs.set(res.job.id, res.job);
+    renderPublishJobs();
+  } catch (e) {
+    alert(`Failed to cancel job: ${e.message}`);
+  }
+}
+
+function startPublishJobsSSE() {
+  // Close existing SSE if any
+  if (publishJobsSSE) {
+    publishJobsSSE.close();
+  }
+
+  publishJobsSSE = new EventSource('/api/publisher/jobs/stream');
+
+  publishJobsSSE.onmessage = (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+      if (data.type === 'jobs_update' && data.jobs) {
+        for (const job of data.jobs) {
+          publishJobs.set(job.id, job);
+        }
+        renderPublishJobs();
+      }
+    } catch (e) {
+      console.warn('Failed to parse SSE:', e);
+    }
+  };
+
+  publishJobsSSE.onerror = () => {
+    // Reconnect after a delay
+    setTimeout(() => {
+      if (currentTab === 'publish') {
+        startPublishJobsSSE();
+      }
+    }, 3000);
+  };
+}
+
+function wirePublishUI() {
+  // Account filters
+  const platformFilter = $('#publishPlatformFilter');
+  const searchInput = $('#publishAccountSearch');
+
+  if (platformFilter) platformFilter.onchange = renderPublishAccounts;
+  if (searchInput) searchInput.oninput = renderPublishAccounts;
+
+  // Copy command button
+  const copyBtn = $('#btnCopyAccountCmd');
+  if (copyBtn) {
+    copyBtn.onclick = () => {
+      const cmd = 'vp accounts add youtube --client-secrets "path/to/client_secret.json" --label "My Channel"';
+      navigator.clipboard.writeText(cmd).then(() => {
+        copyBtn.textContent = 'Copied!';
+        setTimeout(() => { copyBtn.textContent = 'Copy command'; }, 2000);
+      });
+    };
+  }
+
+  // Queue publish button
+  const queueBtn = $('#btnQueuePublish');
+  if (queueBtn) queueBtn.onclick = queuePublish;
+}
+
 async function main() {
   try {
     profile = await apiGet('/api/profile');
@@ -696,6 +1116,8 @@ async function main() {
 
   // Wire up home UI first
   wireHomeUI();
+  wireTabUI();
+  wirePublishUI();
 
   // Check if there's an active project
   try {

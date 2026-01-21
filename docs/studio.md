@@ -55,6 +55,61 @@ Open: http://127.0.0.1:8765
 - Watch progress in Jobs
 - Click "← Home" to return to Home screen and open another project
 
+## Publishing from the UI
+
+Studio includes a **Publish** tab for uploading exports to YouTube (and later TikTok).
+
+### Setup: Add Accounts
+
+Accounts are managed via CLI. Add a YouTube account:
+
+```bash
+vp accounts add youtube --client-secrets "path/to/client_secret.json" --label "My Channel"
+```
+
+This opens an OAuth flow in your browser. Once authorized, the account appears in Studio's Publish tab.
+
+List accounts:
+
+```bash
+vp accounts list
+```
+
+### Using the Publish Tab
+
+1. **Open a project** from the Home screen or via `vp studio /path/to/video.mp4`
+2. **Export clips** from the Edit tab
+3. **Switch to the Publish tab**
+4. **Select accounts** — click to multi-select which accounts to publish to
+5. **Select exports** — click to multi-select which clips to publish
+6. **Configure options**:
+   - **Privacy**: Private / Unlisted / Public
+   - **Title override**: Replace the metadata title
+   - **Description override**: Replace the metadata description
+   - **Append hashtags**: Add hashtags to the description
+   - **Stagger**: Delay between posts (useful for multi-account publishing)
+7. **Click "Queue publish"** — creates one job per (export × account) combination
+
+### Monitoring Jobs
+
+The Publish Jobs panel shows:
+- **Status badges**: queued → running → succeeded/failed
+- **Progress bar** for running uploads
+- **Error messages** for failed jobs
+- **Remote URL** link when succeeded (click to open on YouTube)
+- **Retry** button for failed/canceled jobs
+- **Cancel** button for queued/running jobs
+
+Jobs update in real-time via SSE (Server-Sent Events).
+
+### Safety
+
+The publisher only allows uploading files from the active project's `exports/` directory. This prevents accidentally publishing arbitrary files.
+
+### Batch Publishing
+
+Select multiple exports and multiple accounts, then click Queue publish. Studio creates one job for each combination. Use the Stagger option to space out uploads (e.g., 600 seconds = 10 minutes between posts).
+
 ## Outputs
 
 Projects live in: `outputs/projects/<project_id>/`

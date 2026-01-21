@@ -20,6 +20,7 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+*.spec
 
 .pytest_cache/
 .mypy_cache/

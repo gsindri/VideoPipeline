@@ -22,6 +22,7 @@ from ..publisher.queue import PublishWorker
 from .jobs import JOB_MANAGER
 from .range import ranged_file_response
 from .home import list_recent_projects, windows_open_video_dialog, check_video_exists
+from .publisher_api import create_publisher_router
 
 
 class StudioContext:
@@ -76,12 +77,29 @@ def create_app(
     publish_worker = PublishWorker(job_store=publish_store, account_store=account_store)
     publish_worker.start()
 
+    # Mount publisher API router
+    def get_exports_dir():
+        if ctx.has_project:
+            return ctx.require_project().exports_dir
+        return None
+
+    publisher_router = create_publisher_router(
+        get_exports_dir=get_exports_dir,
+        account_store=account_store,
+        job_store=publish_store,
+    )
+    app.include_router(publisher_router)
+
     static_dir = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
     @app.get("/")
     def index() -> FileResponse:
         return FileResponse(str(static_dir / "index.html"))
+
+    @app.get("/api/health")
+    def api_health() -> JSONResponse:
+        return JSONResponse({"ok": True})
 
     @app.get("/api/profile")
     def api_profile() -> JSONResponse:

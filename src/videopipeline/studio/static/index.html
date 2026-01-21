@@ -43,13 +43,18 @@
     <header>
       <h1>VideoPipeline Studio</h1>
       <span class="muted" id="projectInfo">Loading project...</span>
+      <div class="tab-bar" style="margin-left:20px">
+        <button class="tab-btn active" data-tab="edit" id="tabEdit">Edit</button>
+        <button class="tab-btn" data-tab="publish" id="tabPublish">Publish</button>
+      </div>
       <button id="btnBackToHome" style="margin-left:20px" title="Back to Home">← Home</button>
       <span class="muted" style="margin-left:auto">
         Shortcuts: <kbd>Space</kbd> play/pause, <kbd>I</kbd> set start, <kbd>O</kbd> set end, <kbd>[</kbd>/<kbd>]</kbd> nudge ±0.5s
       </span>
     </header>
 
-    <main>
+    <!-- Edit Tab Content -->
+    <main id="editTabContent">
       <section id="left">
         <div class="panel">
           <h2>Source video</h2>
@@ -187,6 +192,92 @@
         <div class="panel">
           <h2>Jobs</h2>
           <div class="list" id="jobs"></div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Publish Tab Content -->
+    <main id="publishTabContent" style="display:none">
+      <section id="publishLeft">
+        <div class="panel">
+          <h2>Accounts</h2>
+          <div class="row" style="margin-bottom:10px">
+            <select id="publishPlatformFilter">
+              <option value="">All platforms</option>
+              <option value="youtube">YouTube</option>
+              <option value="tiktok">TikTok</option>
+            </select>
+            <input type="text" id="publishAccountSearch" placeholder="Search accounts..." style="flex:1" />
+          </div>
+          <div class="list" id="publishAccounts">
+            <div class="small">Loading accounts...</div>
+          </div>
+          <div id="noAccountsCard" class="panel" style="display:none;margin-top:12px;background:#1a1e24">
+            <p class="small">No accounts connected yet.</p>
+            <p class="small">Add an account via CLI:</p>
+            <code class="small" style="display:block;padding:8px;background:#0f1318;border-radius:6px;margin-top:8px;word-break:break-all">vp accounts add youtube --client-secrets "path/to/client_secret.json" --label "My Channel"</code>
+            <button id="btnCopyAccountCmd" style="margin-top:8px">Copy command</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Publish Options</h2>
+          <div class="row">
+            <label>Privacy
+              <select id="publishPrivacy">
+                <option value="private">Private</option>
+                <option value="unlisted">Unlisted</option>
+                <option value="public">Public</option>
+              </select>
+            </label>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <label style="width:100%">Title override (optional)
+              <input type="text" id="publishTitleOverride" placeholder="Leave blank to use metadata title" style="width:100%" />
+            </label>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <label style="width:100%">Description override (optional)
+              <textarea id="publishDescOverride" placeholder="Leave blank to use metadata description" rows="3" style="width:100%;resize:vertical"></textarea>
+            </label>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <label style="width:100%">Append hashtags (optional)
+              <input type="text" id="publishHashtags" placeholder="#shorts #gaming" style="width:100%" />
+            </label>
+          </div>
+          <details style="margin-top:12px">
+            <summary class="small" style="cursor:pointer">Batch options</summary>
+            <div class="row" style="margin-top:10px">
+              <label>Stagger (seconds between posts)
+                <input type="number" id="publishStagger" value="0" min="0" />
+              </label>
+            </div>
+          </details>
+        </div>
+
+        <div class="panel">
+          <h2>Actions</h2>
+          <div class="row">
+            <button class="primary" id="btnQueuePublish">Queue publish</button>
+            <span class="small" id="publishSelectionInfo">Select exports and accounts above</span>
+          </div>
+        </div>
+      </section>
+
+      <section id="publishRight">
+        <div class="panel">
+          <h2>Exports</h2>
+          <div class="list" id="publishExports">
+            <div class="small">Loading exports...</div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Publish Jobs</h2>
+          <div class="list" id="publishJobs">
+            <div class="small">No jobs yet.</div>
+          </div>
         </div>
       </section>
     </main>
