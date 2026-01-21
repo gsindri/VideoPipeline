@@ -86,7 +86,7 @@ def cmd_studio(args: argparse.Namespace) -> None:
 
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port, reload=args.reload)
+    uvicorn.run(app, host=args.host, port=args.port, reload=args.reload, log_level="warning")
 
 
 def cmd_export(args: argparse.Namespace) -> None:
@@ -466,7 +466,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     p.set_defaults(func=cmd_suggest)
 
     s = sub.add_parser("studio", help="Launch the local review + export studio web app.")
-    s.add_argument("video", type=Path)
+    s.add_argument("video", type=Path, nargs="?", default=None, help="Video file to open (optional, launches Home if omitted)")
     s.add_argument("--profile", type=Path, default=None, help="Path to a YAML profile (e.g. profiles/gaming.yaml)")
     s.add_argument("--host", type=str, default="127.0.0.1")
     s.add_argument("--port", type=int, default=8765)

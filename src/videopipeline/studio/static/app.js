@@ -7,6 +7,7 @@ let currentCandidate = null;
 let facecamRect = null;
 let lastBatchSelectionIds = [];
 let calibrating = false;
+let isStudioMode = false;
 
 const jobs = new Map();
 
@@ -41,6 +42,136 @@ async function apiJson(method, path, body) {
     throw new Error(`${method} ${path} -> ${r.status} ${txt}`);
   }
   return await r.json();
+}
+
+// =========================================================================
+// VIEW SWITCHING
+// =========================================================================
+
+function showHomeView() {
+  isStudioMode = false;
+  $('#homeView').style.display = 'block';
+  $('#studioView').style.display = 'none';
+  loadRecentProjects();
+}
+
+function showStudioView() {
+  isStudioMode = true;
+  $('#homeView').style.display = 'none';
+  $('#studioView').style.display = 'block';
+  // Reload video element src to refresh
+  const v = $('#video');
+  if (v) {
+    v.src = '/video?' + Date.now();
+    v.load();
+  }
+}
+
+// =========================================================================
+// HOME VIEW FUNCTIONS
+// =========================================================================
+
+async function loadRecentProjects() {
+  const container = $('#recentProjects');
+  container.innerHTML = '<div class="small">Loading...</div>';
+
+  try {
+    const res = await apiGet('/api/home/recent_projects');
+    const projects = res.projects || [];
+
+    if (projects.length === 0) {
+      container.innerHTML = '<div class="small">No recent projects found.</div>';
+      return;
+    }
+
+    container.innerHTML = '';
+    for (const p of projects) {
+      const el = document.createElement('div');
+      el.className = 'item';
+      const dur = fmtTime(p.duration_seconds || 0);
+      const sels = p.selections_count || 0;
+      const exps = p.exports_count || 0;
+      el.innerHTML = `
+        <div class="title">${p.video_name || 'Unknown video'}</div>
+        <div class="meta">Duration: ${dur} • Selections: ${sels} • Exports: ${exps}</div>
+        <div class="meta small" style="opacity:0.7;word-break:break-all">${p.video_path || ''}</div>
+        <div class="actions" style="margin-top:8px">
+          <button class="primary">Open project</button>
+        </div>
+      `;
+      const btn = el.querySelector('button');
+      btn.onclick = () => openProjectByPath(p.video_path);
+      container.appendChild(el);
+    }
+  } catch (e) {
+    container.innerHTML = `<div class="small">Error loading projects: ${e.message}</div>`;
+  }
+}
+
+async function openProjectByPath(videoPath) {
+  if (!videoPath) {
+    alert('Please enter a video path.');
+    return;
+  }
+
+  try {
+    const res = await apiJson('POST', '/api/home/open_video', { video_path: videoPath });
+    if (res.active && res.project) {
+      project = res.project;
+      showStudioView();
+      await initStudioView();
+    }
+  } catch (e) {
+    alert(`Failed to open video: ${e.message}`);
+  }
+}
+
+async function openVideoDialog() {
+  try {
+    const res = await apiJson('POST', '/api/home/open_dialog', {});
+    if (res.video_path) {
+      await openProjectByPath(res.video_path);
+    } else if (res.error === 'not_windows') {
+      alert('Native file dialog is only available on Windows. Please use the path input instead.');
+    }
+    // If null, user cancelled - do nothing
+  } catch (e) {
+    alert(`Failed to open dialog: ${e.message}`);
+  }
+}
+
+async function closeProject() {
+  try {
+    await apiJson('POST', '/api/home/close_project', {});
+    project = null;
+    showHomeView();
+  } catch (e) {
+    alert(`Failed to close project: ${e.message}`);
+  }
+}
+
+function wireHomeUI() {
+  const btnOpenDialog = $('#btnOpenDialog');
+  const btnOpenByPath = $('#btnOpenByPath');
+  const videoPathInput = $('#videoPathInput');
+
+  if (btnOpenDialog) {
+    btnOpenDialog.onclick = openVideoDialog;
+  }
+
+  if (btnOpenByPath && videoPathInput) {
+    btnOpenByPath.onclick = () => openProjectByPath(videoPathInput.value.trim());
+    videoPathInput.onkeydown = (e) => {
+      if (e.key === 'Enter') {
+        openProjectByPath(videoPathInput.value.trim());
+      }
+    };
+  }
+
+  const btnBackToHome = $('#btnBackToHome');
+  if (btnBackToHome) {
+    btnBackToHome.onclick = closeProject;
+  }
 }
 
 function setBuilder(startS, endS, title = '', template = '') {
@@ -270,7 +401,14 @@ async function refreshTimeline() {
 }
 
 async function refreshProject() {
-  project = await apiGet('/api/project');
+  try {
+    const res = await apiGet('/api/project');
+    if (res.active && res.project) {
+      project = res.project;
+    }
+  } catch (e) {
+    console.warn('Failed to refresh project:', e);
+  }
   renderProjectInfo();
   renderCandidates();
   renderSelections();
@@ -556,7 +694,30 @@ async function main() {
     profile = await apiGet('/api/profile');
   } catch (_) {}
 
-  await refreshProject();
+  // Wire up home UI first
+  wireHomeUI();
+
+  // Check if there's an active project
+  try {
+    const res = await apiGet('/api/project');
+    if (res.active && res.project) {
+      project = res.project;
+      showStudioView();
+      await initStudioView();
+    } else {
+      showHomeView();
+    }
+  } catch (e) {
+    console.error('Failed to check project status:', e);
+    showHomeView();
+  }
+}
+
+async function initStudioView() {
+  renderProjectInfo();
+  renderCandidates();
+  renderSelections();
+  await refreshTimeline();
 
   try {
     const layout = await apiGet('/api/layout');

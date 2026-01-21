@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -13,22 +14,61 @@ from fastapi.staticfiles import StaticFiles
 from ..analysis_audio import compute_audio_analysis
 from ..analysis_highlights import compute_highlights_analysis
 from ..layouts import RectNorm
-from ..project import add_selection, add_selection_from_candidate, create_or_load_project, get_project_data, load_npz, set_layout_facecam
+from ..project import create_or_load_project, get_project_data, load_npz, set_layout_facecam, Project
 from ..profile import load_profile
 from ..publisher.accounts import AccountStore
 from ..publisher.jobs import PublishJobStore
 from ..publisher.queue import PublishWorker
 from .jobs import JOB_MANAGER
 from .range import ranged_file_response
+from .home import list_recent_projects, windows_open_video_dialog, check_video_exists
+
+
+class StudioContext:
+    """Holds the active project context for Studio."""
+
+    def __init__(
+        self,
+        video_path: Optional[Path] = None,
+        profile_path: Optional[Path] = None,
+    ):
+        self.profile = load_profile(profile_path)
+        self.profile_path = profile_path
+        self._project: Optional[Project] = None
+
+        if video_path is not None:
+            self._project = create_or_load_project(video_path)
+
+    @property
+    def project(self) -> Optional[Project]:
+        return self._project
+
+    @property
+    def has_project(self) -> bool:
+        return self._project is not None
+
+    def open_project(self, video_path: Path) -> Project:
+        """Open or create a project for the given video."""
+        self._project = create_or_load_project(video_path)
+        return self._project
+
+    def close_project(self) -> None:
+        """Close the current project."""
+        self._project = None
+
+    def require_project(self) -> Project:
+        """Return the current project or raise HTTPException if none."""
+        if self._project is None:
+            raise HTTPException(status_code=400, detail="no_active_project")
+        return self._project
 
 
 def create_app(
     *,
-    video_path: Path,
+    video_path: Optional[Path] = None,
     profile_path: Optional[Path] = None,
 ) -> FastAPI:
-    proj = create_or_load_project(video_path)
-    profile = load_profile(profile_path)
+    ctx = StudioContext(video_path=video_path, profile_path=profile_path)
 
     app = FastAPI(title="VideoPipeline Studio")
     account_store = AccountStore()
@@ -45,11 +85,66 @@ def create_app(
 
     @app.get("/api/profile")
     def api_profile() -> JSONResponse:
-        return JSONResponse(profile)
+        return JSONResponse(ctx.profile)
+
+    # -------------------------------------------------------------------------
+    # Home endpoints
+    # -------------------------------------------------------------------------
 
     @app.get("/api/project")
     def api_project() -> JSONResponse:
-        return JSONResponse(get_project_data(proj))
+        if not ctx.has_project:
+            return JSONResponse({"active": False})
+        proj = ctx.require_project()
+        data = get_project_data(proj)
+        return JSONResponse({"active": True, "project": data})
+
+    @app.get("/api/home/recent_projects")
+    def api_home_recent_projects() -> JSONResponse:
+        projects = list_recent_projects()
+        return JSONResponse({"projects": projects})
+
+    @app.post("/api/home/open_project")
+    def api_home_open_project(body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        video_path = body.get("video_path")
+        if not video_path:
+            raise HTTPException(status_code=400, detail="video_path_required")
+
+        video_path = Path(video_path)
+        if not video_path.exists():
+            raise HTTPException(status_code=404, detail="video_not_found")
+
+        proj = ctx.open_project(video_path)
+        return JSONResponse({"active": True, "project": get_project_data(proj)})
+
+    @app.post("/api/home/open_video")
+    def api_home_open_video(body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        video_path = body.get("video_path")
+        if not video_path:
+            raise HTTPException(status_code=400, detail="video_path_required")
+
+        video_path = Path(video_path)
+        if not video_path.exists():
+            raise HTTPException(status_code=404, detail="video_not_found")
+
+        proj = ctx.open_project(video_path)
+        return JSONResponse({"active": True, "project": get_project_data(proj)})
+
+    @app.post("/api/home/open_dialog")
+    def api_home_open_dialog():
+        if sys.platform != "win32":
+            return JSONResponse({"video_path": None, "error": "not_windows"})
+        result = windows_open_video_dialog()
+        return JSONResponse({"video_path": result})
+
+    @app.post("/api/home/close_project")
+    def api_home_close_project():
+        ctx.close_project()
+        return JSONResponse({"active": False})
+
+    # -------------------------------------------------------------------------
+    # Publisher endpoints
+    # -------------------------------------------------------------------------
 
     @app.get("/api/publisher/accounts")
     def api_publisher_accounts() -> JSONResponse:
@@ -96,11 +191,13 @@ def create_app(
 
     @app.get("/api/layout")
     def api_layout() -> JSONResponse:
+        proj = ctx.require_project()
         proj_data = get_project_data(proj)
         return JSONResponse(proj_data.get("layout", {}))
 
     @app.post("/api/layout/facecam")
     def api_layout_facecam(body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        proj = ctx.require_project()
         try:
             rect = RectNorm(
                 x=float(body.get("x")),
@@ -116,7 +213,8 @@ def create_app(
 
     @app.post("/api/analyze/audio")
     def api_analyze_audio(body: Dict[str, Any] = Body(default={})):  # type: ignore[valid-type]
-        cfg = profile.get("analysis", {}).get("audio", {})
+        proj = ctx.require_project()
+        cfg = ctx.profile.get("analysis", {}).get("audio", {})
         cfg = {**cfg, **(body or {})}
 
         job = JOB_MANAGER.create("analyze_audio")
@@ -151,7 +249,8 @@ def create_app(
 
     @app.post("/api/analyze/highlights")
     def api_analyze_highlights(body: Dict[str, Any] = Body(default={})):  # type: ignore[valid-type]
-        analysis_cfg = profile.get("analysis", {})
+        proj = ctx.require_project()
+        analysis_cfg = ctx.profile.get("analysis", {})
         body = body or {}
         audio_cfg = {**analysis_cfg.get("audio", {}), **(body.get("audio") or {})}
         motion_cfg = {**analysis_cfg.get("motion", {}), **(body.get("motion") or {})}
@@ -187,6 +286,7 @@ def create_app(
 
     @app.get("/api/audio/timeline")
     def api_audio_timeline(max_points: int = 2000) -> JSONResponse:
+        proj = ctx.require_project()
         if not proj.audio_features_path.exists():
             return JSONResponse({"ok": False, "reason": "no_audio_analysis"}, status_code=404)
 
@@ -211,13 +311,14 @@ def create_app(
             proj_data.get("analysis", {})
             .get("audio", {})
             .get("config", {})
-            .get("hop_seconds", profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
+            .get("hop_seconds", ctx.profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
         )
 
         return JSONResponse({"ok": True, "hop_seconds": hop_s, "indices": idx.tolist(), "scores": down.tolist()})
 
     @app.get("/api/highlights/timeline")
     def api_highlights_timeline(max_points: int = 2000) -> JSONResponse:
+        proj = ctx.require_project()
         if not proj.highlights_features_path.exists():
             return JSONResponse({"ok": False, "reason": "no_highlights_analysis"}, status_code=404)
 
@@ -243,32 +344,37 @@ def create_app(
             .get("highlights", {})
             .get("config", {})
             .get("audio", {})
-            .get("hop_seconds", profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
+            .get("hop_seconds", ctx.profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
         )
 
         return JSONResponse({"ok": True, "hop_seconds": hop_s, "indices": idx.tolist(), "scores": down.tolist()})
 
     @app.get("/video")
     async def video(request: Request):
+        proj = ctx.require_project()
         ext = Path(proj.video_path).suffix.lower()
         media_type = "video/mp4" if ext in {".mp4", ".m4v", ".mov"} else "application/octet-stream"
         return ranged_file_response(request, Path(proj.video_path), media_type=media_type)
 
     @app.post("/api/selections")
     def api_add_selection(body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        from ..project import add_selection
+        proj = ctx.require_project()
         start_s = float(body.get("start_s"))
         end_s = float(body.get("end_s"))
         title = str(body.get("title") or "")
         notes = str(body.get("notes") or "")
-        template = str(body.get("template") or profile.get("export", {}).get("template", "vertical_blur"))
+        template = str(body.get("template") or ctx.profile.get("export", {}).get("template", "vertical_blur"))
 
         add_selection(proj, start_s=start_s, end_s=end_s, title=title, notes=notes, template=template)
         return JSONResponse(get_project_data(proj))
 
     @app.post("/api/selections/from_candidates")
     def api_selections_from_candidates(body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        from ..project import add_selection_from_candidate
+        proj = ctx.require_project()
         top = int(body.get("top", 10))
-        template = str(body.get("template") or profile.get("export", {}).get("template", "vertical_blur"))
+        template = str(body.get("template") or ctx.profile.get("export", {}).get("template", "vertical_blur"))
 
         proj_data = get_project_data(proj)
         highlights = proj_data.get("analysis", {}).get("highlights", {})
@@ -286,6 +392,7 @@ def create_app(
     @app.patch("/api/selections/{selection_id}")
     def api_patch_selection(selection_id: str, body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
         from ..project import update_selection
+        proj = ctx.require_project()
 
         patch: Dict[str, Any] = {}
         for k in ["start_s", "end_s", "title", "notes", "template"]:
@@ -300,22 +407,24 @@ def create_app(
     @app.delete("/api/selections/{selection_id}")
     def api_delete_selection(selection_id: str):
         from ..project import remove_selection
+        proj = ctx.require_project()
 
         remove_selection(proj, selection_id)
         return JSONResponse(get_project_data(proj))
 
     @app.post("/api/export")
     def api_export(body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        proj = ctx.require_project()
         sel_id = str(body.get("selection_id"))
         proj_data = get_project_data(proj)
         selection = next((s for s in proj_data.get("selections", []) if s.get("id") == sel_id), None)
         if not selection:
             raise HTTPException(status_code=404, detail="selection_not_found")
 
-        export_cfg = {**profile.get("export", {}), **(body.get("export") or {})}
-        cap_cfg = {**profile.get("captions", {}), **(body.get("captions") or {})}
-        hook_cfg = {**profile.get("overlay", {}).get("hook_text", {}), **(body.get("hook_text") or {})}
-        pip_cfg = {**profile.get("layout", {}).get("pip", {}), **(body.get("pip") or {})}
+        export_cfg = {**ctx.profile.get("export", {}), **(body.get("export") or {})}
+        cap_cfg = {**ctx.profile.get("captions", {}), **(body.get("captions") or {})}
+        hook_cfg = {**ctx.profile.get("overlay", {}).get("hook_text", {}), **(body.get("hook_text") or {})}
+        pip_cfg = {**ctx.profile.get("layout", {}).get("pip", {}), **(body.get("pip") or {})}
 
         with_captions = bool(body.get("with_captions", cap_cfg.get("enabled", False)))
 
@@ -351,11 +460,12 @@ def create_app(
 
     @app.post("/api/export/batch")
     def api_export_batch(body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        proj = ctx.require_project()
         selection_ids = body.get("selection_ids") or []
-        export_cfg = {**profile.get("export", {}), **(body.get("export") or {})}
-        cap_cfg = {**profile.get("captions", {}), **(body.get("captions") or {})}
-        hook_cfg = {**profile.get("overlay", {}).get("hook_text", {}), **(body.get("hook_text") or {})}
-        pip_cfg = {**profile.get("layout", {}).get("pip", {}), **(body.get("pip") or {})}
+        export_cfg = {**ctx.profile.get("export", {}), **(body.get("export") or {})}
+        cap_cfg = {**ctx.profile.get("captions", {}), **(body.get("captions") or {})}
+        hook_cfg = {**ctx.profile.get("overlay", {}).get("hook_text", {}), **(body.get("hook_text") or {})}
+        pip_cfg = {**ctx.profile.get("layout", {}).get("pip", {}), **(body.get("pip") or {})}
         with_captions = bool(body.get("with_captions", cap_cfg.get("enabled", False)))
 
         whisper_cfg = None

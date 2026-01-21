@@ -215,3 +215,30 @@ video {
   width: 0%;
   background: var(--accent);
 }
+
+/* Home view styles */
+.home-main {
+  display: flex;
+  justify-content: center;
+  padding: 40px 20px;
+  min-height: calc(100vh - 100px);
+}
+
+.home-section {
+  max-width: 800px;
+  width: 100%;
+}
+
+.home-panel {
+  margin-bottom: 24px;
+}
+
+.home-panel h2 {
+  font-size: 16px;
+  margin-bottom: 16px;
+}
+
+.home-panel .list {
+  max-height: 400px;
+  overflow-y: auto;
+}

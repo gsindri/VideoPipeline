@@ -8,155 +8,189 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
-  <header>
-    <h1>VideoPipeline Studio</h1>
-    <span class="muted" id="projectInfo">Loading project...</span>
-    <span class="muted" style="margin-left:auto">
-      Shortcuts: <kbd>Space</kbd> play/pause, <kbd>I</kbd> set start, <kbd>O</kbd> set end, <kbd>[</kbd>/<kbd>]</kbd> nudge ±0.5s
-    </span>
-  </header>
+  <!-- ===== HOME VIEW ===== -->
+  <div id="homeView" style="display:none">
+    <header>
+      <h1>VideoPipeline Studio</h1>
+      <span class="muted">Home</span>
+    </header>
+    <main class="home-main">
+      <section class="home-section">
+        <div class="panel home-panel">
+          <h2>Open Video</h2>
+          <div class="row" style="gap:10px">
+            <button class="primary" id="btnOpenDialog">Browse for video...</button>
+          </div>
+          <div class="row" style="margin-top:15px;gap:10px">
+            <input type="text" id="videoPathInput" placeholder="Or paste video path here..." style="flex:1;min-width:300px" />
+            <button id="btnOpenByPath">Open</button>
+          </div>
+          <p class="small" style="margin-top:10px">Select a video file to create or open its project.</p>
+        </div>
 
-  <main>
-    <section id="left">
-      <div class="panel">
-        <h2>Source video</h2>
-        <div class="video-wrap">
-          <video id="video" controls preload="metadata" src="/video"></video>
-          <canvas id="facecamCanvas" class="overlay-canvas"></canvas>
+        <div class="panel home-panel">
+          <h2>Recent Projects</h2>
+          <div class="list" id="recentProjects">
+            <div class="small">Loading...</div>
+          </div>
         </div>
-        <div class="row" style="margin-top:10px">
-          <button id="btnSetStart">Set Start = current</button>
-          <button id="btnSetEnd">Set End = current</button>
-          <button id="btnSnapCandidate" title="Snap in/out to candidate">Snap to candidate</button>
-          <span class="small" id="timeReadout"></span>
-        </div>
-      </div>
+      </section>
+    </main>
+  </div>
 
-      <div class="panel">
-        <h2>Layout</h2>
-        <div class="row">
-          <button class="primary" id="btnCalibrateFacecam">Calibrate facecam</button>
-          <button id="btnSaveFacecam" disabled>Save facecam</button>
-          <span class="small" id="facecamStatus">No facecam calibration yet.</span>
-        </div>
-        <p class="small">Draw a rectangle around the facecam. Saved as normalized coordinates.</p>
-      </div>
+  <!-- ===== STUDIO VIEW ===== -->
+  <div id="studioView" style="display:none">
+    <header>
+      <h1>VideoPipeline Studio</h1>
+      <span class="muted" id="projectInfo">Loading project...</span>
+      <button id="btnBackToHome" style="margin-left:20px" title="Back to Home">← Home</button>
+      <span class="muted" style="margin-left:auto">
+        Shortcuts: <kbd>Space</kbd> play/pause, <kbd>I</kbd> set start, <kbd>O</kbd> set end, <kbd>[</kbd>/<kbd>]</kbd> nudge ±0.5s
+      </span>
+    </header>
 
-      <div class="panel">
-        <h2>Interest timeline</h2>
-        <div class="row">
-          <button class="primary" id="btnAnalyzeHighlights">Analyze highlights (audio+motion+scenes)</button>
-          <button id="btnAnalyzeAudio">Analyze audio only</button>
-          <span class="small" id="analysisStatus"></span>
+    <main>
+      <section id="left">
+        <div class="panel">
+          <h2>Source video</h2>
+          <div class="video-wrap">
+            <video id="video" controls preload="metadata" src="/video"></video>
+            <canvas id="facecamCanvas" class="overlay-canvas"></canvas>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <button id="btnSetStart">Set Start = current</button>
+            <button id="btnSetEnd">Set End = current</button>
+            <button id="btnSnapCandidate" title="Snap in/out to candidate">Snap to candidate</button>
+            <span class="small" id="timeReadout"></span>
+          </div>
         </div>
-        <div class="canvas-wrap">
-          <canvas id="chart" height="120"></canvas>
-        </div>
-        <p class="small">Higher score means more hype based on combined signals.</p>
-      </div>
 
-      <div class="panel">
-        <h2>Clip builder</h2>
-        <div class="row">
-          <label>Start (s)
-            <input type="number" id="startS" step="0.1" />
-          </label>
-          <label>End (s)
-            <input type="number" id="endS" step="0.1" />
-          </label>
-          <label>Title
-            <input type="text" id="title" placeholder="Optional title" style="width:260px" />
-          </label>
-          <label>Template
-            <select id="template">
-              <option value="vertical_blur">vertical_blur (gaming default)</option>
-              <option value="vertical_streamer_pip">vertical_streamer_pip (facecam PIP)</option>
-              <option value="vertical_streamer_split">vertical_streamer_split (facecam split)</option>
-              <option value="vertical_crop_center">vertical_crop_center</option>
-              <option value="original">original</option>
-            </select>
-          </label>
+        <div class="panel">
+          <h2>Layout</h2>
+          <div class="row">
+            <button class="primary" id="btnCalibrateFacecam">Calibrate facecam</button>
+            <button id="btnSaveFacecam" disabled>Save facecam</button>
+            <span class="small" id="facecamStatus">No facecam calibration yet.</span>
+          </div>
+          <p class="small">Draw a rectangle around the facecam. Saved as normalized coordinates.</p>
         </div>
-        <div class="row" style="margin-top:10px">
-          <button class="primary" id="btnSaveSelection">Save selection</button>
-          <button id="btnNudgeBack">◀ -0.5s</button>
-          <button id="btnNudgeFwd">+0.5s ▶</button>
-          <span class="small">Tip: fine-tune with arrow keys in the inputs.</span>
-        </div>
-      </div>
-    </section>
 
-    <section id="right">
-      <div class="panel">
-        <h2>Top candidates</h2>
-        <div class="list" id="candidates"></div>
-      </div>
-
-      <div class="panel">
-        <h2>Batch actions</h2>
-        <div class="row">
-          <label>Top N
-            <input type="number" id="batchTopN" value="10" min="1" />
-          </label>
-          <label>Template
-            <select id="batchTemplate">
-              <option value="vertical_streamer_pip">vertical_streamer_pip</option>
-              <option value="vertical_streamer_split">vertical_streamer_split</option>
-              <option value="vertical_blur">vertical_blur</option>
-              <option value="vertical_crop_center">vertical_crop_center</option>
-              <option value="original">original</option>
-            </select>
-          </label>
+        <div class="panel">
+          <h2>Interest timeline</h2>
+          <div class="row">
+            <button class="primary" id="btnAnalyzeHighlights">Analyze highlights (audio+motion+scenes)</button>
+            <button id="btnAnalyzeAudio">Analyze audio only</button>
+            <span class="small" id="analysisStatus"></span>
+          </div>
+          <div class="canvas-wrap">
+            <canvas id="chart" height="120"></canvas>
+          </div>
+          <p class="small">Higher score means more hype based on combined signals.</p>
         </div>
-        <div class="row" style="margin-top:10px">
-          <button class="primary" id="btnCreateSelections">Create selections from top candidates</button>
-          <button id="btnBatchExport">Batch export selections</button>
-        </div>
-        <p class="small">Creates selections from top highlight candidates, then exports them sequentially.</p>
-      </div>
 
-      <div class="panel">
-        <h2>Selections</h2>
-        <div class="list" id="selections"></div>
-      </div>
-
-      <div class="panel">
-        <h2>Export</h2>
-        <div class="row">
-          <label>Width
-            <input type="number" id="expW" value="1080" />
-          </label>
-          <label>Height
-            <input type="number" id="expH" value="1920" />
-          </label>
-          <label>FPS
-            <input type="number" id="expFps" value="30" />
-          </label>
-          <label>CRF
-            <input type="number" id="expCrf" value="20" />
-          </label>
-          <label>Preset
-            <select id="expPreset">
-              <option>veryfast</option>
-              <option>faster</option>
-              <option>fast</option>
-              <option>medium</option>
-            </select>
-          </label>
+        <div class="panel">
+          <h2>Clip builder</h2>
+          <div class="row">
+            <label>Start (s)
+              <input type="number" id="startS" step="0.1" />
+            </label>
+            <label>End (s)
+              <input type="number" id="endS" step="0.1" />
+            </label>
+            <label>Title
+              <input type="text" id="title" placeholder="Optional title" style="width:260px" />
+            </label>
+            <label>Template
+              <select id="template">
+                <option value="vertical_blur">vertical_blur (gaming default)</option>
+                <option value="vertical_streamer_pip">vertical_streamer_pip (facecam PIP)</option>
+                <option value="vertical_streamer_split">vertical_streamer_split (facecam split)</option>
+                <option value="vertical_crop_center">vertical_crop_center</option>
+                <option value="original">original</option>
+              </select>
+            </label>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <button class="primary" id="btnSaveSelection">Save selection</button>
+            <button id="btnNudgeBack">◀ -0.5s</button>
+            <button id="btnNudgeFwd">+0.5s ▶</button>
+            <span class="small">Tip: fine-tune with arrow keys in the inputs.</span>
+          </div>
         </div>
-        <div class="row" style="margin-top:10px">
-          <label><input type="checkbox" id="withCaptions" /> Burn-in captions (Whisper)</label>
-          <label><input type="checkbox" id="normalizeAudio" /> Normalize audio</label>
-        </div>
-        <p class="small">Captions require optional dependency: <code>pip install -e '.[whisper]'</code></p>
-      </div>
+      </section>
 
-      <div class="panel">
-        <h2>Jobs</h2>
-        <div class="list" id="jobs"></div>
-      </div>
-    </section>
-  </main>
+      <section id="right">
+        <div class="panel">
+          <h2>Top candidates</h2>
+          <div class="list" id="candidates"></div>
+        </div>
+
+        <div class="panel">
+          <h2>Batch actions</h2>
+          <div class="row">
+            <label>Top N
+              <input type="number" id="batchTopN" value="10" min="1" />
+            </label>
+            <label>Template
+              <select id="batchTemplate">
+                <option value="vertical_streamer_pip">vertical_streamer_pip</option>
+                <option value="vertical_streamer_split">vertical_streamer_split</option>
+                <option value="vertical_blur">vertical_blur</option>
+                <option value="vertical_crop_center">vertical_crop_center</option>
+                <option value="original">original</option>
+              </select>
+            </label>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <button class="primary" id="btnCreateSelections">Create selections from top candidates</button>
+            <button id="btnBatchExport">Batch export selections</button>
+          </div>
+          <p class="small">Creates selections from top highlight candidates, then exports them sequentially.</p>
+        </div>
+
+        <div class="panel">
+          <h2>Selections</h2>
+          <div class="list" id="selections"></div>
+        </div>
+
+        <div class="panel">
+          <h2>Export</h2>
+          <div class="row">
+            <label>Width
+              <input type="number" id="expW" value="1080" />
+            </label>
+            <label>Height
+              <input type="number" id="expH" value="1920" />
+            </label>
+            <label>FPS
+              <input type="number" id="expFps" value="30" />
+            </label>
+            <label>CRF
+              <input type="number" id="expCrf" value="20" />
+            </label>
+            <label>Preset
+              <select id="expPreset">
+                <option>veryfast</option>
+                <option>faster</option>
+                <option>fast</option>
+                <option>medium</option>
+              </select>
+            </label>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <label><input type="checkbox" id="withCaptions" /> Burn-in captions (Whisper)</label>
+            <label><input type="checkbox" id="normalizeAudio" /> Normalize audio</label>
+          </div>
+          <p class="small">Captions require optional dependency: <code>pip install -e '.[whisper]'</code></p>
+        </div>
+
+        <div class="panel">
+          <h2>Jobs</h2>
+          <div class="list" id="jobs"></div>
+        </div>
+      </section>
+    </main>
+  </div>
 
   <script src="/static/app.js"></script>
 </body>
