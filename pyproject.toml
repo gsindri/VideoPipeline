@@ -17,6 +17,7 @@ dependencies = [
     "requests>=2.31",
     "google-auth>=2.29",
     "google-auth-oauthlib>=1.2",
+    "yt-dlp>=2024.1.0",
 ]
 
 [project.scripts]

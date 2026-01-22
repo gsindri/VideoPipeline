@@ -29,8 +29,61 @@
         </div>
 
         <div class="panel home-panel">
+          <h2>Download from URL</h2>
+          <div class="row" style="gap:10px;align-items:center">
+            <input type="text" id="urlInput" placeholder="Paste YouTube/Twitch/etc URL..." style="flex:1;min-width:300px" />
+            <button id="btnPasteUrl" title="Paste from clipboard">📋</button>
+            <button id="btnProbeUrl" title="Detect site info">🔍 Probe</button>
+            <button class="primary" id="btnDownloadUrl">Download</button>
+          </div>
+          <div id="probeBadge" style="margin-top:8px;padding:8px 12px;background:#2a3a4a;border-radius:4px;display:none">
+            <span id="probeBadgeText" class="small" style="color:#7fdbff"></span>
+          </div>
+          <div class="row" style="margin-top:10px;gap:15px;align-items:center;flex-wrap:wrap">
+            <label class="small"><input type="checkbox" id="dlCreatePreview" checked /> Create preview</label>
+            <label class="small"><input type="checkbox" id="dlNoPlaylist" checked /> No playlist</label>
+            <label class="small" style="display:flex;align-items:center;gap:5px">
+              Speed:
+              <select id="dlSpeedMode" style="padding:2px 6px">
+                <option value="auto" selected>Auto (recommended)</option>
+                <option value="conservative">Conservative (N=4)</option>
+                <option value="balanced">Balanced (N=8)</option>
+                <option value="fast">Fast (N=16)</option>
+                <option value="aggressive">Aggressive (N=32)</option>
+              </select>
+            </label>
+            <label class="small" style="display:flex;align-items:center;gap:5px">
+              Quality:
+              <select id="dlQualityCap" style="padding:2px 6px">
+                <option value="source" selected>Source (best)</option>
+                <option value="1080">1080p</option>
+                <option value="720">720p</option>
+                <option value="480">480p</option>
+              </select>
+            </label>
+          </div>
+          <p class="small" style="margin-top:8px;color:#888">
+            <span id="dlHelpText">Paste a URL and click Download. Auto mode adapts speed per site.</span>
+          </p>
+        </div>
+
+        <div class="panel home-panel">
+          <h2>Jobs</h2>
+          <div class="list" id="homeJobs">
+            <div class="small">No active jobs.</div>
+          </div>
+        </div>
+
+        <div class="panel home-panel">
           <h2>Recent Projects</h2>
           <div class="list" id="recentProjects">
+            <div class="small">Loading...</div>
+          </div>
+        </div>
+
+        <div class="panel home-panel">
+          <h2>Recent Downloads</h2>
+          <div class="list" id="recentDownloads">
             <div class="small">Loading...</div>
           </div>
         </div>

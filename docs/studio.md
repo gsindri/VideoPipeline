@@ -25,7 +25,9 @@ vp studio
 The Home screen lets you:
 - **Browse for video**: Opens a native Windows file dialog to select a video
 - **Paste a path**: Enter a video path directly and click Open
+- **Download from URL**: Paste a YouTube/Twitch/etc link and download directly
 - **Recent Projects**: Shows your recent projects sorted by last modified time
+- **Recent Downloads**: Shows recently downloaded videos
 
 ### Direct Mode (with video)
 
@@ -38,6 +40,72 @@ vp studio /path/to/video.mp4 --profile profiles/gaming.yaml
 This opens the video immediately in the Studio editor.
 
 Open: http://127.0.0.1:8765
+
+## Downloading from URLs (Step 6.5)
+
+Studio integrates yt-dlp for smart downloading from 1000+ supported sites with automatic site detection, adaptive speed, and guaranteed playback.
+
+### How to Download
+
+1. On the Home screen, paste a URL into the "Download from URL" field
+2. The app automatically detects the site and shows a badge (e.g., "Detected: Twitch VOD (HLS) — Auto concurrency 16")
+3. Click **🔍 Probe** for detailed info (title, duration) - optional
+4. Choose quality cap and speed mode if needed
+5. Click **Download** (or press Enter)
+6. Watch progress in the Jobs panel (shows %, MB/s, ETA)
+7. When complete, the video automatically opens as a project
+8. Video plays in browser (preview is created if needed)
+
+### Site Detection
+
+| Site | Detection | Strategy |
+|------|-----------|----------|
+| **Twitch VOD** | `twitch.tv/videos/...` | HLS native + parallel fragments |
+| **Twitch Clip** | `clips.twitch.tv/...` | HLS native |
+| **YouTube** | `youtube.com`, `youtu.be` | Default DASH strategy |
+| **Generic** | Any other site | Conservative defaults |
+
+### Download Options
+
+- **Create preview**: Generate a browser-friendly H.264/AAC proxy for smooth playback (recommended)
+- **No playlist**: Download single video only, not entire playlists (default: on)
+- **Speed mode**: Controls download concurrency for HLS streams (Twitch optimization)
+- **Quality cap**: Limit download resolution (Source, 1080p, 720p, 480p)
+
+### Speed Modes
+
+| Mode | Concurrency (N) | Description |
+|------|-----------------|-------------|
+| **Auto** | Adaptive | Learns optimal speed per site, backs off on throttling |
+| Conservative | 4 | Very safe, for slow/unstable connections |
+| Balanced | 8 | Conservative, stable for most connections |
+| Fast | 16 | Good for fast connections |
+| Aggressive | 32 | Maximum speed, may trigger throttling |
+
+**Auto mode** is recommended. It:
+- Starts at N=16 for Twitch sites
+- Backs off automatically if throttled (429/403 errors, fragment retries)
+- Remembers what worked for each domain
+- Learns over time so you get optimal speed without manual tuning
+
+The tuning history is stored in: `%APPDATA%\VideoPipeline\ytdlp_tuning.json`
+
+### Guaranteed Playback
+
+After download, the app automatically:
+1. **Probes** the video with ffprobe
+2. **Remuxes** MPEG-TS to MP4 if needed (no quality loss)
+3. **Creates preview** if codecs aren't browser-friendly (H.264/AAC proxy)
+
+Studio uses:
+- `source_path` for analysis and export (best quality)
+- `preview_path` for the `<video>` element (guaranteed to play)
+
+### Why Create Preview?
+
+Some video formats (WebM, HEVC, VP9) don't play well in browsers. The preview option automatically creates an H.264/AAC MP4 for smooth playback in Studio while keeping the original full-quality file.
+
+Downloads are saved to: `%LOCALAPPDATA%\VideoPipeline\Workspace\downloads\`
 
 ## Workflow
 

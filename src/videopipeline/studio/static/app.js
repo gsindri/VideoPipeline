@@ -62,6 +62,8 @@ function showHomeView() {
   $('#homeView').style.display = 'block';
   $('#studioView').style.display = 'none';
   loadRecentProjects();
+  loadRecentDownloads();
+  renderHomeJobs();
 }
 
 function showStudioView() {
@@ -180,6 +182,277 @@ function wireHomeUI() {
   const btnBackToHome = $('#btnBackToHome');
   if (btnBackToHome) {
     btnBackToHome.onclick = closeProject;
+  }
+
+  // URL Download UI
+  const btnDownloadUrl = $('#btnDownloadUrl');
+  const btnProbeUrl = $('#btnProbeUrl');
+  const urlInput = $('#urlInput');
+  const btnPasteUrl = $('#btnPasteUrl');
+
+  if (btnDownloadUrl && urlInput) {
+    btnDownloadUrl.onclick = () => startUrlDownload(urlInput.value.trim());
+    urlInput.onkeydown = (e) => {
+      if (e.key === 'Enter') {
+        startUrlDownload(urlInput.value.trim());
+      }
+    };
+    // Auto-probe on URL change (debounced)
+    let probeTimeout = null;
+    urlInput.oninput = () => {
+      if (probeTimeout) clearTimeout(probeTimeout);
+      probeTimeout = setTimeout(() => {
+        const url = urlInput.value.trim();
+        if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
+          probeUrl(url, false);  // Quick heuristic probe
+        } else {
+          hideProbeBadge();
+        }
+      }, 300);
+    };
+  }
+
+  if (btnProbeUrl && urlInput) {
+    btnProbeUrl.onclick = () => probeUrl(urlInput.value.trim(), true);  // Full yt-dlp probe
+  }
+
+  if (btnPasteUrl && urlInput) {
+    btnPasteUrl.onclick = async () => {
+      try {
+        const text = await navigator.clipboard.readText();
+        urlInput.value = text;
+        // Trigger auto-probe
+        if (text && (text.startsWith('http://') || text.startsWith('https://'))) {
+          probeUrl(text, false);
+        }
+      } catch (e) {
+        alert('Failed to read clipboard. Please paste manually.');
+      }
+    };
+  }
+}
+
+// =========================================================================
+// URL DOWNLOAD FUNCTIONS
+// =========================================================================
+
+const homeJobs = new Map();
+let lastProbeResult = null;
+
+function hideProbeBadge() {
+  const badge = $('#probeBadge');
+  if (badge) badge.style.display = 'none';
+  lastProbeResult = null;
+}
+
+function showProbeBadge(text, notes) {
+  const badge = $('#probeBadge');
+  const badgeText = $('#probeBadgeText');
+  const helpText = $('#dlHelpText');
+
+  if (badge && badgeText) {
+    badgeText.textContent = text;
+    badge.style.display = 'block';
+  }
+  if (helpText && notes) {
+    helpText.textContent = notes;
+  }
+}
+
+async function probeUrl(url, useYtdlp = false) {
+  if (!url) {
+    hideProbeBadge();
+    return;
+  }
+
+  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+    hideProbeBadge();
+    return;
+  }
+
+  try {
+    const res = await apiJson('POST', '/api/ingest/probe', {
+      url,
+      use_ytdlp: useYtdlp,
+    });
+
+    lastProbeResult = res;
+
+    // Build badge text
+    let badgeText = res.display_badge || `Detected: ${res.policy?.display_name || 'Unknown'}`;
+
+    // Add concurrency info for HLS sites
+    if (res.policy?.supports_fragment_concurrency) {
+      badgeText += ` — Auto concurrency ${res.policy.default_concurrency}`;
+    }
+
+    // Add title if available from yt-dlp probe
+    if (res.title && useYtdlp) {
+      badgeText += `\n📺 ${res.title}`;
+      if (res.duration_seconds > 0) {
+        const mins = Math.floor(res.duration_seconds / 60);
+        const secs = Math.floor(res.duration_seconds % 60);
+        badgeText += ` (${mins}:${secs.toString().padStart(2, '0')})`;
+      }
+    }
+
+    showProbeBadge(badgeText, res.policy?.notes);
+
+  } catch (e) {
+    hideProbeBadge();
+  }
+}
+
+async function startUrlDownload(url) {
+  if (!url) {
+    alert('Please enter a URL.');
+    return;
+  }
+
+  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+    alert('Please enter a valid URL (starting with http:// or https://).');
+    return;
+  }
+
+  const options = {
+    no_playlist: $('#dlNoPlaylist')?.checked ?? true,
+    create_preview: $('#dlCreatePreview')?.checked ?? true,
+    speed_mode: $('#dlSpeedMode')?.value ?? 'auto',
+    quality_cap: $('#dlQualityCap')?.value ?? 'source',
+  };
+
+  try {
+    const res = await apiJson('POST', '/api/ingest/url', {
+      url,
+      options,
+      auto_open: true,
+    });
+
+    // Clear input and badge
+    $('#urlInput').value = '';
+    hideProbeBadge();
+
+    // Watch job progress
+    watchHomeJob(res.job_id);
+    renderHomeJobs();
+
+  } catch (e) {
+    alert(`Failed to start download: ${e.message}`);
+  }
+}
+
+function watchHomeJob(jobId) {
+  const es = new EventSource(`/api/jobs/${jobId}/events`);
+  es.onmessage = (ev) => {
+    try {
+      const payload = JSON.parse(ev.data);
+      if (payload.type === 'job_update' || payload.type === 'job_created') {
+        const j = payload.job;
+        homeJobs.set(j.id, j);
+        renderHomeJobs();
+
+        // If download succeeded and auto-opened, switch to Studio
+        if (j.kind === 'download_url' && j.status === 'succeeded' && j.result?.auto_opened) {
+          project = j.result.project;
+          showStudioView();
+          initStudioView();
+        }
+      }
+    } catch (e) {
+      console.warn('bad job payload', e);
+    }
+  };
+}
+
+function renderHomeJobs() {
+  const container = $('#homeJobs');
+  if (!container) return;
+
+  if (homeJobs.size === 0) {
+    container.innerHTML = '<div class="small">No active jobs.</div>';
+    return;
+  }
+
+  container.innerHTML = '';
+  const sorted = Array.from(homeJobs.values()).sort((a, b) =>
+    a.created_at < b.created_at ? 1 : -1
+  );
+
+  for (const job of sorted) {
+    const el = document.createElement('div');
+    el.className = 'item';
+    const pct = Math.round((job.progress || 0) * 100);
+
+    let statusClass = '';
+    if (job.status === 'running') statusClass = 'status-badge running';
+    else if (job.status === 'succeeded') statusClass = 'status-badge succeeded';
+    else if (job.status === 'failed') statusClass = 'status-badge failed';
+    else statusClass = 'status-badge queued';
+
+    let resultInfo = '';
+    if (job.status === 'succeeded' && job.result?.video_path) {
+      const filename = job.result.video_path.split(/[/\\]/).pop();
+      resultInfo = `<div class="small" style="margin-top:4px">Downloaded: ${filename}</div>`;
+    }
+
+    let errorInfo = '';
+    if (job.status === 'failed') {
+      errorInfo = `<div class="small" style="color:var(--danger);margin-top:4px">${job.message}</div>`;
+    }
+
+    el.innerHTML = `
+      <div class="title">
+        <span class="${statusClass}">${job.status}</span>
+        ${job.kind === 'download_url' ? 'URL Download' : job.kind}
+      </div>
+      <div class="meta">${job.message || ''}</div>
+      ${job.status === 'running' ? `
+        <div class="progress" style="margin-top:8px"><div style="width:${pct}%"></div></div>
+        <div class="small" style="margin-top:4px">${pct}%</div>
+      ` : ''}
+      ${resultInfo}
+      ${errorInfo}
+    `;
+
+    container.appendChild(el);
+  }
+}
+
+async function loadRecentDownloads() {
+  const container = $('#recentDownloads');
+  if (!container) return;
+
+  container.innerHTML = '<div class="small">Loading...</div>';
+
+  try {
+    const res = await apiGet('/api/ingest/recent_downloads');
+    const downloads = res.downloads || [];
+
+    if (downloads.length === 0) {
+      container.innerHTML = '<div class="small">No recent downloads.</div>';
+      return;
+    }
+
+    container.innerHTML = '';
+    for (const d of downloads) {
+      const el = document.createElement('div');
+      el.className = 'item';
+      const dur = fmtTime(d.duration_seconds || 0);
+      const sizeMB = ((d.size_bytes || 0) / 1024 / 1024).toFixed(1);
+      el.innerHTML = `
+        <div class="title">${d.title || d.filename}</div>
+        <div class="meta">${dur} • ${sizeMB} MB • ${d.extractor || 'local'}</div>
+        <div class="meta small" style="opacity:0.7;word-break:break-all">${d.path}</div>
+        <div class="actions" style="margin-top:8px">
+          <button class="primary">Open project</button>
+        </div>
+      `;
+      const btn = el.querySelector('button');
+      btn.onclick = () => openProjectByPath(d.path);
+      container.appendChild(el);
+    }
+  } catch (e) {
+    container.innerHTML = `<div class="small">Error: ${e.message}</div>`;
   }
 }
 

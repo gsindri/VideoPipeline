@@ -23,6 +23,15 @@ from .jobs import JOB_MANAGER
 from .range import ranged_file_response
 from .home import list_recent_projects, windows_open_video_dialog, check_video_exists
 from .publisher_api import create_publisher_router
+from ..ingest import (
+    IngestRequest,
+    IngestResult,
+    QualityCap,
+    SpeedMode,
+    SiteType,
+    probe_url,
+)
+from ..ingest.ytdlp_runner import download_url
 
 
 class StudioContext:
@@ -159,6 +168,168 @@ def create_app(
     def api_home_close_project():
         ctx.close_project()
         return JSONResponse({"active": False})
+
+    # -------------------------------------------------------------------------
+    # URL Ingest endpoints
+    # -------------------------------------------------------------------------
+
+    @app.post("/api/ingest/probe")
+    def api_ingest_probe(body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        """Probe a URL to detect site type and metadata.
+        
+        Body:
+            url: str - The URL to probe
+            use_ytdlp: bool - Whether to use yt-dlp for detailed probe (default True)
+        
+        Returns:
+            ProbeResult with site_type, policy, title, duration, etc.
+        """
+        url = str(body.get("url") or "").strip()
+        if not url:
+            raise HTTPException(status_code=400, detail="url_required")
+
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise HTTPException(status_code=400, detail="invalid_url")
+
+        use_ytdlp = bool(body.get("use_ytdlp", True))
+
+        try:
+            result = probe_url(url, use_ytdlp=use_ytdlp)
+            return JSONResponse(result.to_dict())
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Probe failed: {e}")
+
+    @app.post("/api/ingest/url")
+    def api_ingest_url(body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        """Download a video from a URL using yt-dlp.
+        
+        Body:
+            url: str - The URL to download
+            options: dict - Optional download options
+                no_playlist: bool (default True)
+                create_preview: bool (default True)
+                speed_mode: str - One of: auto, conservative, balanced, fast, aggressive
+                quality_cap: str - One of: source, 1080, 720, 480
+            auto_open: bool - Automatically open as project when done (default True)
+        
+        Returns job_id for tracking progress.
+        """
+        import threading
+
+        url = str(body.get("url") or "").strip()
+        if not url:
+            raise HTTPException(status_code=400, detail="url_required")
+
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise HTTPException(status_code=400, detail="invalid_url")
+
+        opts = body.get("options") or {}
+        auto_open = bool(body.get("auto_open", True))
+
+        # Parse speed mode
+        speed_mode_str = str(opts.get("speed_mode", "auto")).lower()
+        try:
+            speed_mode = SpeedMode(speed_mode_str)
+        except ValueError:
+            speed_mode = SpeedMode.AUTO
+
+        # Parse quality cap
+        quality_cap_str = str(opts.get("quality_cap", "source")).lower()
+        try:
+            quality_cap = QualityCap(quality_cap_str)
+        except ValueError:
+            quality_cap = QualityCap.SOURCE
+
+        request = IngestRequest(
+            url=url,
+            speed_mode=speed_mode,
+            quality_cap=quality_cap,
+            no_playlist=bool(opts.get("no_playlist", True)),
+            create_preview=bool(opts.get("create_preview", True)),
+            auto_open=auto_open,
+        )
+
+        job = JOB_MANAGER.create("download_url")
+
+        def runner() -> None:
+            JOB_MANAGER._set(job, status="running", progress=0.0, message="Starting download...")
+
+            def on_progress(frac: float, msg: str) -> None:
+                JOB_MANAGER._set(job, progress=frac, message=msg)
+
+            try:
+                result = download_url(url, request=request, on_progress=on_progress)
+
+                result_dict = result.to_dict()
+
+                # Auto-open the project if requested
+                if auto_open:
+                    # Use preview if available, otherwise original
+                    video_to_open = result.preview_path or result.video_path
+                    proj = ctx.open_project(video_to_open)
+                    result_dict["project"] = get_project_data(proj)
+                    result_dict["auto_opened"] = True
+
+                JOB_MANAGER._set(
+                    job,
+                    status="succeeded",
+                    progress=1.0,
+                    message="Download complete!",
+                    result=result_dict,
+                )
+
+            except ImportError as e:
+                JOB_MANAGER._set(job, status="failed", message=str(e))
+            except Exception as e:
+                JOB_MANAGER._set(job, status="failed", message=f"{type(e).__name__}: {e}")
+
+        threading.Thread(target=runner, daemon=True).start()
+        return JSONResponse({"job_id": job.id})
+
+    @app.get("/api/ingest/recent_downloads")
+    def api_ingest_recent_downloads() -> JSONResponse:
+        """List recent downloads from the downloads folder."""
+        from ..ingest.ytdlp_runner import _default_downloads_dir
+
+        downloads_dir = _default_downloads_dir()
+        if not downloads_dir.exists():
+            return JSONResponse({"downloads": []})
+
+        # Find video files
+        video_exts = {".mp4", ".mkv", ".webm", ".m4v", ".avi", ".mov", ".ts"}
+        files = []
+        for ext in video_exts:
+            files.extend(downloads_dir.glob(f"*{ext}"))
+
+        # Sort by modification time
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+        downloads = []
+        for f in files[:20]:  # Limit to 20 most recent
+            try:
+                st = f.stat()
+                info_json = f.with_suffix(".info.json")
+                info = {}
+                if info_json.exists():
+                    try:
+                        info = json.loads(info_json.read_text(encoding="utf-8"))
+                    except Exception:
+                        pass
+
+                downloads.append({
+                    "path": str(f),
+                    "filename": f.name,
+                    "size_bytes": st.st_size,
+                    "mtime": st.st_mtime,
+                    "title": info.get("title", f.stem),
+                    "url": info.get("webpage_url", ""),
+                    "extractor": info.get("extractor", ""),
+                    "duration_seconds": info.get("duration", 0),
+                })
+            except Exception:
+                continue
+
+        return JSONResponse({"downloads": downloads})
 
     # -------------------------------------------------------------------------
     # Publisher endpoints
