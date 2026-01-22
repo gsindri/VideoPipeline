@@ -18,6 +18,7 @@ dependencies = [
     "google-auth>=2.29",
     "google-auth-oauthlib>=1.2",
     "yt-dlp>=2024.1.0",
+    "chat-replay-downloader>=0.0.8",
 ]
 
 [project.scripts]

@@ -32,6 +32,58 @@ analysis:
       max_pre_seconds: 12
       min_post_seconds: 4
       max_post_seconds: 28
+  speech:
+    enabled: true
+    model_size: small
+    language: null
+    device: cpu
+    compute_type: int8
+    vad_filter: true
+    word_timestamps: true
+    hop_seconds: 0.5
+  reaction_audio:
+    enabled: true
+    sample_rate: 16000
+    hop_seconds: 0.5
+    smooth_seconds: 1.5
+  rerank:
+    enabled: true
+    weights:
+      highlight: 0.55
+      reaction: 0.25
+      speech: 0.20
+    hook:
+      max_chars: 60
+      window_seconds: 4.0
+      phrases:
+        - "no way"
+        - "oh my god"
+        - "let's go"
+        - "lets go"
+        - "bro"
+        - "what"
+        - "holy"
+        - "wtf"
+        - "omg"
+        - "insane"
+        - "clutch"
+        - "no shot"
+        - "bruh"
+        - "dude"
+        - "sheesh"
+        - "yo"
+        - "oh no"
+        - "wait"
+        - "huh"
+        - "wow"
+        - "nice"
+        - "crazy"
+        - "dead"
+        - "gg"
+        - "pog"
+        - "hype"
+    quote:
+      max_chars: 120
 
 export:
   template: vertical_streamer_pip

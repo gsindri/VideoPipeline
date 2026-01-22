@@ -121,6 +121,22 @@ class Project:
         return self.analysis_dir / "chat_raw.json"
 
     @property
+    def chat_db_path(self) -> Path:
+        return self.analysis_dir / "chat.sqlite"
+
+    @property
+    def transcript_path(self) -> Path:
+        return self.analysis_dir / "transcript_full.json"
+
+    @property
+    def speech_features_path(self) -> Path:
+        return self.analysis_dir / "speech_features.npz"
+
+    @property
+    def reaction_audio_features_path(self) -> Path:
+        return self.analysis_dir / "reaction_audio_features.npz"
+
+    @property
     def exports_dir(self) -> Path:
         return self.project_dir / "exports"
 
@@ -278,5 +294,67 @@ def record_export(
                 "status": status,
             }
         )
+
+    return update_project(proj, _upd)
+
+
+# ---------------------------------------------------------------------------
+# Source URL and Chat Config Management
+# ---------------------------------------------------------------------------
+
+
+def get_source_url(proj: Project) -> Optional[str]:
+    """Get the source URL for the project (if set)."""
+    data = get_project_data(proj)
+    source = data.get("source", {})
+    return source.get("source_url")
+
+
+def set_source_url(proj: Project, source_url: str, *, platform: Optional[str] = None) -> Dict[str, Any]:
+    """Set the source URL for a project (for chat download, etc.).
+
+    Args:
+        proj: Project instance
+        source_url: URL of the original video (Twitch VOD, YouTube, etc.)
+        platform: Optional platform hint (twitch, youtube, etc.)
+    """
+    def _upd(d: Dict[str, Any]) -> None:
+        d.setdefault("source", {})
+        d["source"]["source_url"] = source_url
+        if platform:
+            d["source"]["platform"] = platform
+
+    return update_project(proj, _upd)
+
+
+def get_chat_config(proj: Project) -> Dict[str, Any]:
+    """Get chat configuration for the project."""
+    data = get_project_data(proj)
+    return data.get("chat", {"enabled": False, "sync_offset_ms": 0})
+
+
+def set_chat_config(
+    proj: Project,
+    *,
+    enabled: Optional[bool] = None,
+    sync_offset_ms: Optional[int] = None,
+    source_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Update chat configuration.
+
+    Args:
+        proj: Project instance
+        enabled: Whether chat is enabled
+        sync_offset_ms: Chat sync offset in milliseconds
+        source_url: Source URL used for chat download
+    """
+    def _upd(d: Dict[str, Any]) -> None:
+        d.setdefault("chat", {"enabled": False, "sync_offset_ms": 0})
+        if enabled is not None:
+            d["chat"]["enabled"] = bool(enabled)
+        if sync_offset_ms is not None:
+            d["chat"]["sync_offset_ms"] = int(sync_offset_ms)
+        if source_url is not None:
+            d["chat"]["source_url"] = source_url
 
     return update_project(proj, _upd)

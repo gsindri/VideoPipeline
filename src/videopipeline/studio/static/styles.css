@@ -395,3 +395,78 @@ details summary::before {
 details[open] summary::before {
   content: '▼ ';
 }
+
+/* Chat panel styles */
+.chat-messages {
+  max-height: 300px;
+  overflow-y: auto;
+  margin-top: 10px;
+  background: #0a0c0f;
+  border-radius: 8px;
+  padding: 8px;
+  font-size: 12px;
+}
+
+.chat-msg {
+  padding: 4px 6px;
+  margin: 2px 0;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s;
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.chat-msg:hover {
+  background: rgba(79, 140, 255, 0.15);
+}
+
+.chat-msg-near {
+  background: rgba(79, 140, 255, 0.1);
+  border-left: 2px solid var(--accent);
+}
+
+.chat-time {
+  color: var(--muted);
+  font-size: 10px;
+  flex-shrink: 0;
+  min-width: 50px;
+  font-family: monospace;
+}
+
+.chat-author {
+  color: #9966ff;
+  font-weight: 600;
+  flex-shrink: 0;
+  max-width: 100px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-text {
+  color: var(--text);
+  word-break: break-word;
+}
+
+.chat-messages::-webkit-scrollbar {
+  width: 6px;
+}
+
+.chat-messages::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.chat-messages::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+
+.chat-messages::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+}
+
+.small.success {
+  color: #32c864;
+}

@@ -3,8 +3,17 @@ from __future__ import annotations
 import importlib.util
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
+
+
+def _subprocess_flags() -> dict[str, Any]:
+    """Return subprocess flags to hide console window on Windows."""
+    if sys.platform == "win32":
+        # CREATE_NO_WINDOW = 0x08000000
+        return {"creationflags": 0x08000000}
+    return {}
 
 
 @dataclass(frozen=True)
@@ -19,7 +28,7 @@ def _which(cmd: str) -> Optional[str]:
 
 def _version(cmd: str) -> str:
     try:
-        out = subprocess.check_output([cmd, "-version"], text=True, stderr=subprocess.STDOUT)
+        out = subprocess.check_output([cmd, "-version"], text=True, stderr=subprocess.STDOUT, **_subprocess_flags())
         return out.splitlines()[0].strip()
     except Exception as e:
         return f"error: {type(e).__name__}: {e}"

@@ -177,16 +177,29 @@ def compute_highlights_analysis(
             on_progress=None,
         )
 
-    if include_chat and proj.chat_raw_path.exists() and not proj.chat_features_path.exists():
+    # Chat analysis: prefer SQLite store, fall back to raw JSON
+    if include_chat and not proj.chat_features_path.exists():
         if on_progress:
             on_progress(0.6)
-        compute_chat_analysis(
-            proj,
-            chat_path=proj.chat_raw_path,
-            hop_s=hop_s,
-            smooth_s=float(highlights_cfg.get("chat_smooth_seconds", 3.0)),
-            on_progress=None,
-        )
+        chat_db_path = proj.analysis_dir / "chat.sqlite"
+        if chat_db_path.exists():
+            # Use new SQLite-based chat features
+            from .chat.features import compute_and_save_chat_features
+            compute_and_save_chat_features(
+                proj,
+                hop_s=hop_s,
+                smooth_s=float(highlights_cfg.get("chat_smooth_seconds", 3.0)),
+                on_progress=None,
+            )
+        elif proj.chat_raw_path.exists():
+            # Fall back to legacy JSON-based analysis
+            compute_chat_analysis(
+                proj,
+                chat_path=proj.chat_raw_path,
+                hop_s=hop_s,
+                smooth_s=float(highlights_cfg.get("chat_smooth_seconds", 3.0)),
+                on_progress=None,
+            )
 
     audio_data = load_npz(proj.audio_features_path)
     audio_scores = audio_data.get("scores")
@@ -222,7 +235,18 @@ def compute_highlights_analysis(
     weights = highlights_cfg.get("weights", {})
     w_audio = float(weights.get("audio", 0.55))
     w_motion = float(weights.get("motion", 0.45))
-    w_chat = float(weights.get("chat", 0.0)) if chat_used else 0.0
+    # When chat is available, use a default weight of 0.20 if not explicitly set to 0
+    # This re-normalizes with chat contribution
+    w_chat_cfg = float(weights.get("chat", 0.20))
+    w_chat = w_chat_cfg if chat_used else 0.0
+
+    # If chat is used with default weight and audio/motion are also default,
+    # normalize weights to sum to 1.0
+    w_total = w_audio + w_motion + w_chat
+    if w_total > 0 and abs(w_total - 1.0) > 0.001:
+        w_audio = w_audio / w_total
+        w_motion = w_motion / w_total
+        w_chat = w_chat / w_total
 
     combined_raw = (w_audio * audio_scores) + (w_motion * motion_resampled) + (w_chat * chat_scores)
     smooth_s = float(highlights_cfg.get("smooth_seconds", max(1.0, 2.0 * hop_s)))

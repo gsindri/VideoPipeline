@@ -138,12 +138,18 @@
           <div class="row">
             <button class="primary" id="btnAnalyzeHighlights">Analyze highlights (audio+motion+scenes)</button>
             <button id="btnAnalyzeAudio">Analyze audio only</button>
+            <button id="btnAnalyzeSpeech" title="Transcribe with Whisper and extract speech/reaction features">Analyze speech</button>
             <span class="small" id="analysisStatus"></span>
           </div>
           <div class="canvas-wrap">
             <canvas id="chart" height="120"></canvas>
           </div>
           <p class="small">Higher score means more hype based on combined signals.</p>
+        </div>
+
+        <div class="panel">
+          <h2>Jobs</h2>
+          <div class="list" id="jobs"></div>
         </div>
 
         <div class="panel">
@@ -178,6 +184,27 @@
       </section>
 
       <section id="right">
+        <div class="panel" id="chatPanel">
+          <h2>Chat Replay</h2>
+          <div class="row" style="margin-bottom:10px;gap:8px;flex-wrap:wrap">
+            <input type="text" id="chatSourceUrl" placeholder="Source URL (Twitch VOD, YouTube...)" style="flex:1;min-width:200px" />
+            <button class="primary" id="btnDownloadChat">Download Chat</button>
+            <button id="btnClearChat" style="display:none">Clear</button>
+          </div>
+          <div id="chatOffsetControls" class="row" style="margin-bottom:10px;gap:8px;align-items:center;display:none">
+            <label style="display:flex;align-items:center;gap:5px">
+              Offset (ms):
+              <button id="chatNudgeBack" style="padding:2px 8px">-1s</button>
+              <input type="number" id="chatOffsetMs" value="0" style="width:80px" />
+              <button id="chatNudgeFwd" style="padding:2px 8px">+1s</button>
+            </label>
+            <label style="font-size:0.85em"><input type="checkbox" id="chatAutoScroll" checked /> Auto-scroll</label>
+          </div>
+          <div class="small" id="chatStatus">No chat replay available.</div>
+          <div class="chat-messages" id="chatMessages"></div>
+          <p class="small" style="margin-top:8px;opacity:0.7">Click a message to seek. Use offset to sync chat with video.</p>
+        </div>
+
         <div class="panel">
           <h2>Top candidates</h2>
           <div class="list" id="candidates"></div>
@@ -240,11 +267,6 @@
             <label><input type="checkbox" id="normalizeAudio" /> Normalize audio</label>
           </div>
           <p class="small">Captions require optional dependency: <code>pip install -e '.[whisper]'</code></p>
-        </div>
-
-        <div class="panel">
-          <h2>Jobs</h2>
-          <div class="list" id="jobs"></div>
         </div>
       </section>
     </main>

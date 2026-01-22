@@ -13,6 +13,10 @@ from fastapi.staticfiles import StaticFiles
 
 from ..analysis_audio import compute_audio_analysis
 from ..analysis_highlights import compute_highlights_analysis
+from ..analysis_transcript import TranscriptConfig, compute_transcript_analysis, load_transcript
+from ..analysis_speech_features import SpeechFeatureConfig, compute_speech_features, load_speech_features
+from ..analysis_reaction_audio import ReactionAudioConfig, compute_reaction_audio_features
+from ..rerank_candidates import RerankConfig, compute_reranked_candidates
 from ..layouts import RectNorm
 from ..project import create_or_load_project, get_project_data, load_npz, set_layout_facecam, Project
 from ..profile import load_profile
@@ -473,6 +477,483 @@ def create_app(
         threading.Thread(target=runner, daemon=True).start()
         return JSONResponse({"job_id": job.id})
 
+    @app.post("/api/analyze/speech")
+    def api_analyze_speech(body: Dict[str, Any] = Body(default={})):  # type: ignore[valid-type]
+        """Run full speech analysis pipeline: transcription + speech features + reaction audio + rerank.
+        
+        This is the main endpoint for speech-based clip enhancement.
+        It runs:
+        1. Whisper transcription (if not cached)
+        2. Speech feature extraction (lexical excitement, speech rate)
+        3. Reaction audio features (acoustic cues)
+        4. Candidate reranking with hook/quote extraction
+        """
+        proj = ctx.require_project()
+        analysis_cfg = ctx.profile.get("analysis", {})
+        body = body or {}
+
+        # Get configurations from profile, allow overrides from body
+        speech_cfg = {**analysis_cfg.get("speech", {}), **(body.get("speech") or {})}
+        reaction_cfg = {**analysis_cfg.get("reaction_audio", {}), **(body.get("reaction_audio") or {})}
+        rerank_cfg_dict = {**analysis_cfg.get("rerank", {}), **(body.get("rerank") or {})}
+
+        job = JOB_MANAGER.create("analyze_speech")
+
+        def runner() -> None:
+            import threading as _threading
+            JOB_MANAGER._set(job, status="running", progress=0.0, message="Starting speech analysis...")
+
+            try:
+                # Step 1: Transcription (if needed)
+                if speech_cfg.get("enabled", True) and not proj.transcript_path.exists():
+                    JOB_MANAGER._set(job, progress=0.05, message="Transcribing audio with Whisper...")
+                    
+                    transcript_config = TranscriptConfig(
+                        model_size=str(speech_cfg.get("model_size", "small")),
+                        language=speech_cfg.get("language"),
+                        device=str(speech_cfg.get("device", "cpu")),
+                        compute_type=str(speech_cfg.get("compute_type", "int8")),
+                        vad_filter=bool(speech_cfg.get("vad_filter", True)),
+                        word_timestamps=bool(speech_cfg.get("word_timestamps", True)),
+                    )
+                    
+                    def on_transcript_progress(frac: float) -> None:
+                        JOB_MANAGER._set(job, progress=0.05 + 0.35 * frac, message="Transcribing audio...")
+                    
+                    compute_transcript_analysis(proj, cfg=transcript_config, on_progress=on_transcript_progress)
+
+                # Step 2: Speech features (if transcript exists)
+                if speech_cfg.get("enabled", True) and proj.transcript_path.exists() and not proj.speech_features_path.exists():
+                    JOB_MANAGER._set(job, progress=0.4, message="Extracting speech features...")
+                    
+                    # Get reaction phrases from config
+                    hook_cfg = rerank_cfg_dict.get("hook", {})
+                    phrases = hook_cfg.get("phrases", [])
+                    
+                    speech_feature_config = SpeechFeatureConfig(
+                        hop_seconds=float(speech_cfg.get("hop_seconds", 0.5)),
+                        reaction_phrases=phrases if phrases else None,
+                    )
+                    
+                    def on_speech_progress(frac: float) -> None:
+                        JOB_MANAGER._set(job, progress=0.4 + 0.15 * frac, message="Extracting speech features...")
+                    
+                    compute_speech_features(proj, cfg=speech_feature_config, on_progress=on_speech_progress)
+
+                # Step 3: Reaction audio features
+                if reaction_cfg.get("enabled", True) and not proj.reaction_audio_features_path.exists():
+                    JOB_MANAGER._set(job, progress=0.55, message="Analyzing reaction audio...")
+                    
+                    reaction_audio_config = ReactionAudioConfig(
+                        sample_rate=int(reaction_cfg.get("sample_rate", 16000)),
+                        hop_seconds=float(reaction_cfg.get("hop_seconds", 0.5)),
+                        smooth_seconds=float(reaction_cfg.get("smooth_seconds", 1.5)),
+                    )
+                    
+                    def on_reaction_progress(frac: float) -> None:
+                        JOB_MANAGER._set(job, progress=0.55 + 0.25 * frac, message="Analyzing reaction audio...")
+                    
+                    compute_reaction_audio_features(proj, cfg=reaction_audio_config, on_progress=on_reaction_progress)
+
+                # Step 4: Rerank candidates (if highlights exist)
+                proj_data = get_project_data(proj)
+                has_candidates = bool(proj_data.get("analysis", {}).get("highlights", {}).get("candidates"))
+                
+                if rerank_cfg_dict.get("enabled", True) and has_candidates:
+                    JOB_MANAGER._set(job, progress=0.8, message="Reranking candidates...")
+                    
+                    # Build rerank config
+                    hook_cfg = rerank_cfg_dict.get("hook", {})
+                    quote_cfg = rerank_cfg_dict.get("quote", {})
+                    weights = rerank_cfg_dict.get("weights", {})
+                    
+                    rerank_config = RerankConfig(
+                        enabled=True,
+                        weights=weights if weights else None,
+                        hook_max_chars=int(hook_cfg.get("max_chars", 60)),
+                        hook_window_seconds=float(hook_cfg.get("window_seconds", 4.0)),
+                        quote_max_chars=int(quote_cfg.get("max_chars", 120)),
+                        reaction_phrases=hook_cfg.get("phrases", []),
+                    )
+                    
+                    def on_rerank_progress(frac: float) -> None:
+                        JOB_MANAGER._set(job, progress=0.8 + 0.15 * frac, message="Reranking candidates...")
+                    
+                    result = compute_reranked_candidates(proj, cfg=rerank_config, on_progress=on_rerank_progress)
+                else:
+                    result = {"message": "No candidates to rerank. Run highlights analysis first."}
+
+                JOB_MANAGER._set(
+                    job,
+                    status="succeeded",
+                    progress=1.0,
+                    message="Speech analysis complete!",
+                    result=result,
+                )
+
+            except ImportError as e:
+                JOB_MANAGER._set(job, status="failed", message=f"Missing dependency: {e}")
+            except Exception as e:
+                JOB_MANAGER._set(job, status="failed", message=f"{type(e).__name__}: {e}")
+
+        import threading
+        threading.Thread(target=runner, daemon=True).start()
+        return JSONResponse({"job_id": job.id})
+
+    @app.get("/api/speech/timeline")
+    def api_speech_timeline(max_points: int = 2000) -> JSONResponse:
+        """Get speech feature timeline for visualization."""
+        proj = ctx.require_project()
+        if not proj.speech_features_path.exists():
+            return JSONResponse({"ok": False, "reason": "no_speech_analysis"}, status_code=404)
+
+        data = load_npz(proj.speech_features_path)
+        speech_score = data.get("speech_score")
+        if speech_score is None:
+            return JSONResponse({"ok": False, "reason": "missing_scores"}, status_code=404)
+
+        speech_score = speech_score.astype(float)
+        n = len(speech_score)
+        if n <= 0:
+            return JSONResponse({"ok": False, "reason": "empty"}, status_code=404)
+
+        step = max(1, int(n / max(1, int(max_points))))
+        idx = np.arange(0, n, step)
+        down = speech_score[idx]
+        if not np.isfinite(down).all():
+            down = np.where(np.isfinite(down), down, 0.0)
+
+        hop_arr = data.get("hop_seconds")
+        hop_s = float(hop_arr[0]) if hop_arr is not None and len(hop_arr) > 0 else 0.5
+
+        return JSONResponse({
+            "ok": True,
+            "hop_seconds": hop_s,
+            "indices": idx.tolist(),
+            "speech_score": down.tolist(),
+        })
+
+    @app.get("/api/reaction/timeline")
+    def api_reaction_timeline(max_points: int = 2000) -> JSONResponse:
+        """Get reaction audio feature timeline for visualization."""
+        proj = ctx.require_project()
+        if not proj.reaction_audio_features_path.exists():
+            return JSONResponse({"ok": False, "reason": "no_reaction_analysis"}, status_code=404)
+
+        data = load_npz(proj.reaction_audio_features_path)
+        reaction_score = data.get("reaction_score")
+        if reaction_score is None:
+            return JSONResponse({"ok": False, "reason": "missing_scores"}, status_code=404)
+
+        reaction_score = reaction_score.astype(float)
+        n = len(reaction_score)
+        if n <= 0:
+            return JSONResponse({"ok": False, "reason": "empty"}, status_code=404)
+
+        step = max(1, int(n / max(1, int(max_points))))
+        idx = np.arange(0, n, step)
+        down = reaction_score[idx]
+        if not np.isfinite(down).all():
+            down = np.where(np.isfinite(down), down, 0.0)
+
+        hop_arr = data.get("hop_seconds")
+        hop_s = float(hop_arr[0]) if hop_arr is not None and len(hop_arr) > 0 else 0.5
+
+        return JSONResponse({
+            "ok": True,
+            "hop_seconds": hop_s,
+            "indices": idx.tolist(),
+            "reaction_score": down.tolist(),
+        })
+
+    # -------------------------------------------------------------------------
+    # Chat Replay endpoints
+    # -------------------------------------------------------------------------
+
+    @app.get("/api/chat/status")
+    def api_chat_status() -> JSONResponse:
+        """Get chat status for the current project.
+        
+        Returns:
+            - available: Whether chat is available
+            - enabled: Whether chat is enabled in project config
+            - sync_offset_ms: Current sync offset
+            - message_count: Number of chat messages
+            - source_url: Source URL used for chat
+        """
+        proj = ctx.require_project()
+        from ..project import get_chat_config, get_source_url
+
+        chat_config = get_chat_config(proj)
+        source_url = get_source_url(proj) or chat_config.get("source_url", "")
+
+        chat_available = proj.chat_db_path.exists()
+        message_count = 0
+        duration_ms = 0
+
+        if chat_available:
+            try:
+                from ..chat.store import ChatStore
+                store = ChatStore(proj.chat_db_path)
+                meta = store.get_all_meta()
+                message_count = meta.message_count
+                duration_ms = meta.duration_ms
+                store.close()
+            except Exception:
+                pass
+
+        return JSONResponse({
+            "available": chat_available,
+            "enabled": chat_config.get("enabled", False),
+            "sync_offset_ms": chat_config.get("sync_offset_ms", 0),
+            "message_count": message_count,
+            "duration_ms": duration_ms,
+            "source_url": source_url,
+        })
+
+    @app.post("/api/chat/set_source_url")
+    def api_chat_set_source_url(body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        """Set the source URL for chat download.
+        
+        Body:
+            source_url: str - The URL to use for chat download
+            platform: str - Optional platform hint (twitch, youtube, etc.)
+        """
+        proj = ctx.require_project()
+        from ..project import set_source_url
+
+        source_url = str(body.get("source_url") or "").strip()
+        if not source_url:
+            raise HTTPException(status_code=400, detail="source_url_required")
+
+        platform = body.get("platform")
+        set_source_url(proj, source_url, platform=platform)
+
+        return JSONResponse({"ok": True, "source_url": source_url})
+
+    @app.post("/api/chat/set_offset")
+    def api_chat_set_offset(body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        """Set the chat sync offset.
+        
+        Body:
+            sync_offset_ms: int - Offset in milliseconds (negative = chat earlier, positive = chat later)
+        """
+        proj = ctx.require_project()
+        from ..project import set_chat_config
+
+        sync_offset_ms = int(body.get("sync_offset_ms", 0))
+        set_chat_config(proj, sync_offset_ms=sync_offset_ms)
+
+        return JSONResponse({"ok": True, "sync_offset_ms": sync_offset_ms})
+
+    @app.post("/api/chat/download")
+    def api_chat_download(body: Dict[str, Any] = Body(default={})):  # type: ignore[valid-type]
+        """Download chat from source URL.
+        
+        Body:
+            source_url: str - Optional URL override. If not provided, uses project's source URL.
+        
+        Returns job_id for tracking progress.
+        """
+        import threading
+
+        proj = ctx.require_project()
+        from ..project import get_source_url, set_chat_config
+
+        # Get source URL from body or project
+        source_url = str(body.get("source_url") or "").strip()
+        if not source_url:
+            source_url = get_source_url(proj) or ""
+
+        if not source_url:
+            raise HTTPException(status_code=400, detail="source_url_required")
+
+        if not (source_url.startswith("http://") or source_url.startswith("https://")):
+            raise HTTPException(status_code=400, detail="invalid_url")
+
+        job = JOB_MANAGER.create("download_chat")
+
+        def runner() -> None:
+            JOB_MANAGER._set(job, status="running", progress=0.0, message="Starting chat download...")
+
+            def on_progress(frac: float, msg: str) -> None:
+                JOB_MANAGER._set(job, progress=frac * 0.5, message=msg)
+
+            try:
+                from ..chat.downloader import download_chat, ChatDownloadError
+                from ..chat.normalize import load_and_normalize
+                from ..chat.store import ChatStore, ChatMeta
+                from ..chat.features import compute_and_save_chat_features
+
+                # Download chat
+                JOB_MANAGER._set(job, progress=0.05, message="Downloading chat replay...")
+                result = download_chat(source_url, proj.chat_raw_path, on_progress=on_progress)
+
+                # Load and normalize
+                JOB_MANAGER._set(job, progress=0.5, message="Normalizing chat messages...")
+                messages, detected_format = load_and_normalize(proj.chat_raw_path)
+
+                # Store in SQLite
+                JOB_MANAGER._set(job, progress=0.6, message="Storing chat messages...")
+                store = ChatStore(proj.chat_db_path)
+                store.initialize()
+                store.clear_messages()
+                count = store.insert_messages(messages)
+
+                # Save metadata
+                store.set_all_meta(ChatMeta(
+                    source_url=source_url,
+                    platform=result.platform,
+                    video_id=result.video_id,
+                    message_count=count,
+                    duration_ms=result.duration_ms,
+                    downloaded_at=__import__("datetime").datetime.now(
+                        __import__("datetime").timezone.utc
+                    ).isoformat(),
+                    downloader_version=result.downloader_version,
+                    raw_file=str(proj.chat_raw_path),
+                ))
+                store.close()
+
+                # Compute features
+                JOB_MANAGER._set(job, progress=0.7, message="Computing chat features...")
+                hop_s = float(ctx.profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
+                smooth_s = float(ctx.profile.get("analysis", {}).get("highlights", {}).get("chat_smooth_seconds", 3.0))
+
+                def on_feature_progress(frac: float) -> None:
+                    JOB_MANAGER._set(job, progress=0.7 + 0.25 * frac, message="Computing chat features...")
+
+                compute_and_save_chat_features(proj, hop_s=hop_s, smooth_s=smooth_s, on_progress=on_feature_progress)
+
+                # Update project config
+                set_chat_config(proj, enabled=True, source_url=source_url)
+
+                JOB_MANAGER._set(
+                    job,
+                    status="succeeded",
+                    progress=1.0,
+                    message=f"Downloaded {count} chat messages",
+                    result={
+                        "message_count": count,
+                        "platform": result.platform,
+                        "source_url": source_url,
+                    },
+                )
+
+            except ChatDownloadError as e:
+                JOB_MANAGER._set(job, status="failed", message=str(e))
+            except Exception as e:
+                JOB_MANAGER._set(job, status="failed", message=f"{type(e).__name__}: {e}")
+
+        threading.Thread(target=runner, daemon=True).start()
+        return JSONResponse({"job_id": job.id})
+
+    @app.post("/api/chat/clear")
+    def api_chat_clear() -> JSONResponse:
+        """Clear chat data for the current project."""
+        proj = ctx.require_project()
+        from ..project import set_chat_config
+
+        # Remove chat files
+        if proj.chat_db_path.exists():
+            proj.chat_db_path.unlink()
+        if proj.chat_raw_path.exists():
+            proj.chat_raw_path.unlink()
+        if proj.chat_features_path.exists():
+            proj.chat_features_path.unlink()
+
+        # Update config
+        set_chat_config(proj, enabled=False)
+
+        return JSONResponse({"ok": True})
+
+    @app.get("/api/chat/timeline")
+    def api_chat_timeline(max_points: int = 2000) -> JSONResponse:
+        """Get chat spike timeline for visualization."""
+        proj = ctx.require_project()
+        if not proj.chat_features_path.exists():
+            return JSONResponse({"ok": False, "reason": "no_chat_analysis"}, status_code=404)
+
+        data = load_npz(proj.chat_features_path)
+        scores = data.get("scores")
+        if scores is None:
+            return JSONResponse({"ok": False, "reason": "missing_scores"}, status_code=404)
+
+        scores = scores.astype(float)
+        n = len(scores)
+        if n <= 0:
+            return JSONResponse({"ok": False, "reason": "empty"}, status_code=404)
+
+        step = max(1, int(n / max(1, int(max_points))))
+        idx = np.arange(0, n, step)
+        down = scores[idx]
+        if not np.isfinite(down).all():
+            down = np.where(np.isfinite(down), down, 0.0)
+
+        hop_arr = data.get("hop_seconds")
+        hop_s = float(hop_arr[0]) if hop_arr is not None and len(hop_arr) > 0 else 0.5
+
+        return JSONResponse({
+            "ok": True,
+            "hop_seconds": hop_s,
+            "indices": idx.tolist(),
+            "scores": down.tolist(),
+        })
+
+    @app.get("/api/chat/messages")
+    def api_chat_messages(
+        start_ms: int = 0,
+        end_ms: int = 60000,
+        limit: int = 500,
+    ) -> JSONResponse:
+        """Get chat messages in a time range.
+        
+        Query params:
+            start_ms: Start time in milliseconds (video time)
+            end_ms: End time in milliseconds (video time)
+            limit: Maximum messages to return
+        
+        Returns messages with sync_offset_ms already applied.
+        """
+        proj = ctx.require_project()
+
+        if not proj.chat_db_path.exists():
+            return JSONResponse({"ok": False, "reason": "no_chat"}, status_code=404)
+
+        from ..chat.store import ChatStore
+        from ..project import get_chat_config
+
+        chat_config = get_chat_config(proj)
+        offset_ms = chat_config.get("sync_offset_ms", 0)
+
+        store = ChatStore(proj.chat_db_path)
+        try:
+            messages = store.get_messages(start_ms, end_ms, offset_ms=offset_ms, limit=limit)
+        finally:
+            store.close()
+
+        return JSONResponse({
+            "ok": True,
+            "sync_offset_ms": offset_ms,
+            "messages": [m.to_dict() for m in messages],
+        })
+
+    @app.get("/api/transcript")
+    def api_transcript() -> JSONResponse:
+        """Get the full transcript for the current project."""
+        proj = ctx.require_project()
+        transcript = load_transcript(proj)
+        if transcript is None:
+            return JSONResponse({"ok": False, "reason": "no_transcript"}, status_code=404)
+
+        return JSONResponse({
+            "ok": True,
+            "language": transcript.language,
+            "duration_seconds": transcript.duration_seconds,
+            "segment_count": len(transcript.segments),
+            "segments": [s.to_dict() for s in transcript.segments],
+        })
+
     @app.get("/api/audio/timeline")
     def api_audio_timeline(max_points: int = 2000) -> JSONResponse:
         proj = ctx.require_project()
@@ -614,6 +1095,16 @@ def create_app(
         cap_cfg = {**ctx.profile.get("captions", {}), **(body.get("captions") or {})}
         hook_cfg = {**ctx.profile.get("overlay", {}).get("hook_text", {}), **(body.get("hook_text") or {})}
         pip_cfg = {**ctx.profile.get("layout", {}).get("pip", {}), **(body.get("pip") or {})}
+
+        # Auto-fill hook text from candidate if enabled and text is blank
+        if hook_cfg.get("enabled") and not hook_cfg.get("text"):
+            # Try to find the candidate for this selection and use its hook_text
+            candidate_rank = selection.get("candidate_rank")
+            if candidate_rank is not None:
+                candidates = proj_data.get("analysis", {}).get("highlights", {}).get("candidates", [])
+                matching_cand = next((c for c in candidates if c.get("rank") == candidate_rank), None)
+                if matching_cand and matching_cand.get("hook_text"):
+                    hook_cfg = {**hook_cfg, "text": matching_cand.get("hook_text")}
 
         with_captions = bool(body.get("with_captions", cap_cfg.get("enabled", False)))
 

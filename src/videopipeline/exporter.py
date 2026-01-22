@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from .ffmpeg import _require_cmd, ffprobe_video_stream_info
 from .layouts import RectNorm
+
+
+def _subprocess_flags() -> dict[str, Any]:
+    """Return subprocess flags to hide console window on Windows."""
+    if sys.platform == "win32":
+        # CREATE_NO_WINDOW = 0x08000000
+        return {"creationflags": 0x08000000}
+    return {}
 
 
 @dataclass(frozen=True)
@@ -321,6 +330,7 @@ def run_ffmpeg_export(
         text=True,
         bufsize=1,
         universal_newlines=True,
+        **_subprocess_flags(),
     )
     assert proc.stdout is not None
     assert proc.stderr is not None

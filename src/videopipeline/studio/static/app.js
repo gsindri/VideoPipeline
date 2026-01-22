@@ -592,13 +592,17 @@ function watchJob(jobId) {
         const j = payload.job;
         jobs.set(j.id, j);
         renderJobs();
-        if ((j.kind === 'analyze_audio' || j.kind === 'analyze_highlights') && j.status === 'succeeded') {
-          // refresh project and timeline
+        if ((j.kind === 'analyze_audio' || j.kind === 'analyze_highlights' || j.kind === 'analyze_speech') && j.status === 'succeeded') {
+          // refresh project and timeline to show reranked candidates
           refreshProject();
         }
         if (j.kind === 'export' && j.status === 'succeeded') {
           // refresh project to show exports list eventually
           refreshProject();
+        }
+        if (j.kind === 'download_chat' && j.status === 'succeeded') {
+          // refresh chat status after download completes
+          loadChatStatus();
         }
       }
     } catch (e) {
@@ -790,6 +794,14 @@ async function startAnalyzeAudioJob() {
   $('#analysisStatus').textContent = `Audio analysis running (job ${jobId.slice(0,8)})...`;
 }
 
+async function startAnalyzeSpeechJob() {
+  $('#analysisStatus').textContent = 'Starting speech analysis (Whisper transcription)...';
+  const res = await apiJson('POST', '/api/analyze/speech', {});
+  const jobId = res.job_id;
+  watchJob(jobId);
+  $('#analysisStatus').textContent = `Speech analysis running (job ${jobId.slice(0,8)})...`;
+}
+
 async function startExportJob(selectionId) {
   const exp = {
     width: Number($('#expW').value),
@@ -874,6 +886,13 @@ function wireUI() {
       await startAnalyzeAudioJob();
     } catch (e) {
       alert(`Audio analysis failed: ${e}`);
+    }
+  };
+  $('#btnAnalyzeSpeech').onclick = async () => {
+    try {
+      await startAnalyzeSpeechJob();
+    } catch (e) {
+      alert(`Speech analysis failed: ${e}`);
     }
   };
 
@@ -1382,6 +1401,252 @@ function wirePublishUI() {
   if (queueBtn) queueBtn.onclick = queuePublish;
 }
 
+// =========================================================================
+// CHAT REPLAY FUNCTIONS
+// =========================================================================
+
+let chatStatus = null;
+let chatAutoScroll = true;
+let chatSyncInterval = null;
+
+async function loadChatStatus() {
+  const panel = $('#chatPanel');
+  if (!panel) return;
+
+  try {
+    chatStatus = await apiGet('/api/chat/status');
+    updateChatUI();
+  } catch (e) {
+    chatStatus = null;
+    updateChatUI();
+  }
+}
+
+function updateChatUI() {
+  const panel = $('#chatPanel');
+  const statusEl = $('#chatStatus');
+  const sourceUrlInput = $('#chatSourceUrl');
+  const offsetInput = $('#chatOffsetMs');
+  const messagesEl = $('#chatMessages');
+  const downloadBtn = $('#btnDownloadChat');
+  const clearBtn = $('#btnClearChat');
+  const offsetControls = $('#chatOffsetControls');
+
+  if (!panel) return;
+
+  if (!chatStatus || !chatStatus.available) {
+    statusEl.textContent = 'No chat replay available.';
+    statusEl.className = 'small';
+    if (messagesEl) messagesEl.innerHTML = '';
+    if (offsetControls) offsetControls.style.display = 'none';
+    if (downloadBtn) downloadBtn.disabled = false;
+    if (clearBtn) clearBtn.style.display = 'none';
+
+    // Pre-fill source URL from project if available
+    if (sourceUrlInput && chatStatus?.source_url) {
+      sourceUrlInput.value = chatStatus.source_url;
+    }
+    return;
+  }
+
+  statusEl.textContent = `Chat: ${chatStatus.message_count.toLocaleString()} messages`;
+  statusEl.className = 'small success';
+  if (offsetControls) offsetControls.style.display = 'flex';
+  if (offsetInput) offsetInput.value = chatStatus.sync_offset_ms || 0;
+  if (sourceUrlInput && chatStatus.source_url) {
+    sourceUrlInput.value = chatStatus.source_url;
+  }
+  if (downloadBtn) downloadBtn.disabled = false;
+  if (clearBtn) clearBtn.style.display = 'inline-block';
+
+  // Start syncing chat
+  startChatSync();
+}
+
+function startChatSync() {
+  if (chatSyncInterval) {
+    clearInterval(chatSyncInterval);
+  }
+  chatSyncInterval = setInterval(syncChatMessages, 500);
+}
+
+function stopChatSync() {
+  if (chatSyncInterval) {
+    clearInterval(chatSyncInterval);
+    chatSyncInterval = null;
+  }
+}
+
+async function syncChatMessages() {
+  const v = $('#video');
+  const messagesEl = $('#chatMessages');
+  if (!v || !messagesEl || !chatStatus?.available) return;
+
+  const currentTimeMs = Math.floor(v.currentTime * 1000);
+  const windowMs = 10000; // Show 10 seconds of chat around current time
+  const startMs = Math.max(0, currentTimeMs - windowMs / 2);
+  const endMs = currentTimeMs + windowMs / 2;
+
+  try {
+    const res = await apiGet(`/api/chat/messages?start_ms=${startMs}&end_ms=${endMs}&limit=100`);
+    if (!res.ok) return;
+
+    renderChatMessages(res.messages, currentTimeMs);
+  } catch (e) {
+    // Silently fail
+  }
+}
+
+function renderChatMessages(messages, currentTimeMs) {
+  const messagesEl = $('#chatMessages');
+  if (!messagesEl) return;
+
+  if (!messages || messages.length === 0) {
+    messagesEl.innerHTML = '<div class="small" style="opacity:0.5">No messages in this time range</div>';
+    return;
+  }
+
+  const html = messages.map(m => {
+    const offsetMs = chatStatus?.sync_offset_ms || 0;
+    const msgTimeMs = m.t_ms - offsetMs;
+    const timeSec = msgTimeMs / 1000;
+    const isNear = Math.abs(msgTimeMs - currentTimeMs) < 2000;
+    const nearClass = isNear ? 'chat-msg-near' : '';
+    const timeStr = fmtTime(timeSec);
+    
+    return `
+      <div class="chat-msg ${nearClass}" data-time="${timeSec}">
+        <span class="chat-time" title="Click to seek">${timeStr}</span>
+        <span class="chat-author">${escapeHtml(m.author || 'anon')}</span>
+        <span class="chat-text">${escapeHtml(m.text || '')}</span>
+      </div>
+    `;
+  }).join('');
+
+  messagesEl.innerHTML = html;
+
+  // Add click handlers for seeking
+  messagesEl.querySelectorAll('.chat-msg').forEach(el => {
+    el.onclick = () => {
+      const t = parseFloat(el.dataset.time);
+      if (!isNaN(t)) {
+        const v = $('#video');
+        if (v) v.currentTime = t;
+      }
+    };
+  });
+
+  // Auto-scroll to current time
+  if (chatAutoScroll) {
+    const nearEl = messagesEl.querySelector('.chat-msg-near');
+    if (nearEl) {
+      nearEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+async function downloadChat() {
+  const sourceUrl = $('#chatSourceUrl')?.value?.trim();
+
+  if (!sourceUrl) {
+    alert('Please enter a source URL (e.g., Twitch VOD or YouTube URL)');
+    return;
+  }
+
+  if (!sourceUrl.startsWith('http://') && !sourceUrl.startsWith('https://')) {
+    alert('Please enter a valid URL starting with http:// or https://');
+    return;
+  }
+
+  try {
+    const res = await apiJson('POST', '/api/chat/download', { source_url: sourceUrl });
+    watchJob(res.job_id);
+    $('#chatStatus').textContent = 'Downloading chat...';
+  } catch (e) {
+    alert(`Failed to start chat download: ${e.message}`);
+  }
+}
+
+async function clearChat() {
+  if (!confirm('Clear all chat data for this project?')) return;
+
+  try {
+    await apiJson('POST', '/api/chat/clear', {});
+    chatStatus = null;
+    stopChatSync();
+    updateChatUI();
+    $('#chatMessages').innerHTML = '';
+  } catch (e) {
+    alert(`Failed to clear chat: ${e.message}`);
+  }
+}
+
+async function setChatOffset() {
+  const offsetInput = $('#chatOffsetMs');
+  if (!offsetInput) return;
+
+  const offset = parseInt(offsetInput.value, 10) || 0;
+
+  try {
+    await apiJson('POST', '/api/chat/set_offset', { sync_offset_ms: offset });
+    if (chatStatus) chatStatus.sync_offset_ms = offset;
+    syncChatMessages(); // Refresh immediately
+  } catch (e) {
+    alert(`Failed to set offset: ${e.message}`);
+  }
+}
+
+function wireChatUI() {
+  const downloadBtn = $('#btnDownloadChat');
+  const clearBtn = $('#btnClearChat');
+  const offsetInput = $('#chatOffsetMs');
+  const autoScrollChk = $('#chatAutoScroll');
+  const nudgeBackBtn = $('#chatNudgeBack');
+  const nudgeFwdBtn = $('#chatNudgeFwd');
+
+  if (downloadBtn) downloadBtn.onclick = downloadChat;
+  if (clearBtn) clearBtn.onclick = clearChat;
+
+  if (offsetInput) {
+    offsetInput.onchange = setChatOffset;
+    offsetInput.onkeydown = (e) => {
+      if (e.key === 'Enter') setChatOffset();
+    };
+  }
+
+  if (autoScrollChk) {
+    autoScrollChk.onchange = () => {
+      chatAutoScroll = autoScrollChk.checked;
+    };
+  }
+
+  if (nudgeBackBtn) {
+    nudgeBackBtn.onclick = () => {
+      const offsetInput = $('#chatOffsetMs');
+      if (offsetInput) {
+        offsetInput.value = (parseInt(offsetInput.value, 10) || 0) - 1000;
+        setChatOffset();
+      }
+    };
+  }
+
+  if (nudgeFwdBtn) {
+    nudgeFwdBtn.onclick = () => {
+      const offsetInput = $('#chatOffsetMs');
+      if (offsetInput) {
+        offsetInput.value = (parseInt(offsetInput.value, 10) || 0) + 1000;
+        setChatOffset();
+      }
+    };
+  }
+}
+
 async function main() {
   try {
     profile = await apiGet('/api/profile');
@@ -1412,7 +1677,9 @@ async function initStudioView() {
   renderProjectInfo();
   renderCandidates();
   renderSelections();
+  renderJobs();
   await refreshTimeline();
+  await loadChatStatus();
 
   try {
     const layout = await apiGet('/api/layout');
@@ -1447,6 +1714,7 @@ async function initStudioView() {
   }
 
   wireUI();
+  wireChatUI();
   updateFacecamStatus();
 }
 

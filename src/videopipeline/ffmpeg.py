@@ -2,11 +2,20 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Iterator
+from typing import Any, BinaryIO, Iterator
 
 import numpy as np
+
+
+def _subprocess_flags() -> dict[str, Any]:
+    """Return subprocess flags to hide console window on Windows."""
+    if sys.platform == "win32":
+        # CREATE_NO_WINDOW = 0x08000000
+        return {"creationflags": 0x08000000}
+    return {}
 
 
 def _require_cmd(cmd: str) -> str:
@@ -33,7 +42,7 @@ def ffprobe_duration_seconds(video_path: Path) -> float:
         "default=noprint_wrappers=1:nokey=1",
         str(video_path),
     ]
-    out = subprocess.check_output(cmd, text=True).strip()
+    out = subprocess.check_output(cmd, text=True, **_subprocess_flags()).strip()
     try:
         return float(out)
     except ValueError as e:
@@ -54,7 +63,7 @@ def ffprobe_streams(video_path: Path) -> dict:
         "-show_format",
         str(video_path),
     ]
-    out = subprocess.check_output(cmd, text=True)
+    out = subprocess.check_output(cmd, text=True, **_subprocess_flags())
     import json
 
     return json.loads(out)
@@ -75,7 +84,7 @@ def ffprobe_video_stream_info(video_path: Path) -> dict:
         "json",
         str(video_path),
     ]
-    out = subprocess.check_output(cmd, text=True)
+    out = subprocess.check_output(cmd, text=True, **_subprocess_flags())
     import json
 
     data = json.loads(out)
@@ -168,6 +177,7 @@ def stream_audio_blocks_f32le(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0,
+        **_subprocess_flags(),
     )
     assert proc.stdout is not None
     assert proc.stderr is not None
@@ -241,6 +251,7 @@ def stream_video_frames_gray(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0,
+        **_subprocess_flags(),
     )
     assert proc.stdout is not None
     assert proc.stderr is not None
