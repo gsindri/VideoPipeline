@@ -61,8 +61,7 @@ function showHomeView() {
   isStudioMode = false;
   $('#homeView').style.display = 'block';
   $('#studioView').style.display = 'none';
-  loadRecentProjects();
-  loadRecentDownloads();
+  loadRecentVideos();
   renderHomeJobs();
 }
 
@@ -82,41 +81,82 @@ function showStudioView() {
 // HOME VIEW FUNCTIONS
 // =========================================================================
 
-async function loadRecentProjects() {
-  const container = $('#recentProjects');
+async function loadRecentVideos() {
+  const container = $('#recentVideos');
+  if (!container) return;
   container.innerHTML = '<div class="small">Loading...</div>';
 
   try {
-    const res = await apiGet('/api/home/recent_projects');
-    const projects = res.projects || [];
+    const res = await apiGet('/api/home/videos');
+    const videos = res.videos || [];
 
-    if (projects.length === 0) {
-      container.innerHTML = '<div class="small">No recent projects found.</div>';
+    if (videos.length === 0) {
+      container.innerHTML = '<div class="small">No videos found. Download or open a video to get started.</div>';
       return;
     }
 
     container.innerHTML = '';
-    for (const p of projects) {
+    for (const v of videos) {
       const el = document.createElement('div');
       el.className = 'item';
-      const dur = fmtTime(p.duration_seconds || 0);
-      const sels = p.selections_count || 0;
-      const exps = p.exports_count || 0;
+      const dur = fmtTime(v.duration_seconds || 0);
+      const sizeMB = ((v.size_bytes || 0) / 1024 / 1024).toFixed(1);
+      
+      // Build status badges
+      let badges = '';
+      if (v.has_project) {
+        badges += `<span class="badge" style="background:#22c55e;color:#000">Project</span> `;
+        if (v.selections_count > 0) badges += `<span class="badge">${v.selections_count} sel</span> `;
+        if (v.exports_count > 0) badges += `<span class="badge">${v.exports_count} exp</span> `;
+      }
+      if (v.extractor) {
+        badges += `<span class="badge" style="background:#6366f1">${v.extractor}</span> `;
+      }
+      
       el.innerHTML = `
-        <div class="title">${p.video_name || 'Unknown video'}</div>
-        <div class="meta">Duration: ${dur} • Selections: ${sels} • Exports: ${exps}</div>
-        <div class="meta small" style="opacity:0.7;word-break:break-all">${p.video_path || ''}</div>
-        <div class="actions" style="margin-top:8px">
-          <button class="primary">Open project</button>
+        <div class="title">${v.title || v.filename}</div>
+        <div class="meta">${dur} • ${sizeMB} MB ${badges}</div>
+        <div class="meta small" style="opacity:0.7;word-break:break-all">${v.path}</div>
+        <div class="actions" style="margin-top:8px;display:flex;gap:8px">
+          <button class="primary btn-open">Open</button>
+          ${v.has_project ? `<button class="btn-delete" style="background:#ef4444" data-project-id="${v.project_id}">Delete Project</button>` : ''}
         </div>
       `;
-      const btn = el.querySelector('button');
-      btn.onclick = () => openProjectByPath(p.video_path);
+      
+      const btnOpen = el.querySelector('.btn-open');
+      btnOpen.onclick = () => openProjectByPath(v.path);
+      
+      const btnDelete = el.querySelector('.btn-delete');
+      if (btnDelete) {
+        btnDelete.onclick = async (e) => {
+          e.stopPropagation();
+          const projectId = btnDelete.dataset.projectId;
+          if (confirm(`Delete project for "${v.title || v.filename}"?\n\nThis will remove analysis data, selections, and exports. The video file will NOT be deleted.`)) {
+            try {
+              await apiJson('DELETE', `/api/home/project/${projectId}`, null);
+              loadRecentVideos(); // Refresh list
+            } catch (err) {
+              alert(`Failed to delete project: ${err.message}`);
+            }
+          }
+        };
+      }
+      
       container.appendChild(el);
     }
   } catch (e) {
-    container.innerHTML = `<div class="small">Error loading projects: ${e.message}</div>`;
+    container.innerHTML = `<div class="small">Error loading videos: ${e.message}</div>`;
   }
+}
+
+// Keep old function names for backwards compatibility
+async function loadRecentProjects() {
+  return loadRecentVideos();
+}
+
+async function loadRecentDownloads() {
+  // Deprecated - now merged into loadRecentVideos
+  return;
 }
 
 async function openProjectByPath(videoPath) {
@@ -393,6 +433,31 @@ function renderHomeJobs() {
     if (job.status === 'succeeded' && job.result?.video_path) {
       const filename = job.result.video_path.split(/[/\\]/).pop();
       resultInfo = `<div class="small" style="margin-top:4px">Downloaded: ${filename}</div>`;
+      
+      // Show chat status
+      const chat = job.result?.chat;
+      if (chat) {
+        if (chat.imported) {
+          resultInfo += `<div class="small" style="color:#22c55e;margin-top:2px">✓ Chat imported</div>`;
+        } else if (chat.import_error) {
+          resultInfo += `<div class="small" style="color:#f59e0b;margin-top:2px">⚠ Chat import failed: ${chat.import_error}</div>`;
+        } else if (chat.status === 'failed') {
+          resultInfo += `<div class="small" style="color:#f59e0b;margin-top:2px">⚠ Chat download failed: ${chat.message}</div>`;
+        } else if (chat.status === 'skipped') {
+          resultInfo += `<div class="small" style="color:#888;margin-top:2px">○ ${chat.message}</div>`;
+        }
+      }
+    }
+    
+    // Show chat status while running
+    let chatStatusInfo = '';
+    if (job.status === 'running' && job.result?.chat_status) {
+      const cs = job.result.chat_status;
+      if (cs === 'downloading') {
+        chatStatusInfo = `<div class="small" style="color:#6366f1;margin-top:2px">📥 Downloading chat...</div>`;
+      } else if (cs === 'pending') {
+        chatStatusInfo = `<div class="small" style="color:#888;margin-top:2px">○ Chat: pending</div>`;
+      }
     }
 
     let errorInfo = '';
@@ -406,6 +471,7 @@ function renderHomeJobs() {
         ${job.kind === 'download_url' ? 'URL Download' : job.kind}
       </div>
       <div class="meta">${job.message || ''}</div>
+      ${chatStatusInfo}
       ${job.status === 'running' ? `
         <div class="progress" style="margin-top:8px"><div style="width:${pct}%"></div></div>
         <div class="small" style="margin-top:4px">${pct}%</div>
@@ -415,44 +481,6 @@ function renderHomeJobs() {
     `;
 
     container.appendChild(el);
-  }
-}
-
-async function loadRecentDownloads() {
-  const container = $('#recentDownloads');
-  if (!container) return;
-
-  container.innerHTML = '<div class="small">Loading...</div>';
-
-  try {
-    const res = await apiGet('/api/ingest/recent_downloads');
-    const downloads = res.downloads || [];
-
-    if (downloads.length === 0) {
-      container.innerHTML = '<div class="small">No recent downloads.</div>';
-      return;
-    }
-
-    container.innerHTML = '';
-    for (const d of downloads) {
-      const el = document.createElement('div');
-      el.className = 'item';
-      const dur = fmtTime(d.duration_seconds || 0);
-      const sizeMB = ((d.size_bytes || 0) / 1024 / 1024).toFixed(1);
-      el.innerHTML = `
-        <div class="title">${d.title || d.filename}</div>
-        <div class="meta">${dur} • ${sizeMB} MB • ${d.extractor || 'local'}</div>
-        <div class="meta small" style="opacity:0.7;word-break:break-all">${d.path}</div>
-        <div class="actions" style="margin-top:8px">
-          <button class="primary">Open project</button>
-        </div>
-      `;
-      const btn = el.querySelector('button');
-      btn.onclick = () => openProjectByPath(d.path);
-      container.appendChild(el);
-    }
-  } catch (e) {
-    container.innerHTML = `<div class="small">Error: ${e.message}</div>`;
   }
 }
 
@@ -484,25 +512,65 @@ function renderCandidates() {
 
   const highlights = project?.analysis?.highlights;
   const audio = project?.analysis?.audio;
+  const director = project?.analysis?.director;
   const candidates = highlights?.candidates || audio?.candidates || [];
   if (candidates.length === 0) {
-    container.innerHTML = `<div class="small">No candidates yet. Click “Analyze highlights”.</div>`;
+    container.innerHTML = `<div class="small">No candidates yet. Click "Analyze highlights".</div>`;
     return;
   }
 
   for (const c of candidates) {
     const el = document.createElement('div');
     el.className = 'item';
-    const breakdown = c.breakdown ? ` • audio ${Number(c.breakdown.audio).toFixed(2)} / motion ${Number(c.breakdown.motion).toFixed(2)} / chat ${Number(c.breakdown.chat).toFixed(2)}` : '';
+    let breakdown = '';
+    if (c.breakdown) {
+      const audio = Number(c.breakdown.audio).toFixed(2);
+      const motion = Number(c.breakdown.motion).toFixed(2);
+      const chat = Number(c.breakdown.chat).toFixed(2);
+      const audioEvents = Number(c.breakdown.audio_events || 0).toFixed(2);
+      breakdown = ` • audio ${audio} / motion ${motion}`;
+      if (Number(c.breakdown.chat) !== 0) breakdown += ` / chat ${chat}`;
+      if (Number(c.breakdown.audio_events || 0) !== 0) breakdown += ` / events ${audioEvents}`;
+    }
+    
+    // Get AI metadata if available
+    const aiResult = director?.results?.find(r => r.rank === c.rank);
+    const aiTitle = aiResult?.title || '';
+    const aiHook = aiResult?.hook || '';
+    const aiVariant = aiResult?.chosen_variant || '';
+    const hasAI = !!aiResult;
+    
+    let aiHtml = '';
+    if (hasAI) {
+      const aiTags = (aiResult?.tags || []).slice(0, 5);
+      const tagsHtml = aiTags.length > 0 ? `<div class="ai-tags">${aiTags.map(t => `<span class="ai-tag">#${escapeHtml(t)}</span>`).join('')}</div>` : '';
+      aiHtml = `
+        <div class="candidate-ai-section">
+          <span class="ai-badge">AI Generated</span>
+          <div class="ai-title">${escapeHtml(aiTitle)}</div>
+          ${aiHook ? `<div class="ai-hook">"${escapeHtml(aiHook)}"</div>` : ''}
+          ${tagsHtml}
+          <div class="small" style="margin-top:4px;">Best variant: <span class="badge">${aiVariant}</span></div>
+        </div>
+      `;
+    }
+    
     el.innerHTML = `
       <div class="title">#${c.rank} • score ${c.score.toFixed(2)} <span class="badge">peak ${fmtTime(c.peak_time_s)}</span></div>
       <div class="meta">Clip: ${fmtTime(c.start_s)} → ${fmtTime(c.end_s)} (${(c.end_s - c.start_s).toFixed(1)}s)${breakdown}</div>
+      ${aiHtml}
       <div class="actions">
         <button class="primary">Load</button>
         <button>Seek peak</button>
+        ${hasAI ? '<button class="apply-ai">Apply AI</button>' : ''}
+        ${hasAI ? '<button class="variants">Variants</button>' : ''}
       </div>
     `;
-    const [btnLoad, btnPeak] = el.querySelectorAll('button');
+    const btnLoad = el.querySelector('button.primary');
+    const btnPeak = el.querySelectorAll('button')[1];
+    const btnApplyAI = el.querySelector('.apply-ai');
+    const btnVariants = el.querySelector('.variants');
+    
     btnLoad.onclick = () => {
       currentCandidate = c;
       setBuilder(c.start_s, c.end_s, '', $('#template').value);
@@ -515,8 +583,84 @@ function renderCandidates() {
       v.currentTime = c.peak_time_s;
       v.play();
     };
+    if (btnApplyAI && aiResult) {
+      btnApplyAI.onclick = () => {
+        // Apply AI-suggested variant times and title
+        const variant = aiResult.chosen_variant_data;
+        if (variant) {
+          setBuilder(variant.start_s, variant.end_s, aiTitle, $('#template').value);
+          const v = $('#video');
+          v.currentTime = variant.start_s;
+        } else {
+          setBuilder(c.start_s, c.end_s, aiTitle, $('#template').value);
+        }
+      };
+    }
+    if (btnVariants && aiResult) {
+      btnVariants.onclick = () => showVariantsModal(c.rank, aiResult);
+    }
     container.appendChild(el);
   }
+}
+
+// Modal for showing clip variants
+function showVariantsModal(rank, aiResult) {
+  // Remove existing modal if any
+  const existing = document.querySelector('.variants-modal-overlay');
+  if (existing) existing.remove();
+  
+  // Fetch variants from API
+  apiGet(`/api/clip_variants/${rank}`).then(data => {
+    const variants = data.variants || [];
+    if (variants.length === 0) {
+      alert('No variants available for this candidate.');
+      return;
+    }
+    
+    const overlay = document.createElement('div');
+    overlay.className = 'variants-modal-overlay';
+    overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);z-index:1000;display:flex;align-items:center;justify-content:center;';
+    
+    let variantsHtml = variants.map((v, i) => {
+      const isChosen = v.variant_id === aiResult?.chosen_variant;
+      return `
+        <div class="variant-item ${isChosen ? 'chosen' : ''}" data-idx="${i}" style="padding:12px;margin:8px 0;background:${isChosen ? 'rgba(79,140,255,0.2)' : 'rgba(255,255,255,0.05)'};border-radius:6px;cursor:pointer;">
+          <div style="font-weight:600;">${v.variant_id} ${isChosen ? '✓ AI choice' : ''}</div>
+          <div class="small">${fmtTime(v.start_s)} → ${fmtTime(v.end_s)} (${v.duration_s.toFixed(1)}s)</div>
+          <div class="small" style="margin-top:4px;">Strategy: ${v.strategy} • Cut in: ${v.cut_in_reason} • Cut out: ${v.cut_out_reason}</div>
+        </div>
+      `;
+    }).join('');
+    
+    const modal = document.createElement('div');
+    modal.style.cssText = 'background:var(--bg);padding:24px;border-radius:8px;max-width:500px;max-height:80vh;overflow-y:auto;';
+    modal.innerHTML = `
+      <h3 style="margin:0 0 16px 0;">Clip Variants for #${rank}</h3>
+      ${variantsHtml}
+      <div style="margin-top:16px;text-align:right;">
+        <button class="close-modal">Close</button>
+      </div>
+    `;
+    
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+    
+    // Wire up click handlers
+    modal.querySelectorAll('.variant-item').forEach((el, i) => {
+      el.onclick = () => {
+        const v = variants[i];
+        setBuilder(v.start_s, v.end_s, aiResult?.title || '', $('#template').value);
+        const video = $('#video');
+        video.currentTime = v.start_s;
+        overlay.remove();
+      };
+    });
+    
+    modal.querySelector('.close-modal').onclick = () => overlay.remove();
+    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+  }).catch(e => {
+    alert(`Failed to load variants: ${e.message}`);
+  });
 }
 
 function renderSelections() {
@@ -573,9 +717,36 @@ function renderJobs() {
     const el = document.createElement('div');
     el.className = 'item';
     const pct = Math.round((job.progress || 0) * 100);
+    
+    // Build detailed status for analyze_full jobs
+    let detailHtml = '';
+    if (job.kind === 'analyze_full' && job.result) {
+      const r = job.result;
+      if (r.stage === 1 && (r.pending || r.completed || r.failed)) {
+        // Stage 1 detailed view
+        const completedList = (r.completed || []).map(t => `<span style="color:#22c55e">✓${t}</span>`).join(' ');
+        const failedList = (r.failed || []).map(t => `<span style="color:#ef4444">✗${t}</span>`).join(' ');
+        const pendingList = (r.pending || []).map(t => `<span style="color:#888">◦${t}</span>`).join(' ');
+        detailHtml = `<div class="meta" style="margin-top:4px;font-size:11px">${completedList} ${failedList} ${pendingList}</div>`;
+      } else if (r.completed_stages) {
+        // Final result
+        const candidateCount = r.candidates_count || 0;
+        const errorCount = (r.errors || []).length;
+        detailHtml = `<div class="meta" style="margin-top:4px;font-size:11px">`;
+        detailHtml += `Stages: ${r.completed_stages.join(', ')}`;
+        if (candidateCount > 0) detailHtml += ` | <strong>${candidateCount} candidates</strong>`;
+        if (errorCount > 0) detailHtml += ` | <span style="color:#f59e0b">${errorCount} errors</span>`;
+        detailHtml += `</div>`;
+        if (r.errors && r.errors.length > 0) {
+          detailHtml += `<div class="meta" style="margin-top:2px;font-size:10px;color:#ef4444">${r.errors.join('<br/>')}</div>`;
+        }
+      }
+    }
+    
     el.innerHTML = `
       <div class="title">${job.kind} • <span class="badge">${job.status}</span></div>
       <div class="meta">${job.message || ''}${job.result?.output ? `<br/>Output: ${job.result.output}` : ''}</div>
+      ${detailHtml}
       <div class="progress" style="margin-top:10px"><div style="width:${pct}%"></div></div>
       <div class="meta" style="margin-top:6px">${pct}%</div>
     `;
@@ -592,7 +763,7 @@ function watchJob(jobId) {
         const j = payload.job;
         jobs.set(j.id, j);
         renderJobs();
-        if ((j.kind === 'analyze_audio' || j.kind === 'analyze_highlights' || j.kind === 'analyze_speech') && j.status === 'succeeded') {
+        if ((j.kind === 'analyze_audio' || j.kind === 'analyze_highlights' || j.kind === 'analyze_speech' || j.kind === 'analyze_context_titles' || j.kind === 'analyze_full') && j.status === 'succeeded') {
           // refresh project and timeline to show reranked candidates
           refreshProject();
         }
@@ -600,9 +771,13 @@ function watchJob(jobId) {
           // refresh project to show exports list eventually
           refreshProject();
         }
-        if (j.kind === 'download_chat' && j.status === 'succeeded') {
+        if ((j.kind === 'download_chat' || j.kind === 'download_url') && j.status === 'succeeded') {
           // refresh chat status after download completes
           loadChatStatus();
+          // Also refresh videos list in home view if visible
+          if ($('#recentVideos')) {
+            loadRecentVideos();
+          }
         }
       }
     } catch (e) {
@@ -794,12 +969,36 @@ async function startAnalyzeAudioJob() {
   $('#analysisStatus').textContent = `Audio analysis running (job ${jobId.slice(0,8)})...`;
 }
 
+async function startAnalyzeAudioEventsJob() {
+  $('#analysisStatus').textContent = 'Starting audio events analysis (laughter/cheer/shout)...';
+  const res = await apiJson('POST', '/api/analyze/audio_events', {});
+  const jobId = res.job_id;
+  watchJob(jobId);
+  $('#analysisStatus').textContent = `Audio events analysis running (job ${jobId.slice(0,8)})...`;
+}
+
+async function startAnalyzeFullJob() {
+  $('#analysisStatus').textContent = 'Starting full parallel analysis (DAG)...';
+  const res = await apiJson('POST', '/api/analyze/full', {});
+  const jobId = res.job_id;
+  watchJob(jobId);
+  $('#analysisStatus').textContent = `Full analysis running (job ${jobId.slice(0,8)})...`;
+}
+
 async function startAnalyzeSpeechJob() {
   $('#analysisStatus').textContent = 'Starting speech analysis (Whisper transcription)...';
   const res = await apiJson('POST', '/api/analyze/speech', {});
   const jobId = res.job_id;
   watchJob(jobId);
   $('#analysisStatus').textContent = `Speech analysis running (job ${jobId.slice(0,8)})...`;
+}
+
+async function startAnalyzeContextJob() {
+  $('#analysisStatus').textContent = 'Starting context + titles analysis (AI)...';
+  const res = await apiJson('POST', '/api/analyze/context_titles', {});
+  const jobId = res.job_id;
+  watchJob(jobId);
+  $('#analysisStatus').textContent = `Context analysis running (job ${jobId.slice(0,8)})...`;
 }
 
 async function startExportJob(selectionId) {
@@ -888,11 +1087,32 @@ function wireUI() {
       alert(`Audio analysis failed: ${e}`);
     }
   };
+  $('#btnAnalyzeAudioEvents').onclick = async () => {
+    try {
+      await startAnalyzeAudioEventsJob();
+    } catch (e) {
+      alert(`Audio events analysis failed: ${e}`);
+    }
+  };
+  $('#btnAnalyzeFull').onclick = async () => {
+    try {
+      await startAnalyzeFullJob();
+    } catch (e) {
+      alert(`Full analysis failed: ${e}`);
+    }
+  };
   $('#btnAnalyzeSpeech').onclick = async () => {
     try {
       await startAnalyzeSpeechJob();
     } catch (e) {
       alert(`Speech analysis failed: ${e}`);
+    }
+  };
+  $('#btnAnalyzeContext').onclick = async () => {
+    try {
+      await startAnalyzeContextJob();
+    } catch (e) {
+      alert(`Context analysis failed: ${e}`);
     }
   };
 
@@ -1536,11 +1756,16 @@ function renderChatMessages(messages, currentTimeMs) {
     };
   });
 
-  // Auto-scroll to current time
+  // Auto-scroll to current time (within chat container only, not the page)
   if (chatAutoScroll) {
     const nearEl = messagesEl.querySelector('.chat-msg-near');
     if (nearEl) {
-      nearEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      // Calculate scroll position to center the element within the container
+      const containerHeight = messagesEl.clientHeight;
+      const elementTop = nearEl.offsetTop - messagesEl.offsetTop;
+      const elementHeight = nearEl.clientHeight;
+      const scrollTarget = elementTop - (containerHeight / 2) + (elementHeight / 2);
+      messagesEl.scrollTop = Math.max(0, scrollTarget);
     }
   }
 }

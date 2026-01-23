@@ -99,6 +99,7 @@ class JobManager:
         whisper_cfg: Optional[TranscribeConfig] = None,
         hook_cfg: Optional[Dict[str, Any]] = None,
         pip_cfg: Optional[Dict[str, Any]] = None,
+        director_results: Optional[list[Dict[str, Any]]] = None,
     ) -> Job:
         job = self.create("export")
 
@@ -144,6 +145,17 @@ class JobManager:
                 hook_spec = None
                 if hook_cfg and bool(hook_cfg.get("enabled", False)):
                     hook_text = hook_cfg.get("text")
+                    # Check AI director results for this selection's hook
+                    if not hook_text and director_results:
+                        candidate_rank = selection.get("rank")
+                        if candidate_rank is not None:
+                            for dr in director_results:
+                                if dr.get("candidate_rank") == candidate_rank:
+                                    hook_text = dr.get("hook")
+                                    break
+                    # Fall back to candidate hook_text or derived hook
+                    if not hook_text:
+                        hook_text = selection.get("hook_text")
                     if not hook_text:
                         hook_text = derive_hook_text(selection, segments)
                     if hook_text:
@@ -179,12 +191,23 @@ class JobManager:
 
                 run_ffmpeg_export(spec, on_progress=on_prog)
 
+                # Look up AI metadata for this selection
+                ai_metadata = None
+                if director_results:
+                    candidate_rank = selection.get("rank") or selection.get("candidate_rank")
+                    if candidate_rank is not None:
+                        for dr in director_results:
+                            if dr.get("candidate_rank") == candidate_rank:
+                                ai_metadata = dr
+                                break
+
                 metadata = build_metadata(
                     selection=selection,
                     output_path=out_path,
                     template=template,
                     with_captions=with_captions,
                     segments=segments,
+                    ai_metadata=ai_metadata,
                 )
                 write_metadata(out_path.with_suffix(".metadata.json"), metadata)
 
@@ -224,6 +247,7 @@ class JobManager:
         whisper_cfg: Optional[TranscribeConfig] = None,
         hook_cfg: Optional[Dict[str, Any]] = None,
         pip_cfg: Optional[Dict[str, Any]] = None,
+        director_results: Optional[list[Dict[str, Any]]] = None,
     ) -> Job:
         job = self.create("export_batch")
 
@@ -247,6 +271,7 @@ class JobManager:
                         whisper_cfg=whisper_cfg,
                         hook_cfg=hook_cfg,
                         pip_cfg=pip_cfg,
+                        director_results=director_results,
                     )
 
                     while True:

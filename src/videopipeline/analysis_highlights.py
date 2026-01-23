@@ -132,7 +132,9 @@ def compute_highlights_analysis(
     motion_cfg: Dict[str, Any],
     scenes_cfg: Dict[str, Any],
     highlights_cfg: Dict[str, Any],
+    audio_events_cfg: Optional[Dict[str, Any]] = None,
     include_chat: bool = True,
+    include_audio_events: bool = True,
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     proj_data = get_project_data(proj)
@@ -232,23 +234,51 @@ def compute_highlights_analysis(
             )
             chat_used = True
 
+    # Load audio events (7.3) if available
+    audio_events_scores = np.zeros_like(audio_scores)
+    audio_events_used = False
+    if include_audio_events and proj.audio_events_features_path.exists():
+        try:
+            events_data = load_npz(proj.audio_events_features_path)
+            events_raw = events_data.get("event_combo_z")
+            events_hop_arr = events_data.get("hop_seconds")
+            if events_raw is not None and events_hop_arr is not None and len(events_hop_arr) > 0:
+                audio_events_scores = resample_series(
+                    events_raw.astype(np.float64),
+                    src_hop_s=float(events_hop_arr[0]),
+                    target_hop_s=hop_s,
+                    target_len=len(audio_scores),
+                )
+                audio_events_used = True
+        except Exception:
+            # If loading fails, continue without audio events
+            pass
+
     weights = highlights_cfg.get("weights", {})
-    w_audio = float(weights.get("audio", 0.55))
-    w_motion = float(weights.get("motion", 0.45))
+    w_audio = float(weights.get("audio", 0.45))
+    w_motion = float(weights.get("motion", 0.35))
     # When chat is available, use a default weight of 0.20 if not explicitly set to 0
     # This re-normalizes with chat contribution
     w_chat_cfg = float(weights.get("chat", 0.20))
     w_chat = w_chat_cfg if chat_used else 0.0
+    # Audio events weight (7.3)
+    w_audio_events_cfg = float(weights.get("audio_events", 0.20))
+    w_audio_events = w_audio_events_cfg if audio_events_used else 0.0
 
-    # If chat is used with default weight and audio/motion are also default,
-    # normalize weights to sum to 1.0
-    w_total = w_audio + w_motion + w_chat
+    # Normalize weights to sum to 1.0
+    w_total = w_audio + w_motion + w_chat + w_audio_events
     if w_total > 0 and abs(w_total - 1.0) > 0.001:
         w_audio = w_audio / w_total
         w_motion = w_motion / w_total
         w_chat = w_chat / w_total
+        w_audio_events = w_audio_events / w_total
 
-    combined_raw = (w_audio * audio_scores) + (w_motion * motion_resampled) + (w_chat * chat_scores)
+    combined_raw = (
+        (w_audio * audio_scores) +
+        (w_motion * motion_resampled) +
+        (w_chat * chat_scores) +
+        (w_audio_events * audio_events_scores)
+    )
     smooth_s = float(highlights_cfg.get("smooth_seconds", max(1.0, 2.0 * hop_s)))
     smooth_frames = max(1, int(round(smooth_s / hop_s)))
     combined_smoothed = moving_average(combined_raw, smooth_frames) if len(combined_raw) > 0 else combined_raw
@@ -305,6 +335,7 @@ def compute_highlights_analysis(
                     "audio": float(audio_scores[idx]),
                     "motion": float(motion_resampled[idx]),
                     "chat": float(chat_scores[idx]) if chat_used else 0.0,
+                    "audio_events": float(audio_events_scores[idx]) if audio_events_used else 0.0,
                 },
             }
         )
@@ -317,18 +348,29 @@ def compute_highlights_analysis(
         audio_scores=audio_scores,
         motion_scores=motion_resampled,
         chat_scores=chat_scores,
+        audio_events_scores=audio_events_scores,
         hop_seconds=np.array([hop_s], dtype=np.float64),
     )
 
     payload = {
-        "method": "multi_signal_highlights_v2",
+        "method": "multi_signal_highlights_v3",  # Updated version for audio events
         "config": {
             "audio": audio_cfg,
             "motion": motion_cfg,
             "scenes": scenes_cfg,
             "highlights": highlights_cfg,
+            "audio_events": audio_events_cfg,
         },
-        "weights": {"audio": w_audio, "motion": w_motion, "chat": w_chat},
+        "weights": {
+            "audio": w_audio,
+            "motion": w_motion,
+            "chat": w_chat,
+            "audio_events": w_audio_events,
+        },
+        "signals_used": {
+            "chat": chat_used,
+            "audio_events": audio_events_used,
+        },
         "candidates": candidates,
         "generated_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
     }

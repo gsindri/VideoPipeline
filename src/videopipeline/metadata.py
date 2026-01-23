@@ -49,13 +49,42 @@ def build_metadata(
     template: str,
     with_captions: bool,
     segments: Optional[Iterable[SubtitleSegment]] = None,
+    ai_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    hook = derive_hook_text(selection, segments)
-    title = selection.get("title") or hook
-    caption = hook
+    """Build export metadata dictionary.
+    
+    Args:
+        selection: Candidate/selection data dict
+        output_path: Path to the exported video file
+        template: Template name used for export
+        with_captions: Whether captions were included
+        segments: Optional transcript segments for hook derivation
+        ai_metadata: Optional AI director result with title, description, tags, hook
+    """
+    # Priority: AI metadata > selection fields > derived
+    hook = None
+    title = None
+    caption = None
     hashtags = ["#gaming", "#clips", "#shorts"]
+    
+    if ai_metadata:
+        hook = ai_metadata.get("hook")
+        title = ai_metadata.get("title")
+        caption = ai_metadata.get("description")
+        ai_tags = ai_metadata.get("tags") or []
+        if ai_tags:
+            hashtags = [f"#{t}" if not t.startswith("#") else t for t in ai_tags]
+    
+    if not hook:
+        hook = derive_hook_text(selection, segments)
+    if not title:
+        title = selection.get("title") or hook
+    if not caption:
+        caption = hook
+        
     if template.startswith("vertical"):
-        hashtags.append("#vertical")
+        if "#vertical" not in hashtags:
+            hashtags.append("#vertical")
 
     payload = {
         "title": title,
@@ -81,6 +110,13 @@ def build_metadata(
     }
     if segments:
         payload["transcript_snippet"] = _pick_hook_from_segments(segments)
+    if ai_metadata:
+        payload["ai_generated"] = {
+            "title": ai_metadata.get("title"),
+            "description": ai_metadata.get("description"),
+            "tags": ai_metadata.get("tags"),
+            "hook": ai_metadata.get("hook"),
+        }
     return payload
 
 

@@ -22,9 +22,10 @@ analysis:
     min_gap_seconds: 15.0
     skip_start_seconds: 10.0
     weights:
-      audio: 0.55
-      motion: 0.45
-      chat: 0.0
+      audio: 0.35
+      motion: 0.30
+      chat: 0.20
+      audio_events: 0.15
     clip:
       min_seconds: 12
       max_seconds: 60
@@ -46,6 +47,17 @@ analysis:
     sample_rate: 16000
     hop_seconds: 0.5
     smooth_seconds: 1.5
+  audio_events:
+    enabled: true
+    hop_seconds: 0.5
+    smooth_seconds: 2.0
+    sample_rate: 16000
+    events:
+      laughter: 1.0
+      cheering: 0.7
+      applause: 0.5
+      screaming: 0.8
+      shouting: 0.6
   rerank:
     enabled: true
     weights:
@@ -116,3 +128,40 @@ captions:
   language: null
   device: cpu
   compute_type: int8
+
+context:
+  enabled: true
+  top_n: 25
+  silence_noise_db: -30.0
+  silence_min_duration: 0.3
+  max_sentence_words: 30
+
+  variants:
+    short:
+      min_s: 16
+      max_s: 24
+    medium:
+      min_s: 24
+      max_s: 40
+    long:
+      min_s: 40
+      max_s: 75
+
+  boundaries:
+    prefer_silence: true
+    prefer_sentences: true
+    prefer_scene_cuts: true
+    prefer_chat_valleys: true
+    chat_valley_window_s: 12.0
+
+ai:
+  director:
+    enabled: true
+    engine: llama_cpp_server
+    endpoint: "http://127.0.0.1:11435"
+    model_name: "local-gguf-vulkan"
+    timeout_s: 30
+    max_tokens: 256
+    temperature: 0.2
+    platform: "shorts"
+    fallback_to_rules: true

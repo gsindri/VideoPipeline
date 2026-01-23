@@ -75,15 +75,8 @@
         </div>
 
         <div class="panel home-panel">
-          <h2>Recent Projects</h2>
-          <div class="list" id="recentProjects">
-            <div class="small">Loading...</div>
-          </div>
-        </div>
-
-        <div class="panel home-panel">
-          <h2>Recent Downloads</h2>
-          <div class="list" id="recentDownloads">
+          <h2>Videos</h2>
+          <div class="list" id="recentVideos">
             <div class="small">Loading...</div>
           </div>
         </div>
@@ -136,15 +129,20 @@
         <div class="panel">
           <h2>Interest timeline</h2>
           <div class="row">
-            <button class="primary" id="btnAnalyzeHighlights">Analyze highlights (audio+motion+scenes)</button>
-            <button id="btnAnalyzeAudio">Analyze audio only</button>
-            <button id="btnAnalyzeSpeech" title="Transcribe with Whisper and extract speech/reaction features">Analyze speech</button>
+            <button class="success" id="btnAnalyzeFull" title="Run all analysis stages in parallel (recommended)">⚡ Analyze (Full)</button>
+            <button class="primary" id="btnAnalyzeHighlights">Analyze highlights</button>
+            <button id="btnAnalyzeAudio">Audio only</button>
+            <button id="btnAnalyzeAudioEvents" title="Detect laughter, cheering, shouting events">Audio events</button>
+            <button id="btnAnalyzeSpeech" title="Transcribe with Whisper and extract speech/reaction features">Speech</button>
+            <button id="btnAnalyzeContext" title="Generate clip variants and AI titles/hooks">Context + Titles (AI)</button>
+          </div>
+          <div class="row">
             <span class="small" id="analysisStatus"></span>
           </div>
           <div class="canvas-wrap">
             <canvas id="chart" height="120"></canvas>
           </div>
-          <p class="small">Higher score means more hype based on combined signals.</p>
+          <p class="small">Higher score means more hype based on combined signals (audio energy + motion + chat spikes + audio events).</p>
         </div>
 
         <div class="panel">

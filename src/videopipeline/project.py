@@ -137,6 +137,10 @@ class Project:
         return self.analysis_dir / "reaction_audio_features.npz"
 
     @property
+    def audio_events_features_path(self) -> Path:
+        return self.analysis_dir / "audio_events_features.npz"
+
+    @property
     def exports_dir(self) -> Path:
         return self.project_dir / "exports"
 

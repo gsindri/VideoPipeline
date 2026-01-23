@@ -35,9 +35,10 @@ def default_profile() -> Dict[str, Any]:
                 "min_gap_seconds": 15.0,
                 "skip_start_seconds": 10.0,
                 "weights": {
-                    "audio": 0.55,
-                    "motion": 0.45,
+                    "audio": 0.45,
+                    "motion": 0.35,
                     "chat": 0.0,
+                    "audio_events": 0.20,
                 },
                 "clip": {
                     "min_seconds": 12,
@@ -63,6 +64,19 @@ def default_profile() -> Dict[str, Any]:
                 "sample_rate": 16000,
                 "hop_seconds": 0.5,
                 "smooth_seconds": 1.5,
+            },
+            "audio_events": {
+                "enabled": True,
+                "hop_seconds": 0.5,
+                "smooth_seconds": 2.0,
+                "sample_rate": 16000,
+                "events": {
+                    "laughter": 1.0,
+                    "cheering": 0.7,
+                    "applause": 0.5,
+                    "screaming": 0.8,
+                    "shouting": 0.6,
+                },
             },
             "rerank": {
                 "enabled": True,

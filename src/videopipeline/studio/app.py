@@ -12,11 +12,18 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..analysis_audio import compute_audio_analysis
+from ..analysis_audio_events import AudioEventsConfig, compute_audio_events_analysis, load_audio_events_features
 from ..analysis_highlights import compute_highlights_analysis
 from ..analysis_transcript import TranscriptConfig, compute_transcript_analysis, load_transcript
 from ..analysis_speech_features import SpeechFeatureConfig, compute_speech_features, load_speech_features
 from ..analysis_reaction_audio import ReactionAudioConfig, compute_reaction_audio_features
 from ..rerank_candidates import RerankConfig, compute_reranked_candidates
+from ..analysis_silence import SilenceConfig, compute_silence_analysis
+from ..analysis_sentences import SentenceConfig, compute_sentences_analysis
+from ..analysis_chat_boundaries import ChatBoundaryConfig, compute_chat_boundaries_analysis
+from ..analysis_boundaries import BoundaryConfig, compute_boundaries_analysis
+from ..clip_variants import VariantGeneratorConfig, VariantDurationConfig, compute_clip_variants, load_clip_variants
+from ..ai.director import DirectorConfig, compute_director_analysis
 from ..layouts import RectNorm
 from ..project import create_or_load_project, get_project_data, load_npz, set_layout_facecam, Project
 from ..profile import load_profile
@@ -161,6 +168,116 @@ def create_app(
         proj = ctx.open_project(video_path)
         return JSONResponse({"active": True, "project": get_project_data(proj)})
 
+    @app.delete("/api/home/project/{project_id}")
+    def api_home_delete_project(project_id: str) -> JSONResponse:
+        """Delete a project and optionally its video file.
+        
+        Query params:
+            delete_video: bool - Also delete the video file (default False)
+        """
+        import shutil
+        from ..project import default_projects_root
+        
+        projects_root = default_projects_root()
+        project_dir = projects_root / project_id
+        
+        if not project_dir.exists():
+            raise HTTPException(status_code=404, detail="project_not_found")
+        
+        # Load project info before deleting
+        project_json = project_dir / "project.json"
+        video_path = None
+        if project_json.exists():
+            try:
+                data = json.loads(project_json.read_text(encoding="utf-8"))
+                video_path = data.get("video", {}).get("path")
+            except Exception:
+                pass
+        
+        # Close project if it's currently open
+        if ctx.project and ctx.project.project_id == project_id:
+            ctx.close_project()
+        
+        # Delete the project directory
+        try:
+            shutil.rmtree(project_dir)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to delete project: {e}")
+        
+        return JSONResponse({
+            "deleted": True,
+            "project_id": project_id,
+            "video_path": video_path,
+        })
+
+    @app.get("/api/home/videos")
+    def api_home_videos() -> JSONResponse:
+        """Unified list of all videos (projects + downloads merged).
+        
+        Returns videos sorted by most recently modified, with project status.
+        """
+        from ..ingest.ytdlp_runner import _default_downloads_dir
+        from ..project import default_projects_root
+        
+        # Build lookup of video_path -> project info
+        projects_by_path: Dict[str, Dict[str, Any]] = {}
+        projects = list_recent_projects(limit=100)
+        for p in projects:
+            vp = p.get("video_path", "")
+            if vp:
+                # Normalize path for comparison
+                projects_by_path[str(Path(vp).resolve())] = p
+        
+        # Scan downloads directory
+        downloads_dir = _default_downloads_dir()
+        video_exts = {".mp4", ".mkv", ".webm", ".m4v", ".avi", ".mov", ".ts"}
+        videos: List[Dict[str, Any]] = []
+        seen_paths: set = set()
+        
+        if downloads_dir.exists():
+            for ext in video_exts:
+                for f in downloads_dir.glob(f"*{ext}"):
+                    resolved = str(f.resolve())
+                    if resolved in seen_paths:
+                        continue
+                    seen_paths.add(resolved)
+                    
+                    try:
+                        st = f.stat()
+                        info_json = f.with_suffix(".info.json")
+                        info = {}
+                        if info_json.exists():
+                            try:
+                                info = json.loads(info_json.read_text(encoding="utf-8"))
+                            except Exception:
+                                pass
+                        
+                        # Check if this video has a project
+                        project_info = projects_by_path.get(resolved)
+                        
+                        videos.append({
+                            "path": str(f),
+                            "filename": f.name,
+                            "title": info.get("title", f.stem),
+                            "size_bytes": st.st_size,
+                            "mtime": st.st_mtime,
+                            "duration_seconds": info.get("duration", project_info.get("duration_seconds", 0) if project_info else 0),
+                            "url": info.get("webpage_url", ""),
+                            "extractor": info.get("extractor", ""),
+                            # Project info
+                            "has_project": project_info is not None,
+                            "project_id": project_info.get("project_id") if project_info else None,
+                            "selections_count": project_info.get("selections_count", 0) if project_info else 0,
+                            "exports_count": project_info.get("exports_count", 0) if project_info else 0,
+                        })
+                    except Exception:
+                        continue
+        
+        # Sort by mtime descending
+        videos.sort(key=lambda v: v["mtime"], reverse=True)
+        
+        return JSONResponse({"videos": videos[:30]})
+
     @app.post("/api/home/open_dialog")
     def api_home_open_dialog():
         if sys.platform != "win32":
@@ -256,29 +373,160 @@ def create_app(
         job = JOB_MANAGER.create("download_url")
 
         def runner() -> None:
-            JOB_MANAGER._set(job, status="running", progress=0.0, message="Starting download...")
+            import concurrent.futures
+            
+            # Shared state for progress tracking
+            current_chat_status = {"status": "pending", "message": "Waiting..."}
+            
+            JOB_MANAGER._set(
+                job, 
+                status="running", 
+                progress=0.0, 
+                message="Starting download...",
+                result={"video_status": "downloading", "chat_status": "pending"}
+            )
 
-            def on_progress(frac: float, msg: str) -> None:
-                JOB_MANAGER._set(job, progress=frac, message=msg)
+            video_result = None
+            chat_result = {"status": "skipped", "message": "Not a Twitch VOD"}
+            chat_error = None
+
+            def on_video_progress(frac: float, msg: str) -> None:
+                # Video download is 0-90%, chat is 90-100%
+                # Build combined message
+                chat_info = ""
+                if current_chat_status["status"] == "downloading":
+                    chat_info = " | 💬 Chat: downloading..."
+                elif current_chat_status["status"] == "success":
+                    chat_info = " | 💬 Chat: ✓ done"
+                elif current_chat_status["status"] == "failed":
+                    chat_info = f" | 💬 Chat: ✗ failed"
+                elif current_chat_status["status"] == "pending" and "twitch.tv/videos/" in url.lower():
+                    chat_info = " | 💬 Chat: pending"
+                
+                JOB_MANAGER._set(
+                    job, 
+                    progress=frac * 0.9, 
+                    message=f"{msg}{chat_info}",
+                    result={
+                        "video_status": "downloading",
+                        "video_progress": frac,
+                        "chat_status": current_chat_status["status"],
+                        "chat_message": current_chat_status.get("message", ""),
+                    }
+                )
+
+            def download_video():
+                nonlocal video_result
+                video_result = download_url(url, request=request, on_progress=on_video_progress)
+                return video_result
+
+            def download_chat():
+                nonlocal chat_result, chat_error, current_chat_status
+                # Only download chat for Twitch VODs
+                if "twitch.tv/videos/" not in url.lower():
+                    chat_result = {"status": "skipped", "message": "Not a Twitch VOD"}
+                    current_chat_status = chat_result
+                    return chat_result
+                
+                try:
+                    from ..chat.downloader import download_chat as dl_chat, find_twitch_downloader_cli
+                    
+                    cli_path = find_twitch_downloader_cli()
+                    if not cli_path:
+                        chat_result = {"status": "skipped", "message": "TwitchDownloaderCLI not found"}
+                        current_chat_status = chat_result
+                        return chat_result
+                    
+                    # Extract video ID from URL
+                    import re
+                    match = re.search(r'twitch\.tv/videos/(\d+)', url)
+                    if not match:
+                        chat_result = {"status": "skipped", "message": "Could not extract video ID"}
+                        current_chat_status = chat_result
+                        return chat_result
+                    
+                    video_id = match.group(1)
+                    
+                    # Download to temp location first, will move to project later
+                    from ..ingest.ytdlp_runner import _default_downloads_dir
+                    chat_temp_path = _default_downloads_dir() / f"chat_{video_id}.json"
+                    
+                    # Update status to downloading
+                    current_chat_status["status"] = "downloading"
+                    current_chat_status["message"] = "Downloading Twitch chat..."
+                    
+                    dl_chat(url, chat_temp_path)
+                    
+                    chat_result = {
+                        "status": "success",
+                        "message": "Chat downloaded",
+                        "temp_path": str(chat_temp_path),
+                        "video_id": video_id,
+                    }
+                    current_chat_status["status"] = "success"
+                    current_chat_status["message"] = "Chat downloaded"
+                    return chat_result
+                    
+                except Exception as e:
+                    chat_error = str(e)
+                    chat_result = {"status": "failed", "message": str(e)}
+                    current_chat_status["status"] = "failed"
+                    current_chat_status["message"] = str(e)
+                    return chat_result
 
             try:
-                result = download_url(url, request=request, on_progress=on_progress)
+                # Run video and chat downloads in parallel
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    video_future = executor.submit(download_video)
+                    chat_future = executor.submit(download_chat)
+                    
+                    # Wait for both to complete
+                    video_future.result()  # This will raise if video download failed
+                    chat_future.result()   # Chat failures are non-fatal
 
-                result_dict = result.to_dict()
+                result_dict = video_result.to_dict()
+                result_dict["chat"] = chat_result
 
                 # Auto-open the project if requested
                 if auto_open:
                     # Use preview if available, otherwise original
-                    video_to_open = result.preview_path or result.video_path
+                    video_to_open = video_result.preview_path or video_result.video_path
                     proj = ctx.open_project(video_to_open)
+                    
+                    # Store the source URL for chat download later
+                    from ..project import set_source_url
+                    set_source_url(proj, url)
+                    
+                    # If chat was downloaded, import it into the project
+                    if chat_result.get("status") == "success" and chat_result.get("temp_path"):
+                        JOB_MANAGER._set(job, progress=0.95, message="Importing chat into project...")
+                        try:
+                            from ..chat.downloader import import_chat_to_project
+                            import_chat_to_project(proj, Path(chat_result["temp_path"]))
+                            chat_result["imported"] = True
+                        except Exception as e:
+                            chat_result["import_error"] = str(e)
+                    
                     result_dict["project"] = get_project_data(proj)
                     result_dict["auto_opened"] = True
+                    result_dict["chat"] = chat_result
 
+                # Build final message
+                final_msg = "Download complete!"
+                if chat_result.get("imported"):
+                    final_msg = "Download complete! Chat imported."
+                elif chat_result.get("import_error"):
+                    final_msg = f"Download complete. Chat import failed: {chat_result.get('import_error')}"
+                elif chat_result.get("status") == "failed":
+                    final_msg = f"Download complete. Chat download failed: {chat_result.get('message', 'unknown')}"
+                elif chat_result.get("status") == "skipped":
+                    final_msg = f"Download complete. {chat_result.get('message', 'Chat skipped.')}"
+                
                 JOB_MANAGER._set(
                     job,
                     status="succeeded",
                     progress=1.0,
-                    message="Download complete!",
+                    message=final_msg,
                     result=result_dict,
                 )
 
@@ -449,6 +697,7 @@ def create_app(
         motion_cfg = {**analysis_cfg.get("motion", {}), **(body.get("motion") or {})}
         scenes_cfg = {**analysis_cfg.get("scenes", {}), **(body.get("scenes") or {})}
         highlights_cfg = {**analysis_cfg.get("highlights", {}), **(body.get("highlights") or {})}
+        audio_events_cfg = {**analysis_cfg.get("audio_events", {}), **(body.get("audio_events") or {})}
 
         job = JOB_MANAGER.create("analyze_highlights")
 
@@ -465,7 +714,9 @@ def create_app(
                     motion_cfg=motion_cfg,
                     scenes_cfg=scenes_cfg,
                     highlights_cfg=highlights_cfg,
+                    audio_events_cfg=audio_events_cfg,
                     include_chat=True,
+                    include_audio_events=bool(audio_events_cfg.get("enabled", True)),
                     on_progress=on_prog,
                 )
                 JOB_MANAGER._set(job, status="succeeded", progress=1.0, message="done", result=result)  # type: ignore[attr-defined]
@@ -474,6 +725,41 @@ def create_app(
 
         import threading
 
+        threading.Thread(target=runner, daemon=True).start()
+        return JSONResponse({"job_id": job.id})
+
+    @app.post("/api/analyze/audio_events")
+    def api_analyze_audio_events(body: Dict[str, Any] = Body(default={})):  # type: ignore[valid-type]
+        """Run audio event detection (laughter/cheer/shout).
+        
+        This runs a lightweight audio event classifier to detect semantic
+        audio events like laughter, cheering, applause, screaming, etc.
+        
+        The results can be used in highlight scoring as a first-class signal.
+        """
+        proj = ctx.require_project()
+        analysis_cfg = ctx.profile.get("analysis", {})
+        body = body or {}
+
+        # Get configuration from profile, allow overrides from body
+        events_cfg_dict = {**analysis_cfg.get("audio_events", {}), **(body or {})}
+
+        job = JOB_MANAGER.create("analyze_audio_events")
+
+        def runner() -> None:
+            JOB_MANAGER._set(job, status="running", progress=0.0, message="Detecting audio events...")
+
+            def on_prog(frac: float) -> None:
+                JOB_MANAGER._set(job, progress=frac, message="Detecting audio events...")
+
+            try:
+                cfg = AudioEventsConfig.from_dict(events_cfg_dict)
+                result = compute_audio_events_analysis(proj, cfg=cfg, on_progress=on_prog)
+                JOB_MANAGER._set(job, status="succeeded", progress=1.0, message="done", result=result)
+            except Exception as e:
+                JOB_MANAGER._set(job, status="failed", message=f"{type(e).__name__}: {e}")
+
+        import threading
         threading.Thread(target=runner, daemon=True).start()
         return JSONResponse({"job_id": job.id})
 
@@ -600,6 +886,542 @@ def create_app(
         threading.Thread(target=runner, daemon=True).start()
         return JSONResponse({"job_id": job.id})
 
+    @app.post("/api/analyze/context_titles")
+    def api_analyze_context_titles(body: Dict[str, Any] = Body(default={})):  # type: ignore[valid-type]
+        """Run context-aware clip shaping + AI Director pipeline.
+        
+        This runs:
+        1. Silence detection (if not cached)
+        2. Sentence boundary extraction (if not cached)
+        3. Chat boundary detection (if chat available, not cached)
+        4. Unified boundary graph
+        5. Clip variant generation
+        6. AI Director for variant selection + metadata
+        """
+        proj = ctx.require_project()
+        analysis_cfg = ctx.profile.get("analysis", {})
+        context_cfg = ctx.profile.get("context", {})
+        ai_cfg = ctx.profile.get("ai", {}).get("director", {})
+        body = body or {}
+
+        # Merge body overrides
+        context_cfg = {**context_cfg, **(body.get("context") or {})}
+        ai_cfg = {**ai_cfg, **(body.get("ai") or {})}
+
+        job = JOB_MANAGER.create("analyze_context_titles")
+
+        def runner() -> None:
+            import threading as _threading
+            JOB_MANAGER._set(job, status="running", progress=0.0, message="Starting context analysis...")
+
+            try:
+                # Step 1: Silence detection
+                silence_path = proj.analysis_dir / "silence.json"
+                if not silence_path.exists():
+                    JOB_MANAGER._set(job, progress=0.05, message="Detecting silence intervals...")
+                    silence_cfg = SilenceConfig(
+                        noise_db=float(context_cfg.get("silence_noise_db", -30.0)),
+                        min_duration=float(context_cfg.get("silence_min_duration", 0.3)),
+                    )
+                    compute_silence_analysis(proj, cfg=silence_cfg)
+
+                # Step 2: Sentence boundaries (requires transcript)
+                sentences_path = proj.analysis_dir / "sentences.json"
+                if proj.transcript_path.exists() and not sentences_path.exists():
+                    JOB_MANAGER._set(job, progress=0.15, message="Extracting sentence boundaries...")
+                    sentence_cfg = SentenceConfig(
+                        max_sentence_words=int(context_cfg.get("max_sentence_words", 30)),
+                    )
+                    compute_sentences_analysis(proj, cfg=sentence_cfg)
+
+                # Step 3: Chat boundaries (if chat available)
+                chat_boundaries_path = proj.analysis_dir / "chat_boundaries.json"
+                if proj.chat_features_path.exists() and not chat_boundaries_path.exists():
+                    JOB_MANAGER._set(job, progress=0.25, message="Detecting chat valleys/bursts...")
+                    chat_boundary_cfg = ChatBoundaryConfig(
+                        valley_window_s=float(context_cfg.get("boundaries", {}).get("chat_valley_window_s", 12.0)),
+                    )
+                    compute_chat_boundaries_analysis(proj, cfg=chat_boundary_cfg)
+
+                # Step 4: Unified boundaries
+                boundaries_path = proj.analysis_dir / "boundaries.json"
+                JOB_MANAGER._set(job, progress=0.35, message="Building boundary graph...")
+                boundary_prefs = context_cfg.get("boundaries", {})
+                boundary_cfg = BoundaryConfig(
+                    prefer_silence=bool(boundary_prefs.get("prefer_silence", True)),
+                    prefer_sentences=bool(boundary_prefs.get("prefer_sentences", True)),
+                    prefer_scene_cuts=bool(boundary_prefs.get("prefer_scene_cuts", True)),
+                    prefer_chat_valleys=bool(boundary_prefs.get("prefer_chat_valleys", True)),
+                )
+                compute_boundaries_analysis(proj, cfg=boundary_cfg)
+
+                # Step 5: Clip variants
+                JOB_MANAGER._set(job, progress=0.45, message="Generating clip variants...")
+                variants_cfg_dict = context_cfg.get("variants", {})
+                short_cfg = variants_cfg_dict.get("short", {})
+                medium_cfg = variants_cfg_dict.get("medium", {})
+                long_cfg = variants_cfg_dict.get("long", {})
+                
+                variant_cfg = VariantGeneratorConfig(
+                    short=VariantDurationConfig(
+                        min_s=float(short_cfg.get("min_s", 16)),
+                        max_s=float(short_cfg.get("max_s", 24)),
+                    ),
+                    medium=VariantDurationConfig(
+                        min_s=float(medium_cfg.get("min_s", 24)),
+                        max_s=float(medium_cfg.get("max_s", 40)),
+                    ),
+                    long=VariantDurationConfig(
+                        min_s=float(long_cfg.get("min_s", 40)),
+                        max_s=float(long_cfg.get("max_s", 75)),
+                    ),
+                    chat_valley_window_s=float(boundary_prefs.get("chat_valley_window_s", 12.0)),
+                )
+                
+                top_n = int(context_cfg.get("top_n", 25))
+                
+                def on_variant_progress(frac: float) -> None:
+                    JOB_MANAGER._set(job, progress=0.45 + 0.25 * frac, message="Generating clip variants...")
+                
+                compute_clip_variants(proj, cfg=variant_cfg, top_n=top_n, on_progress=on_variant_progress)
+
+                # Step 6: AI Director
+                JOB_MANAGER._set(job, progress=0.70, message="Running AI Director...")
+                director_cfg = DirectorConfig(
+                    enabled=bool(ai_cfg.get("enabled", True)),
+                    engine=str(ai_cfg.get("engine", "llama_cpp_server")),
+                    endpoint=str(ai_cfg.get("endpoint", "http://127.0.0.1:11435")),
+                    model_name=str(ai_cfg.get("model_name", "local-gguf-vulkan")),
+                    timeout_s=float(ai_cfg.get("timeout_s", 30)),
+                    max_tokens=int(ai_cfg.get("max_tokens", 256)),
+                    temperature=float(ai_cfg.get("temperature", 0.2)),
+                    platform=str(ai_cfg.get("platform", "shorts")),
+                    fallback_to_rules=bool(ai_cfg.get("fallback_to_rules", True)),
+                )
+                
+                def on_director_progress(frac: float) -> None:
+                    JOB_MANAGER._set(job, progress=0.70 + 0.25 * frac, message="Running AI Director...")
+                
+                result = compute_director_analysis(proj, cfg=director_cfg, top_n=top_n, on_progress=on_director_progress)
+
+                JOB_MANAGER._set(
+                    job,
+                    status="succeeded",
+                    progress=1.0,
+                    message="Context + Titles analysis complete!",
+                    result=result,
+                )
+
+            except Exception as e:
+                JOB_MANAGER._set(job, status="failed", message=f"{type(e).__name__}: {e}")
+
+        import threading
+        threading.Thread(target=runner, daemon=True).start()
+        return JSONResponse({"job_id": job.id})
+
+    @app.post("/api/analyze/full")
+    def api_analyze_full(body: Dict[str, Any] = Body(default={})):  # type: ignore[valid-type]
+        """Run the complete analysis DAG with parallel orchestration.
+        
+        This runs all analysis stages efficiently by parallelizing independent stages:
+        
+        Stage 1 (parallel):
+          - Audio energy analysis
+          - Motion/scenes analysis  
+          - Audio events detection (7.3)
+          - Whisper transcription (if enabled)
+          - Chat features (if chat available)
+        
+        Stage 2 (after Stage 1):
+          - Highlight scoring (combines all Stage 1 signals)
+        
+        Stage 3 (after highlights):
+          - Speech features + reaction audio
+          - Candidate reranking
+        
+        Stage 4 (after reranking, optional):
+          - Context/boundaries analysis
+          - Clip variants
+          - AI Director
+        
+        Progress is streamed via SSE job updates as each sub-stage completes.
+        """
+        import threading
+        import concurrent.futures
+
+        proj = ctx.require_project()
+        analysis_cfg = ctx.profile.get("analysis", {})
+        context_cfg = ctx.profile.get("context", {})
+        ai_cfg = ctx.profile.get("ai", {}).get("director", {})
+        body = body or {}
+
+        # Merge overrides
+        audio_cfg = {**analysis_cfg.get("audio", {}), **(body.get("audio") or {})}
+        motion_cfg = {**analysis_cfg.get("motion", {}), **(body.get("motion") or {})}
+        scenes_cfg = {**analysis_cfg.get("scenes", {}), **(body.get("scenes") or {})}
+        highlights_cfg = {**analysis_cfg.get("highlights", {}), **(body.get("highlights") or {})}
+        audio_events_cfg = {**analysis_cfg.get("audio_events", {}), **(body.get("audio_events") or {})}
+        speech_cfg = {**analysis_cfg.get("speech", {}), **(body.get("speech") or {})}
+        reaction_cfg = {**analysis_cfg.get("reaction_audio", {}), **(body.get("reaction_audio") or {})}
+        rerank_cfg_dict = {**analysis_cfg.get("rerank", {}), **(body.get("rerank") or {})}
+        context_cfg = {**context_cfg, **(body.get("context") or {})}
+        ai_cfg = {**ai_cfg, **(body.get("ai") or {})}
+
+        # Options
+        include_speech = bool(body.get("include_speech", True))
+        include_context = bool(body.get("include_context", True))
+        include_director = bool(body.get("include_director", True))
+
+        job = JOB_MANAGER.create("analyze_full")
+
+        def runner() -> None:
+            from ..analysis_motion import compute_motion_analysis
+            from ..analysis_scenes import compute_scene_analysis
+
+            JOB_MANAGER._set(job, status="running", progress=0.0, message="Starting parallel analysis DAG...")
+            
+            completed_stages = []
+            errors = []
+
+            # Stage 1: Run independent analyses in parallel
+            def run_audio():
+                if not proj.audio_features_path.exists():
+                    hop_s = float(audio_cfg.get("hop_seconds", 0.5))
+                    compute_audio_analysis(
+                        proj,
+                        sample_rate=int(audio_cfg.get("sample_rate", 16000)),
+                        hop_s=hop_s,
+                        smooth_s=float(audio_cfg.get("smooth_seconds", 3.0)),
+                        top=int(audio_cfg.get("top", 12)),
+                        min_gap_s=float(audio_cfg.get("min_gap_seconds", 20.0)),
+                        pre_s=float(audio_cfg.get("pre_seconds", 8.0)),
+                        post_s=float(audio_cfg.get("post_seconds", 22.0)),
+                        skip_start_s=float(audio_cfg.get("skip_start_seconds", 10.0)),
+                    )
+                return "audio"
+
+            def run_motion():
+                if not proj.motion_features_path.exists():
+                    compute_motion_analysis(
+                        proj,
+                        sample_fps=float(motion_cfg.get("sample_fps", 3.0)),
+                        scale_width=int(motion_cfg.get("scale_width", 160)),
+                        smooth_s=float(motion_cfg.get("smooth_seconds", 2.5)),
+                    )
+                return "motion"
+
+            def run_scenes():
+                if bool(scenes_cfg.get("enabled", True)) and not proj.scenes_path.exists():
+                    compute_scene_analysis(
+                        proj,
+                        threshold_z=float(scenes_cfg.get("threshold_z", 3.5)),
+                        min_scene_len_seconds=float(scenes_cfg.get("min_scene_len_seconds", 1.2)),
+                        snap_window_seconds=float(scenes_cfg.get("snap_window_seconds", 1.0)),
+                    )
+                return "scenes"
+
+            def run_audio_events():
+                if bool(audio_events_cfg.get("enabled", True)) and not proj.audio_events_features_path.exists():
+                    cfg = AudioEventsConfig.from_dict(audio_events_cfg)
+                    compute_audio_events_analysis(proj, cfg=cfg)
+                return "audio_events"
+
+            def run_transcript():
+                if include_speech and speech_cfg.get("enabled", True) and not proj.transcript_path.exists():
+                    transcript_config = TranscriptConfig(
+                        model_size=str(speech_cfg.get("model_size", "small")),
+                        language=speech_cfg.get("language"),
+                        device=str(speech_cfg.get("device", "cpu")),
+                        compute_type=str(speech_cfg.get("compute_type", "int8")),
+                        vad_filter=bool(speech_cfg.get("vad_filter", True)),
+                        word_timestamps=bool(speech_cfg.get("word_timestamps", True)),
+                    )
+                    compute_transcript_analysis(proj, cfg=transcript_config)
+                return "transcript"
+
+            def run_chat_features():
+                if proj.chat_features_path.exists():
+                    return "chat_features_cached"
+                chat_db_path = proj.analysis_dir / "chat.sqlite"
+                if chat_db_path.exists():
+                    from ..chat.features import compute_and_save_chat_features
+                    hop_s = float(audio_cfg.get("hop_seconds", 0.5))
+                    smooth_s = float(highlights_cfg.get("chat_smooth_seconds", 3.0))
+                    compute_and_save_chat_features(proj, hop_s=hop_s, smooth_s=smooth_s)
+                return "chat_features"
+
+            # Build stage 1 task list with display names
+            stage1_tasks = [
+                (run_audio, "run_audio", "audio"),
+                (run_motion, "run_motion", "motion"),
+                (run_scenes, "run_scenes", "scenes"),
+                (run_audio_events, "run_audio_events", "audio_events"),
+                (run_chat_features, "run_chat_features", "chat"),
+            ]
+            if include_speech:
+                stage1_tasks.append((run_transcript, "run_transcript", "transcript"))
+
+            total_tasks = len(stage1_tasks)
+            task_names = [t[2] for t in stage1_tasks]
+            pending_tasks = set(task_names)
+            
+            JOB_MANAGER._set(
+                job, 
+                progress=0.05, 
+                message=f"Stage 1: Starting {total_tasks} parallel tasks: {', '.join(task_names)}",
+                result={"stage": 1, "pending": list(pending_tasks), "completed": [], "failed": []}
+            )
+
+            # Run Stage 1 in parallel using ThreadPoolExecutor
+            stage1_completed = []
+            stage1_failed = []
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                futures = {executor.submit(task[0]): (task[1], task[2]) for task in stage1_tasks}
+                for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                    func_name, display_name = futures[future]
+                    try:
+                        result = future.result()
+                        completed_stages.append(result)
+                        stage1_completed.append(display_name)
+                        pending_tasks.discard(display_name)
+                        progress = 0.05 + 0.30 * ((i + 1) / total_tasks)
+                        JOB_MANAGER._set(
+                            job, 
+                            progress=progress, 
+                            message=f"Stage 1: ✓ {display_name} ({len(stage1_completed)}/{total_tasks})",
+                            result={
+                                "stage": 1, 
+                                "pending": list(pending_tasks), 
+                                "completed": stage1_completed,
+                                "failed": stage1_failed,
+                            }
+                        )
+                    except Exception as e:
+                        err_msg = f"{display_name}: {e}"
+                        errors.append(err_msg)
+                        stage1_failed.append(display_name)
+                        pending_tasks.discard(display_name)
+                        progress = 0.05 + 0.30 * ((i + 1) / total_tasks)
+                        JOB_MANAGER._set(
+                            job,
+                            progress=progress,
+                            message=f"Stage 1: ✗ {display_name} failed ({len(stage1_completed)}/{total_tasks} ok)",
+                            result={
+                                "stage": 1,
+                                "pending": list(pending_tasks),
+                                "completed": stage1_completed,
+                                "failed": stage1_failed,
+                            }
+                        )
+
+            # Stage 2: Combine signals into highlight scores
+            JOB_MANAGER._set(job, progress=0.35, message="Stage 2: Computing highlight scores...")
+            try:
+                compute_highlights_analysis(
+                    proj,
+                    audio_cfg=audio_cfg,
+                    motion_cfg=motion_cfg,
+                    scenes_cfg=scenes_cfg,
+                    highlights_cfg=highlights_cfg,
+                    audio_events_cfg=audio_events_cfg,
+                    include_chat=True,
+                    include_audio_events=bool(audio_events_cfg.get("enabled", True)),
+                )
+                completed_stages.append("highlights")
+            except Exception as e:
+                errors.append(f"highlights: {e}")
+
+            # Stage 3: Speech features + reranking (if speech enabled)
+            if include_speech and speech_cfg.get("enabled", True):
+                # Speech features
+                if proj.transcript_path.exists() and not proj.speech_features_path.exists():
+                    JOB_MANAGER._set(job, progress=0.45, message="Stage 3: Extracting speech features...")
+                    try:
+                        hook_cfg = rerank_cfg_dict.get("hook", {})
+                        phrases = hook_cfg.get("phrases", [])
+                        speech_feature_config = SpeechFeatureConfig(
+                            hop_seconds=float(speech_cfg.get("hop_seconds", 0.5)),
+                            reaction_phrases=phrases if phrases else None,
+                        )
+                        compute_speech_features(proj, cfg=speech_feature_config)
+                        completed_stages.append("speech_features")
+                    except Exception as e:
+                        errors.append(f"speech_features: {e}")
+
+                # Reaction audio
+                if reaction_cfg.get("enabled", True) and not proj.reaction_audio_features_path.exists():
+                    JOB_MANAGER._set(job, progress=0.55, message="Stage 3: Analyzing reaction audio...")
+                    try:
+                        reaction_audio_config = ReactionAudioConfig(
+                            sample_rate=int(reaction_cfg.get("sample_rate", 16000)),
+                            hop_seconds=float(reaction_cfg.get("hop_seconds", 0.5)),
+                            smooth_seconds=float(reaction_cfg.get("smooth_seconds", 1.5)),
+                        )
+                        compute_reaction_audio_features(proj, cfg=reaction_audio_config)
+                        completed_stages.append("reaction_audio")
+                    except Exception as e:
+                        errors.append(f"reaction_audio: {e}")
+
+                # Rerank
+                proj_data = get_project_data(proj)
+                has_candidates = bool(proj_data.get("analysis", {}).get("highlights", {}).get("candidates"))
+                if rerank_cfg_dict.get("enabled", True) and has_candidates:
+                    JOB_MANAGER._set(job, progress=0.65, message="Stage 3: Reranking candidates...")
+                    try:
+                        hook_cfg = rerank_cfg_dict.get("hook", {})
+                        quote_cfg = rerank_cfg_dict.get("quote", {})
+                        weights = rerank_cfg_dict.get("weights", {})
+                        rerank_config = RerankConfig(
+                            enabled=True,
+                            weights=weights if weights else None,
+                            hook_max_chars=int(hook_cfg.get("max_chars", 60)),
+                            hook_window_seconds=float(hook_cfg.get("window_seconds", 4.0)),
+                            quote_max_chars=int(quote_cfg.get("max_chars", 120)),
+                            reaction_phrases=hook_cfg.get("phrases", []),
+                        )
+                        compute_reranked_candidates(proj, cfg=rerank_config)
+                        completed_stages.append("rerank")
+                    except Exception as e:
+                        errors.append(f"rerank: {e}")
+
+            # Stage 4: Context + AI Director (optional)
+            if include_context:
+                JOB_MANAGER._set(job, progress=0.70, message="Stage 4: Computing context boundaries...")
+                try:
+                    # Silence detection
+                    silence_path = proj.analysis_dir / "silence.json"
+                    if not silence_path.exists():
+                        silence_cfg = SilenceConfig(
+                            noise_db=float(context_cfg.get("silence_noise_db", -30.0)),
+                            min_duration=float(context_cfg.get("silence_min_duration", 0.3)),
+                        )
+                        compute_silence_analysis(proj, cfg=silence_cfg)
+
+                    # Sentence boundaries
+                    sentences_path = proj.analysis_dir / "sentences.json"
+                    if proj.transcript_path.exists() and not sentences_path.exists():
+                        sentence_cfg = SentenceConfig(
+                            max_sentence_words=int(context_cfg.get("max_sentence_words", 30)),
+                        )
+                        compute_sentences_analysis(proj, cfg=sentence_cfg)
+
+                    # Chat boundaries
+                    chat_boundaries_path = proj.analysis_dir / "chat_boundaries.json"
+                    if proj.chat_features_path.exists() and not chat_boundaries_path.exists():
+                        chat_boundary_cfg = ChatBoundaryConfig(
+                            valley_window_s=float(context_cfg.get("boundaries", {}).get("chat_valley_window_s", 12.0)),
+                        )
+                        compute_chat_boundaries_analysis(proj, cfg=chat_boundary_cfg)
+
+                    # Unified boundaries
+                    boundary_prefs = context_cfg.get("boundaries", {})
+                    boundary_cfg = BoundaryConfig(
+                        prefer_silence=bool(boundary_prefs.get("prefer_silence", True)),
+                        prefer_sentences=bool(boundary_prefs.get("prefer_sentences", True)),
+                        prefer_scene_cuts=bool(boundary_prefs.get("prefer_scene_cuts", True)),
+                        prefer_chat_valleys=bool(boundary_prefs.get("prefer_chat_valleys", True)),
+                    )
+                    compute_boundaries_analysis(proj, cfg=boundary_cfg)
+                    completed_stages.append("boundaries")
+
+                    # Clip variants
+                    JOB_MANAGER._set(job, progress=0.80, message="Stage 4: Generating clip variants...")
+                    variants_cfg_dict = context_cfg.get("variants", {})
+                    short_cfg = variants_cfg_dict.get("short", {})
+                    medium_cfg = variants_cfg_dict.get("medium", {})
+                    long_cfg = variants_cfg_dict.get("long", {})
+                    variant_cfg = VariantGeneratorConfig(
+                        short=VariantDurationConfig(
+                            min_s=float(short_cfg.get("min_s", 16)),
+                            max_s=float(short_cfg.get("max_s", 24)),
+                        ),
+                        medium=VariantDurationConfig(
+                            min_s=float(medium_cfg.get("min_s", 24)),
+                            max_s=float(medium_cfg.get("max_s", 40)),
+                        ),
+                        long=VariantDurationConfig(
+                            min_s=float(long_cfg.get("min_s", 40)),
+                            max_s=float(long_cfg.get("max_s", 75)),
+                        ),
+                        chat_valley_window_s=float(boundary_prefs.get("chat_valley_window_s", 12.0)),
+                    )
+                    top_n = int(context_cfg.get("top_n", 25))
+                    compute_clip_variants(proj, cfg=variant_cfg, top_n=top_n)
+                    completed_stages.append("clip_variants")
+
+                except Exception as e:
+                    errors.append(f"context: {e}")
+
+            # AI Director (if enabled)
+            if include_director and ai_cfg.get("enabled", True):
+                JOB_MANAGER._set(job, progress=0.90, message="Stage 4: Running AI Director...")
+                try:
+                    director_cfg = DirectorConfig(
+                        enabled=True,
+                        engine=str(ai_cfg.get("engine", "llama_cpp_server")),
+                        endpoint=str(ai_cfg.get("endpoint", "http://127.0.0.1:11435")),
+                        model_name=str(ai_cfg.get("model_name", "local-gguf-vulkan")),
+                        timeout_s=float(ai_cfg.get("timeout_s", 30)),
+                        max_tokens=int(ai_cfg.get("max_tokens", 256)),
+                        temperature=float(ai_cfg.get("temperature", 0.2)),
+                        platform=str(ai_cfg.get("platform", "shorts")),
+                        fallback_to_rules=bool(ai_cfg.get("fallback_to_rules", True)),
+                    )
+                    top_n = int(context_cfg.get("top_n", 25))
+                    compute_director_analysis(proj, cfg=director_cfg, top_n=top_n)
+                    completed_stages.append("director")
+                except Exception as e:
+                    errors.append(f"director: {e}")
+
+            # Final result
+            final_proj_data = get_project_data(proj)
+            result = {
+                "completed_stages": completed_stages,
+                "errors": errors,
+                "candidates_count": len(final_proj_data.get("analysis", {}).get("highlights", {}).get("candidates", [])),
+                "signals_used": final_proj_data.get("analysis", {}).get("highlights", {}).get("signals_used", {}),
+            }
+
+            if errors:
+                JOB_MANAGER._set(
+                    job,
+                    status="succeeded",  # Partial success
+                    progress=1.0,
+                    message=f"Analysis complete with {len(errors)} errors",
+                    result=result,
+                )
+            else:
+                JOB_MANAGER._set(
+                    job,
+                    status="succeeded",
+                    progress=1.0,
+                    message="Full analysis complete!",
+                    result=result,
+                )
+
+        threading.Thread(target=runner, daemon=True).start()
+        return JSONResponse({"job_id": job.id})
+
+    @app.get("/api/clip_variants/{rank}")
+    def api_get_clip_variants(rank: int) -> JSONResponse:
+        """Get clip variants for a specific candidate by rank."""
+        proj = ctx.require_project()
+        variants = load_clip_variants(proj)
+        if not variants:
+            return JSONResponse({"ok": False, "reason": "no_variants"}, status_code=404)
+
+        for cv in variants:
+            if cv.candidate_rank == rank:
+                return JSONResponse({
+                    "ok": True,
+                    "candidate_rank": cv.candidate_rank,
+                    "candidate_peak_time_s": cv.candidate_peak_time_s,
+                    "variants": [v.to_dict() for v in cv.variants],
+                })
+
+        return JSONResponse({"ok": False, "reason": "candidate_not_found"}, status_code=404)
+
     @app.get("/api/speech/timeline")
     def api_speech_timeline(max_points: int = 2000) -> JSONResponse:
         """Get speech feature timeline for visualization."""
@@ -664,6 +1486,141 @@ def create_app(
             "hop_seconds": hop_s,
             "indices": idx.tolist(),
             "reaction_score": down.tolist(),
+        })
+
+    @app.get("/api/audio_events/timeline")
+    def api_audio_events_timeline(max_points: int = 2000) -> JSONResponse:
+        """Get audio events timeline for visualization.
+        
+        Returns the combined event score (laughter + cheering + etc.) z-scored,
+        plus individual event curves if requested.
+        """
+        proj = ctx.require_project()
+        if not proj.audio_events_features_path.exists():
+            return JSONResponse({"ok": False, "reason": "no_audio_events_analysis"}, status_code=404)
+
+        data = load_npz(proj.audio_events_features_path)
+        event_combo_z = data.get("event_combo_z")
+        if event_combo_z is None:
+            return JSONResponse({"ok": False, "reason": "missing_scores"}, status_code=404)
+
+        event_combo_z = event_combo_z.astype(float)
+        n = len(event_combo_z)
+        if n <= 0:
+            return JSONResponse({"ok": False, "reason": "empty"}, status_code=404)
+
+        step = max(1, int(n / max(1, int(max_points))))
+        idx = np.arange(0, n, step)
+        combo_down = event_combo_z[idx]
+        if not np.isfinite(combo_down).all():
+            combo_down = np.where(np.isfinite(combo_down), combo_down, 0.0)
+
+        # Also downsample individual event z-scores
+        laughter_z = data.get("laughter_z")
+        cheering_z = data.get("cheering_z")
+        screaming_z = data.get("screaming_z")
+
+        result = {
+            "ok": True,
+            "hop_seconds": float(data.get("hop_seconds", [0.5])[0]),
+            "indices": idx.tolist(),
+            "event_combo_z": combo_down.tolist(),
+        }
+
+        if laughter_z is not None:
+            laughter_down = laughter_z.astype(float)[idx]
+            laughter_down = np.where(np.isfinite(laughter_down), laughter_down, 0.0)
+            result["laughter_z"] = laughter_down.tolist()
+
+        if cheering_z is not None:
+            cheering_down = cheering_z.astype(float)[idx]
+            cheering_down = np.where(np.isfinite(cheering_down), cheering_down, 0.0)
+            result["cheering_z"] = cheering_down.tolist()
+
+        if screaming_z is not None:
+            screaming_down = screaming_z.astype(float)[idx]
+            screaming_down = np.where(np.isfinite(screaming_down), screaming_down, 0.0)
+            result["screaming_z"] = screaming_down.tolist()
+
+        return JSONResponse(result)
+
+    @app.get("/api/audio_events/status")
+    def api_audio_events_status() -> JSONResponse:
+        """Get audio events analysis status including backend availability.
+        
+        Returns comprehensive status:
+        - backend_selected: Which backend was used (tensorflow/onnx/heuristic)
+        - available_backends: List of backends that could be used
+        - unavailable_backends: Dict of unavailable backends with reasons
+        - model_loaded: Whether an ML model is active
+        - notes: Human-readable status message
+        """
+        proj = ctx.require_project()
+        proj_data = get_project_data(proj)
+
+        audio_events_analysis = proj_data.get("analysis", {}).get("audio_events", {})
+        features_available = proj.audio_events_features_path.exists()
+        
+        # Check available backends
+        from ..analysis_audio_events import _try_load_yamnet, _try_load_yamnet_onnx, _try_load_onnx_directml
+        
+        available_backends = []
+        unavailable_backends = {}
+        
+        # Check TF Hub
+        _, tf_err = _try_load_yamnet()
+        if tf_err is None:
+            available_backends.append("tensorflow")
+        else:
+            unavailable_backends["tensorflow"] = tf_err
+        
+        # Check ONNX DirectML (preferred on Windows)
+        _, dml_err = _try_load_onnx_directml()
+        if dml_err is None:
+            available_backends.append("onnx_directml")
+        else:
+            unavailable_backends["onnx_directml"] = dml_err
+        
+        # Check ONNX CPU
+        _, onnx_err = _try_load_yamnet_onnx()
+        if onnx_err is None:
+            available_backends.append("onnx_cpu")
+        else:
+            unavailable_backends["onnx_cpu"] = onnx_err
+        
+        # Heuristic is always available
+        available_backends.append("heuristic")
+        
+        # Determine notes based on status
+        backend_used = audio_events_analysis.get("backend", "unknown") if features_available else None
+        ml_available = audio_events_analysis.get("ml_available", False) if features_available else False
+        
+        if backend_used == "onnx_directml":
+            notes = "Using GPU via DirectML (optimal)"
+        elif backend_used == "tensorflow":
+            notes = "Using TensorFlow Hub YAMNet"
+        elif backend_used == "onnx_cpu":
+            notes = "Using ONNX CPU (consider DirectML for GPU)"
+        elif backend_used == "heuristic":
+            if "onnx_directml" in available_backends or "onnx_cpu" in available_backends:
+                notes = "Using acoustic heuristics (ML models available but not used)"
+            else:
+                notes = "Using acoustic heuristics (no ML model installed)"
+        elif not features_available:
+            notes = "Audio events not yet analyzed"
+        else:
+            notes = "Unknown backend"
+
+        return JSONResponse({
+            "features_available": features_available,
+            "backend_selected": backend_used,
+            "available_backends": available_backends,
+            "unavailable_backends": unavailable_backends,
+            "model_loaded": ml_available,
+            "notes": notes,
+            "peaks": audio_events_analysis.get("peaks", {}) if features_available else {},
+            "config": audio_events_analysis.get("config", {}) if features_available else {},
+            "generated_at": audio_events_analysis.get("generated_at") if features_available else None,
         })
 
     # -------------------------------------------------------------------------
@@ -1096,15 +2053,21 @@ def create_app(
         hook_cfg = {**ctx.profile.get("overlay", {}).get("hook_text", {}), **(body.get("hook_text") or {})}
         pip_cfg = {**ctx.profile.get("layout", {}).get("pip", {}), **(body.get("pip") or {})}
 
-        # Auto-fill hook text from candidate if enabled and text is blank
+        # Auto-fill hook text from AI director or candidate if enabled and text is blank
         if hook_cfg.get("enabled") and not hook_cfg.get("text"):
-            # Try to find the candidate for this selection and use its hook_text
+            # First try AI director results
+            director_results = proj_data.get("analysis", {}).get("director", {}).get("results", [])
             candidate_rank = selection.get("candidate_rank")
             if candidate_rank is not None:
-                candidates = proj_data.get("analysis", {}).get("highlights", {}).get("candidates", [])
-                matching_cand = next((c for c in candidates if c.get("rank") == candidate_rank), None)
-                if matching_cand and matching_cand.get("hook_text"):
-                    hook_cfg = {**hook_cfg, "text": matching_cand.get("hook_text")}
+                ai_result = next((r for r in director_results if r.get("candidate_rank") == candidate_rank), None)
+                if ai_result and ai_result.get("hook"):
+                    hook_cfg = {**hook_cfg, "text": ai_result.get("hook")}
+                else:
+                    # Fallback to candidate hook_text
+                    candidates = proj_data.get("analysis", {}).get("highlights", {}).get("candidates", [])
+                    matching_cand = next((c for c in candidates if c.get("rank") == candidate_rank), None)
+                    if matching_cand and matching_cand.get("hook_text"):
+                        hook_cfg = {**hook_cfg, "text": matching_cand.get("hook_text")}
 
         with_captions = bool(body.get("with_captions", cap_cfg.get("enabled", False)))
 
@@ -1166,6 +2129,9 @@ def create_app(
         if not selections:
             raise HTTPException(status_code=404, detail="no_selections")
 
+        # Load AI director results for hook text lookups
+        director_results = proj_data.get("director_results", [])
+
         job = JOB_MANAGER.start_export_batch(
             proj=proj,
             selections=selections,
@@ -1181,6 +2147,7 @@ def create_app(
             whisper_cfg=whisper_cfg,
             hook_cfg=hook_cfg,
             pip_cfg=pip_cfg,
+            director_results=director_results,
         )
 
         return JSONResponse({"job_id": job.id})
