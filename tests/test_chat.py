@@ -345,6 +345,40 @@ class TestChatFeatures:
 
         store.close()
 
+    def test_laughter_feature_detects_lol_and_ranks_it(self, tmp_path: Path):
+        """Test that laughter detection works and boosts composite score."""
+        db_path = tmp_path / "chat.sqlite"
+        store = ChatStore(db_path)
+        store.initialize()
+
+        messages = []
+
+        # Two identical bursts: same count + unique authors
+        # One is neutral, one is laughter.
+        for i in range(10):
+            messages.append(ChatMessage(t_ms=3000 + i * 10, author=f"a{i}", text="hello"))
+        for i in range(10):
+            messages.append(ChatMessage(t_ms=6000 + i * 10, author=f"b{i}", text="LOL KEKW 😂"))
+
+        # A little baseline noise
+        messages.append(ChatMessage(t_ms=1000, author="x", text="normal"))
+
+        store.insert_messages(messages)
+
+        features = compute_chat_features(store, duration_s=10.0, hop_s=1.0, smooth_s=1.0)
+
+        # Bin 6 should have laugh counts
+        assert features["laugh_counts"][6] > 0
+
+        # The peak of scores_laugh should be around 6s
+        peak_idx = int(np.argmax(features["scores_laugh"]))
+        assert peak_idx == 6
+
+        # Composite score should prefer the laughter burst
+        assert features["scores"][6] > features["scores"][3]
+
+        store.close()
+
 
 # ---------------------------------------------------------------------------
 # Integration Tests
@@ -435,6 +469,50 @@ class TestEdgeCases:
 
         assert len(messages) == 1
         assert messages[0].t_ms == 0
+
+    def test_normalize_twitch_fragments_only(self):
+        """Test Twitch format with fragments but no body text."""
+        data = [
+            {
+                "content_offset_seconds": 10.5,
+                "commenter": {"display_name": "viewer1", "_id": "1001"},
+                "message": {
+                    "fragments": [
+                        {"text": "Hello "},
+                        {"text": "world!", "emoticon": {"emoticon_id": "123"}}
+                    ]
+                }
+            }
+        ]
+        
+        messages = normalize_chat_messages(data)
+        
+        assert len(messages) == 1
+        assert messages[0].text == "Hello world!"
+        assert messages[0].author == "viewer1"
+        assert messages[0].emote_count == 1
+
+    def test_load_and_normalize_jsonl(self, tmp_path: Path):
+        """Test loading JSONL (newline-delimited JSON) format."""
+        from videopipeline.chat.normalize import load_chat_data
+        
+        jsonl_file = tmp_path / "chat.json"
+        lines = [
+            '{"time_in_seconds": 1.0, "message": "First", "author": {"name": "a"}}',
+            '{"time_in_seconds": 2.0, "message": "Second", "author": {"name": "b"}}',
+            '{"time_in_seconds": 3.0, "message": "Third", "author": {"name": "c"}}',
+        ]
+        jsonl_file.write_text("\n".join(lines))
+        
+        data = load_chat_data(jsonl_file)
+        
+        assert isinstance(data, list)
+        assert len(data) == 3
+        
+        messages = normalize_chat_messages(data)
+        assert len(messages) == 3
+        assert messages[0].text == "First"
+        assert messages[2].text == "Third"
 
     def test_large_batch_insert(self, tmp_path: Path):
         """Test inserting large batches of messages."""

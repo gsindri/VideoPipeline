@@ -35,12 +35,41 @@ analysis:
       max_post_seconds: 28
   speech:
     enabled: true
-    model_size: small
-    language: null
-    device: cpu
-    compute_type: int8
+    # Backend selection:
+    #   - auto: prefers whisper.cpp, falls back to faster-whisper
+    #   - whispercpp: fast CPU (uses all cores), GPU with Vulkan build
+    #   - faster_whisper: CUDA GPU support, good CPU with VAD
+    backend: auto
+    
+    # Strict mode: if true, don't fall back to other backends
+    # Useful for A/B testing performance between backends
+    strict: false
+    
+    # Model selection - use .en variants for English-only content (faster):
+    #   Standard: tiny, base, small, medium, large, large-v2, large-v3
+    #   English:  tiny.en, base.en, small.en, medium.en
+    #   Quantized (whisper.cpp, faster): small.en-q8_0, small-q5_1, tiny-q8_0
+    model_size: small.en  # small.en is ~2x faster than small with same quality for English
+    
+    language: en  # Set explicitly for faster processing (null = auto-detect)
+    device: cpu  # cpu or cuda (faster-whisper only)
+    compute_type: int8  # int8 (CPU), float16 (GPU)
+    use_gpu: false  # Request GPU acceleration if available
+    
+    # Performance tuning:
+    threads: 0  # 0 = use all CPU cores (recommended)
+    n_processors: 1  # Parallel decoders for long files (whisper.cpp, try 2-4 for >30min)
+    
+    # VAD (Voice Activity Detection) - CRITICAL for speed:
+    #   - faster-whisper: uses built-in silero VAD
+    #   - whisper.cpp: uses silero-vad if torch is installed
+    #   - Can be 2-5x speedup on streams with silence/downtime
     vad_filter: true
+    
+    # Word timestamps: enables per-word timing for subtitles/captions
+    # Disable if you only need segment timing (faster, less overhead)
     word_timestamps: true
+    
     hop_seconds: 0.5
   reaction_audio:
     enabled: true
@@ -165,3 +194,10 @@ ai:
     temperature: 0.2
     platform: "shorts"
     fallback_to_rules: true
+    # Auto-start server config (saves VRAM when not in use)
+    server_path: "C:/llama.cpp/llama-server.exe"
+    model_path: "C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf"
+    auto_start: true
+    # Auto-stop server after idle (seconds). Frees VRAM for gaming.
+    # Set to null to disable auto-stop. Default: 600 (10 minutes)
+    auto_stop_idle_s: 600

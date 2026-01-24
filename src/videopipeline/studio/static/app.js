@@ -81,10 +81,131 @@ function showStudioView() {
 // HOME VIEW FUNCTIONS
 // =========================================================================
 
+// Track selected videos
+const selectedVideos = new Set();
+
+function updateVideoSelectionToolbar() {
+  const toolbar = $('#videoSelectionToolbar');
+  const countEl = $('#videoSelectionCount');
+  const btnDeleteProjects = $('#btnDeleteSelectedProjects');
+  
+  if (!toolbar) return;
+  
+  const count = selectedVideos.size;
+  if (count > 0) {
+    toolbar.style.display = 'flex';
+    countEl.textContent = `${count} selected`;
+    
+    // Check if any selected videos have projects
+    const hasProjects = Array.from(selectedVideos).some(path => {
+      const checkbox = document.querySelector(`.video-checkbox[data-path="${CSS.escape(path)}"]`);
+      return checkbox && checkbox.dataset.hasProject === 'true';
+    });
+    btnDeleteProjects.style.display = hasProjects ? 'inline-block' : 'none';
+  } else {
+    toolbar.style.display = 'none';
+  }
+}
+
+function setupVideoSelectionToolbar() {
+  const btnSelectAll = $('#btnSelectAll');
+  const btnDeselectAll = $('#btnDeselectAll');
+  const btnDeleteProjects = $('#btnDeleteSelectedProjects');
+  const btnDeleteVideos = $('#btnDeleteSelectedVideos');
+  
+  if (btnSelectAll) {
+    btnSelectAll.onclick = () => {
+      document.querySelectorAll('.video-checkbox').forEach(cb => {
+        cb.checked = true;
+        selectedVideos.add(cb.dataset.path);
+      });
+      updateVideoSelectionToolbar();
+    };
+  }
+  
+  if (btnDeselectAll) {
+    btnDeselectAll.onclick = () => {
+      document.querySelectorAll('.video-checkbox').forEach(cb => {
+        cb.checked = false;
+      });
+      selectedVideos.clear();
+      updateVideoSelectionToolbar();
+    };
+  }
+  
+  if (btnDeleteProjects) {
+    btnDeleteProjects.onclick = async () => {
+      const paths = Array.from(selectedVideos);
+      const projectPaths = paths.filter(path => {
+        const cb = document.querySelector(`.video-checkbox[data-path="${CSS.escape(path)}"]`);
+        return cb && cb.dataset.hasProject === 'true';
+      });
+      
+      if (projectPaths.length === 0) {
+        alert('No projects to delete.');
+        return;
+      }
+      
+      if (!confirm(`Delete ${projectPaths.length} project(s)?\n\nThis will remove analysis data, selections, and exports. The video files will NOT be deleted.`)) {
+        return;
+      }
+      
+      for (const path of projectPaths) {
+        const cb = document.querySelector(`.video-checkbox[data-path="${CSS.escape(path)}"]`);
+        if (cb && cb.dataset.projectId) {
+          try {
+            await apiJson('DELETE', `/api/home/project/${cb.dataset.projectId}`, null);
+          } catch (err) {
+            console.error(`Failed to delete project for ${path}:`, err);
+          }
+        }
+      }
+      selectedVideos.clear();
+      loadRecentVideos();
+    };
+  }
+  
+  if (btnDeleteVideos) {
+    btnDeleteVideos.onclick = async () => {
+      const paths = Array.from(selectedVideos);
+      if (paths.length === 0) {
+        alert('No videos selected.');
+        return;
+      }
+      
+      const hasProjects = paths.some(path => {
+        const cb = document.querySelector(`.video-checkbox[data-path="${CSS.escape(path)}"]`);
+        return cb && cb.dataset.hasProject === 'true';
+      });
+      
+      let msg = `Delete ${paths.length} video(s)?\n\nThis will permanently delete the video files.`;
+      if (hasProjects) {
+        msg += `\n\nAssociated projects (analysis data, selections, exports) will also be deleted.`;
+      }
+      
+      if (!confirm(msg)) return;
+      
+      for (const path of paths) {
+        try {
+          await apiJson('DELETE', '/api/home/video', { video_path: path, delete_project: true });
+        } catch (err) {
+          console.error(`Failed to delete video ${path}:`, err);
+        }
+      }
+      selectedVideos.clear();
+      loadRecentVideos();
+    };
+  }
+}
+
 async function loadRecentVideos() {
   const container = $('#recentVideos');
   if (!container) return;
   container.innerHTML = '<div class="small">Loading...</div>';
+  
+  // Clear selection when reloading
+  selectedVideos.clear();
+  updateVideoSelectionToolbar();
 
   try {
     const res = await apiGet('/api/home/videos');
@@ -98,12 +219,15 @@ async function loadRecentVideos() {
     container.innerHTML = '';
     for (const v of videos) {
       const el = document.createElement('div');
-      el.className = 'item';
+      el.className = 'item' + (v.favorite ? ' favorite' : '');
       const dur = fmtTime(v.duration_seconds || 0);
       const sizeMB = ((v.size_bytes || 0) / 1024 / 1024).toFixed(1);
       
       // Build status badges
       let badges = '';
+      if (v.favorite) {
+        badges += `<span class="badge badge-favorite">★ Favorite</span> `;
+      }
       if (v.has_project) {
         badges += `<span class="badge" style="background:#22c55e;color:#000">Project</span> `;
         if (v.selections_count > 0) badges += `<span class="badge">${v.selections_count} sel</span> `;
@@ -114,23 +238,57 @@ async function loadRecentVideos() {
       }
       
       el.innerHTML = `
-        <div class="title">${v.title || v.filename}</div>
-        <div class="meta">${dur} • ${sizeMB} MB ${badges}</div>
-        <div class="meta small" style="opacity:0.7;word-break:break-all">${v.path}</div>
-        <div class="actions" style="margin-top:8px;display:flex;gap:8px">
+        <div class="item-header">
+          <input type="checkbox" class="video-checkbox" data-path="${v.path.replace(/"/g, '&quot;')}" data-has-project="${v.has_project}" data-project-id="${v.project_id || ''}" style="margin-right:8px;cursor:pointer" />
+          <div class="title" style="flex:1">${v.title || v.filename}</div>
+          <button class="btn-favorite ${v.favorite ? 'active' : ''}" title="${v.favorite ? 'Remove from favorites' : 'Add to favorites'}" data-path="${v.path.replace(/"/g, '&quot;')}">
+            ${v.favorite ? '★' : '☆'}
+          </button>
+        </div>
+        <div class="meta" style="margin-left:24px">${dur} • ${sizeMB} MB ${badges}</div>
+        <div class="meta small" style="opacity:0.7;word-break:break-all;margin-left:24px">${v.path}</div>
+        <div class="actions" style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;margin-left:24px">
           <button class="primary btn-open">Open</button>
-          ${v.has_project ? `<button class="btn-delete" style="background:#ef4444" data-project-id="${v.project_id}">Delete Project</button>` : ''}
+          ${v.has_project ? `<button class="btn-delete-project" style="background:#ef4444" data-project-id="${v.project_id}">Delete Project</button>` : ''}
+          <button class="btn-delete-video" style="background:#dc2626" data-path="${v.path.replace(/"/g, '&quot;')}" data-has-project="${v.has_project}">Delete Video</button>
         </div>
       `;
+      
+      // Checkbox for multi-select
+      const checkbox = el.querySelector('.video-checkbox');
+      checkbox.onclick = (e) => {
+        e.stopPropagation();
+        if (checkbox.checked) {
+          selectedVideos.add(v.path);
+        } else {
+          selectedVideos.delete(v.path);
+        }
+        updateVideoSelectionToolbar();
+      };
       
       const btnOpen = el.querySelector('.btn-open');
       btnOpen.onclick = () => openProjectByPath(v.path);
       
-      const btnDelete = el.querySelector('.btn-delete');
-      if (btnDelete) {
-        btnDelete.onclick = async (e) => {
+      // Favorite button
+      const btnFavorite = el.querySelector('.btn-favorite');
+      if (btnFavorite) {
+        btnFavorite.onclick = async (e) => {
           e.stopPropagation();
-          const projectId = btnDelete.dataset.projectId;
+          try {
+            await apiJson('POST', '/api/home/favorite', { video_path: v.path });
+            loadRecentVideos(); // Refresh list
+          } catch (err) {
+            alert(`Failed to toggle favorite: ${err.message}`);
+          }
+        };
+      }
+      
+      // Delete project button
+      const btnDeleteProject = el.querySelector('.btn-delete-project');
+      if (btnDeleteProject) {
+        btnDeleteProject.onclick = async (e) => {
+          e.stopPropagation();
+          const projectId = btnDeleteProject.dataset.projectId;
           if (confirm(`Delete project for "${v.title || v.filename}"?\n\nThis will remove analysis data, selections, and exports. The video file will NOT be deleted.`)) {
             try {
               await apiJson('DELETE', `/api/home/project/${projectId}`, null);
@@ -142,8 +300,32 @@ async function loadRecentVideos() {
         };
       }
       
+      // Delete video button
+      const btnDeleteVideo = el.querySelector('.btn-delete-video');
+      if (btnDeleteVideo) {
+        btnDeleteVideo.onclick = async (e) => {
+          e.stopPropagation();
+          const hasProject = btnDeleteVideo.dataset.hasProject === 'true';
+          let msg = `Delete video "${v.title || v.filename}"?\n\nThis will permanently delete the video file.`;
+          if (hasProject) {
+            msg += `\n\nThe associated project (analysis data, selections, exports) will also be deleted.`;
+          }
+          if (confirm(msg)) {
+            try {
+              await apiJson('DELETE', '/api/home/video', { video_path: v.path, delete_project: true });
+              loadRecentVideos(); // Refresh list
+            } catch (err) {
+              alert(`Failed to delete video: ${err.message}`);
+            }
+          }
+        };
+      }
+      
       container.appendChild(el);
     }
+    
+    // Setup toolbar handlers after videos are loaded
+    setupVideoSelectionToolbar();
   } catch (e) {
     container.innerHTML = `<div class="small">Error loading videos: ${e.message}</div>`;
   }
@@ -397,11 +579,27 @@ function watchHomeJob(jobId) {
           showStudioView();
           initStudioView();
         }
+        
+        // Close event source when job is finished
+        if (j.status === 'succeeded' || j.status === 'failed' || j.status === 'cancelled') {
+          es.close();
+        }
       }
     } catch (e) {
       console.warn('bad job payload', e);
     }
   };
+}
+
+async function cancelJob(jobId) {
+  if (!confirm('Cancel this download? Any downloaded data will be removed.')) {
+    return;
+  }
+  try {
+    await apiJson('POST', `/api/jobs/${jobId}/cancel`, {});
+  } catch (e) {
+    alert(`Failed to cancel: ${e.message}`);
+  }
 }
 
 function renderHomeJobs() {
@@ -427,6 +625,7 @@ function renderHomeJobs() {
     if (job.status === 'running') statusClass = 'status-badge running';
     else if (job.status === 'succeeded') statusClass = 'status-badge succeeded';
     else if (job.status === 'failed') statusClass = 'status-badge failed';
+    else if (job.status === 'cancelled') statusClass = 'status-badge canceled';
     else statusClass = 'status-badge queued';
 
     let resultInfo = '';
@@ -453,8 +652,19 @@ function renderHomeJobs() {
     let chatStatusInfo = '';
     if (job.status === 'running' && job.result?.chat_status) {
       const cs = job.result.chat_status;
+      const chatMsg = job.result.chat_message || '';
+      const chatPct = job.result.chat_progress;
       if (cs === 'downloading') {
-        chatStatusInfo = `<div class="small" style="color:#6366f1;margin-top:2px">📥 Downloading chat...</div>`;
+        // Show detailed chat progress if available
+        let chatDetail = chatMsg || 'Downloading...';
+        if (chatPct !== undefined && chatPct > 0) {
+          const chatPctDisplay = Math.round(chatPct * 100);
+          chatStatusInfo = `<div class="small" style="color:#6366f1;margin-top:2px">📥 Chat: ${chatDetail}</div>`;
+        } else {
+          chatStatusInfo = `<div class="small" style="color:#6366f1;margin-top:2px">📥 Chat: ${chatDetail}</div>`;
+        }
+      } else if (cs === 'importing') {
+        chatStatusInfo = `<div class="small" style="color:#a855f7;margin-top:2px">⚙️ Importing chat: ${chatMsg || 'Processing...'}</div>`;
       } else if (cs === 'pending') {
         chatStatusInfo = `<div class="small" style="color:#888;margin-top:2px">○ Chat: pending</div>`;
       }
@@ -469,6 +679,7 @@ function renderHomeJobs() {
       <div class="title">
         <span class="${statusClass}">${job.status}</span>
         ${job.kind === 'download_url' ? 'URL Download' : job.kind}
+        ${job.status === 'running' ? `<button class="btn btn-small btn-danger" style="margin-left:auto;padding:2px 8px;font-size:11px" onclick="cancelJob('${job.id}')">Cancel</button>` : ''}
       </div>
       <div class="meta">${job.message || ''}</div>
       ${chatStatusInfo}
@@ -713,23 +924,108 @@ function renderJobs() {
     return;
   }
 
+  // Helper to format seconds nicely, or handle "cached" marker
+  const formatTime = (seconds) => {
+    if (seconds === "cached") return 'cached';
+    if (seconds == null) return '';
+    if (typeof seconds !== 'number') return String(seconds);
+    if (seconds < 60) return `${seconds.toFixed(1)}s`;
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}m ${secs.toFixed(0)}s`;
+  };
+  
+  // Helper to compute elapsed time from a timestamp
+  const getElapsed = (startedAt) => {
+    if (!startedAt) return null;
+    return (Date.now() / 1000) - startedAt;
+  };
+
   for (const job of Array.from(jobs.values()).sort((a,b) => (a.created_at < b.created_at ? 1 : -1))) {
     const el = document.createElement('div');
     el.className = 'item';
     const pct = Math.round((job.progress || 0) * 100);
     
+    // Build elapsed time display (total time)
+    let totalTimeHtml = '';
+    if (job.elapsed_seconds != null) {
+      totalTimeHtml = `<span style="color:#4f8cff;font-weight:600">${formatTime(job.elapsed_seconds)}</span>`;
+    }
+    
     // Build detailed status for analyze_full jobs
     let detailHtml = '';
     if (job.kind === 'analyze_full' && job.result) {
       const r = job.result;
+      const stageTimes = r.stage_times || {};
+      const currentStage = r.current_stage || {};
+      
       if (r.stage === 1 && (r.pending || r.completed || r.failed)) {
-        // Stage 1 detailed view
-        const completedList = (r.completed || []).map(t => `<span style="color:#22c55e">✓${t}</span>`).join(' ');
-        const failedList = (r.failed || []).map(t => `<span style="color:#ef4444">✗${t}</span>`).join(' ');
-        const pendingList = (r.pending || []).map(t => `<span style="color:#888">◦${t}</span>`).join(' ');
-        detailHtml = `<div class="meta" style="margin-top:4px;font-size:11px">${completedList} ${failedList} ${pendingList}</div>`;
+        // Stage 1 detailed view - parallel tasks
+        const taskTimes = r.task_times || {};
+        const completed = r.completed || [];
+        const failed = r.failed || [];
+        const pending = r.pending || [];
+        
+        // In parallel stage 1, pending tasks are actually running in parallel
+        // So we show them as "running" not "pending"
+        const runningTasks = pending; // These are running in parallel
+        
+        // Build a clearer display
+        let tasksHtml = '<div style="margin-top:6px;font-size:11px;line-height:1.6">';
+        
+        // Completed tasks - distinguish cached from computed
+        for (const t of completed) {
+          const time = taskTimes[t];
+          const isCached = time === "cached";
+          if (isCached) {
+            tasksHtml += `<div style="color:#888">✓ ${t} <span style="font-style:italic">(cached)</span></div>`;
+          } else {
+            const timeStr = time != null ? formatTime(time) : '';
+            tasksHtml += `<div style="color:#22c55e">✓ ${t} <span style="color:#888">${timeStr}</span></div>`;
+          }
+        }
+        
+        // Failed tasks
+        for (const t of failed) {
+          const time = taskTimes[t] != null ? formatTime(taskTimes[t]) : '';
+          tasksHtml += `<div style="color:#ef4444">✗ ${t} <span style="color:#888">${time}</span></div>`;
+        }
+        
+        // Running tasks (pending in parallel mode means running)
+        const taskProgressInfo = r.task_progress || {};
+        for (const t of runningTasks) {
+          const taskStartedAt = r.task_start_times?.[t];
+          const elapsed = getElapsed(taskStartedAt);
+          const elapsedStr = elapsed != null ? formatTime(elapsed) : '';
+          
+          // Check if we have detailed progress for this task
+          const progress = taskProgressInfo[t];
+          let statusStr = '';
+          if (progress && progress.message) {
+            statusStr = progress.message;
+            if (elapsedStr) statusStr += ` (${elapsedStr})`;
+          } else {
+            statusStr = `running${elapsedStr ? ` ${elapsedStr}` : '...'}`;
+          }
+          
+          tasksHtml += `<div style="color:#fbbf24">▸ ${t} <span style="color:#888;font-style:italic">${statusStr}</span></div>`;
+          
+          // Show mini progress bar for tasks with progress
+          if (progress && progress.progress > 0 && progress.progress < 1) {
+            const pct = Math.round(progress.progress * 100);
+            tasksHtml += `<div style="margin-left:16px;margin-top:2px;margin-bottom:4px">
+              <div style="background:#333;border-radius:2px;height:4px;width:100%;max-width:200px">
+                <div style="background:#fbbf24;height:100%;width:${pct}%;border-radius:2px;transition:width 0.3s"></div>
+              </div>
+            </div>`;
+          }
+        }
+        
+        tasksHtml += '</div>';
+        detailHtml = tasksHtml;
+        
       } else if (r.completed_stages) {
-        // Final result
+        // Final result with stage timing
         const candidateCount = r.candidates_count || 0;
         const errorCount = (r.errors || []).length;
         detailHtml = `<div class="meta" style="margin-top:4px;font-size:11px">`;
@@ -737,20 +1033,136 @@ function renderJobs() {
         if (candidateCount > 0) detailHtml += ` | <strong>${candidateCount} candidates</strong>`;
         if (errorCount > 0) detailHtml += ` | <span style="color:#f59e0b">${errorCount} errors</span>`;
         detailHtml += `</div>`;
+        
+        // Add stage timing breakdown - separate cached from computed
+        if (Object.keys(stageTimes).length > 0) {
+          const computedParts = [];
+          const cachedStages = [];
+          for (const [stage, time] of Object.entries(stageTimes)) {
+            if (time === "cached") {
+              cachedStages.push(stage);
+            } else {
+              computedParts.push(`${stage}: ${formatTime(time)}`);
+            }
+          }
+          let timingHtml = '';
+          if (computedParts.length > 0) {
+            timingHtml += `<div class="meta" style="margin-top:2px;font-size:10px;color:#22c55e">⏱ ${computedParts.join(' | ')}</div>`;
+          }
+          if (cachedStages.length > 0) {
+            timingHtml += `<div class="meta" style="margin-top:2px;font-size:10px;color:#888">📦 Cached: ${cachedStages.join(', ')}</div>`;
+          }
+          detailHtml += timingHtml;
+        }
+        
         if (r.errors && r.errors.length > 0) {
           detailHtml += `<div class="meta" style="margin-top:2px;font-size:10px;color:#ef4444">${r.errors.join('<br/>')}</div>`;
         }
+      } else if (Object.keys(stageTimes).length > 0 || currentStage.name) {
+        // In-progress after Stage 1 - sequential stages
+        let tasksHtml = '<div style="margin-top:6px;font-size:11px;line-height:1.6">';
+        
+        // Show completed stages - distinguish cached from computed
+        for (const [stage, time] of Object.entries(stageTimes)) {
+          if (time === "cached") {
+            tasksHtml += `<div style="color:#888">✓ ${stage} <span style="font-style:italic">(cached)</span></div>`;
+          } else {
+            tasksHtml += `<div style="color:#22c55e">✓ ${stage} <span style="color:#888">${formatTime(time)}</span></div>`;
+          }
+        }
+        
+        // Show currently running stage with elapsed time and progress
+        if (currentStage.name) {
+          const elapsed = getElapsed(currentStage.started_at);
+          const elapsedStr = elapsed != null ? formatTime(elapsed) : '';
+          
+          // Check for detailed progress for this stage
+          const taskProgressInfo = r.task_progress || {};
+          const progress = taskProgressInfo[currentStage.name];
+          let statusStr = '';
+          if (progress && progress.message) {
+            statusStr = progress.message;
+            if (elapsedStr) statusStr += ` (${elapsedStr})`;
+          } else {
+            statusStr = `running${elapsedStr ? ` ${elapsedStr}` : '...'}`;
+          }
+          
+          tasksHtml += `<div style="color:#fbbf24">▸ ${currentStage.name} <span style="color:#888;font-style:italic">${statusStr}</span></div>`;
+          
+          // Show mini progress bar for stages with progress
+          if (progress && progress.progress > 0 && progress.progress < 1) {
+            const pct = Math.round(progress.progress * 100);
+            tasksHtml += `<div style="margin-left:16px;margin-top:2px;margin-bottom:4px">
+              <div style="background:#333;border-radius:2px;height:4px;width:100%;max-width:200px">
+                <div style="background:#fbbf24;height:100%;width:${pct}%;border-radius:2px;transition:width 0.3s"></div>
+              </div>
+            </div>`;
+          }
+        }
+        
+        tasksHtml += '</div>';
+        detailHtml = tasksHtml;
       }
     }
     
+    // Add cancel button for running jobs
+    const cancelBtnHtml = (job.status === 'running' || job.status === 'queued') 
+      ? `<button class="danger cancel-job-btn" style="padding:4px 12px;font-size:11px" data-job-id="${job.id}">Cancel</button>` 
+      : '';
+    
     el.innerHTML = `
       <div class="title">${job.kind} • <span class="badge">${job.status}</span></div>
-      <div class="meta">${job.message || ''}${job.result?.output ? `<br/>Output: ${job.result.output}` : ''}</div>
+      <div class="meta" style="display:flex;justify-content:space-between;align-items:center">
+        <span>${job.message || ''}</span>
+        ${totalTimeHtml ? `<span style="margin-left:8px">Total: ${totalTimeHtml}</span>` : ''}
+      </div>
+      ${job.result?.output ? `<div class="meta">Output: ${job.result.output}</div>` : ''}
       ${detailHtml}
       <div class="progress" style="margin-top:10px"><div style="width:${pct}%"></div></div>
-      <div class="meta" style="margin-top:6px">${pct}%</div>
+      <div class="meta" style="margin-top:6px;display:flex;justify-content:space-between;align-items:center">
+        <span>${pct}%</span>
+        ${cancelBtnHtml}
+      </div>
     `;
+    
+    // Add cancel button handler
+    const cancelBtn = el.querySelector('.cancel-job-btn');
+    if (cancelBtn) {
+      cancelBtn.onclick = async (e) => {
+        e.stopPropagation();
+        if (!confirm('Cancel this job?')) return;
+        try {
+          await apiJson('POST', `/api/jobs/${job.id}/cancel`, {});
+        } catch (err) {
+          alert(`Failed to cancel: ${err.message}`);
+        }
+      };
+    }
+    
     container.appendChild(el);
+  }
+}
+
+// Timer for live elapsed time updates on running jobs
+let jobsTimerInterval = null;
+
+function startJobsTimer() {
+  if (jobsTimerInterval) return; // Already running
+  jobsTimerInterval = setInterval(() => {
+    // Check if there are any running jobs
+    const hasRunning = Array.from(jobs.values()).some(j => j.status === 'running');
+    if (hasRunning) {
+      renderJobs();
+    } else {
+      stopJobsTimer();
+    }
+  }, 1000); // Update every second
+}
+
+function stopJobsTimer() {
+  if (jobsTimerInterval) {
+    clearInterval(jobsTimerInterval);
+    jobsTimerInterval = null;
   }
 }
 
@@ -763,6 +1175,12 @@ function watchJob(jobId) {
         const j = payload.job;
         jobs.set(j.id, j);
         renderJobs();
+        
+        // Start/stop timer based on job status
+        if (j.status === 'running') {
+          startJobsTimer();
+        }
+        
         if ((j.kind === 'analyze_audio' || j.kind === 'analyze_highlights' || j.kind === 'analyze_speech' || j.kind === 'analyze_context_titles' || j.kind === 'analyze_full') && j.status === 'succeeded') {
           // refresh project and timeline to show reranked candidates
           refreshProject();
@@ -979,7 +1397,17 @@ async function startAnalyzeAudioEventsJob() {
 
 async function startAnalyzeFullJob() {
   $('#analysisStatus').textContent = 'Starting full parallel analysis (DAG)...';
-  const res = await apiJson('POST', '/api/analyze/full', {});
+  const motionMode = $('#motionWeightMode')?.value || 'low';
+  const whisperBackend = $('#whisperBackend')?.value || 'auto';
+  const res = await apiJson('POST', '/api/analyze/full', {
+    highlights: {
+      motion_weight_mode: motionMode
+    },
+    speech: {
+      backend: whisperBackend,
+      strict: whisperBackend !== 'auto'  // Strict mode when explicitly choosing a backend
+    }
+  });
   const jobId = res.job_id;
   watchJob(jobId);
   $('#analysisStatus').textContent = `Full analysis running (job ${jobId.slice(0,8)})...`;
@@ -987,7 +1415,13 @@ async function startAnalyzeFullJob() {
 
 async function startAnalyzeSpeechJob() {
   $('#analysisStatus').textContent = 'Starting speech analysis (Whisper transcription)...';
-  const res = await apiJson('POST', '/api/analyze/speech', {});
+  const whisperBackend = $('#whisperBackend')?.value || 'auto';
+  const res = await apiJson('POST', '/api/analyze/speech', {
+    speech: {
+      backend: whisperBackend,
+      strict: whisperBackend !== 'auto'  // Strict mode when explicitly choosing a backend
+    }
+  });
   const jobId = res.job_id;
   watchJob(jobId);
   $('#analysisStatus').textContent = `Speech analysis running (job ${jobId.slice(0,8)})...`;
@@ -1113,6 +1547,27 @@ function wireUI() {
       await startAnalyzeContextJob();
     } catch (e) {
       alert(`Context analysis failed: ${e}`);
+    }
+  };
+
+  $('#btnResetAnalysis').onclick = async () => {
+    const keepChat = confirm('Keep chat data?\n\nClick OK to keep chat data, or Cancel to delete everything including chat.');
+    const keepTranscript = confirm('Keep transcript?\n\nClick OK to keep the transcript (Whisper output), or Cancel to delete it too.');
+    
+    if (!confirm(`Reset all analysis data?\n\nThis will delete:\n- Audio/motion/highlight analysis\n- Scene detection\n- Speech features\n- Audio events\n- Clip variants\n- AI director results\n${keepChat ? '(Keeping chat data)' : '- Chat data'}\n${keepTranscript ? '(Keeping transcript)' : '- Transcript'}\n\nSelections and exports will be preserved.`)) {
+      return;
+    }
+    
+    try {
+      const res = await apiJson('POST', '/api/project/reset_analysis', {
+        keep_chat: keepChat,
+        keep_transcript: keepTranscript,
+      });
+      alert(`Analysis reset complete!\n\nDeleted ${res.deleted_files.length} files.`);
+      refreshProject();
+      refreshTimeline();
+    } catch (e) {
+      alert(`Failed to reset analysis: ${e.message}`);
     }
   };
 
@@ -1941,6 +2396,37 @@ async function initStudioView() {
   wireUI();
   wireChatUI();
   updateFacecamStatus();
+  
+  // Update whisper backend dropdown with availability info
+  updateWhisperBackendOptions();
+}
+
+async function updateWhisperBackendOptions() {
+  try {
+    const info = await apiGet('/api/system/info');
+    const backends = info.transcription?.backends || {};
+    const select = $('#whisperBackend');
+    if (!select) return;
+    
+    // Update option labels with availability
+    for (const opt of select.options) {
+      if (opt.value === 'whispercpp') {
+        const available = backends.whispercpp;
+        const gpu = backends.whispercpp_gpu;
+        opt.textContent = `whisper.cpp${available ? (gpu ? ' (GPU)' : ' ✓') : ' ✗'}`;
+        opt.disabled = !available;
+      } else if (opt.value === 'faster_whisper') {
+        const available = backends.faster_whisper;
+        const gpu = backends.faster_whisper_gpu;
+        opt.textContent = `faster-whisper${available ? (gpu ? ' (CUDA)' : ' ✓') : ' ✗'}`;
+        opt.disabled = !available;
+      } else if (opt.value === 'auto') {
+        opt.textContent = `Auto (${info.transcription?.recommended || 'best available'})`;
+      }
+    }
+  } catch (e) {
+    console.warn('Could not fetch backend info:', e);
+  }
 }
 
 main();

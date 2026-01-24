@@ -76,6 +76,13 @@
 
         <div class="panel home-panel">
           <h2>Videos</h2>
+          <div id="videoSelectionToolbar" style="display:none;margin-bottom:10px;padding:8px;background:#1a1d24;border-radius:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <span id="videoSelectionCount" style="font-size:12px;color:#888">0 selected</span>
+            <button id="btnSelectAll" class="small">Select All</button>
+            <button id="btnDeselectAll" class="small">Deselect All</button>
+            <button id="btnDeleteSelectedProjects" class="small" style="background:#ef4444;display:none">Delete Selected Projects</button>
+            <button id="btnDeleteSelectedVideos" class="small" style="background:#dc2626">Delete Selected Videos</button>
+          </div>
           <div class="list" id="recentVideos">
             <div class="small">Loading...</div>
           </div>
@@ -130,11 +137,27 @@
           <h2>Interest timeline</h2>
           <div class="row">
             <button class="success" id="btnAnalyzeFull" title="Run all analysis stages in parallel (recommended)">⚡ Analyze (Full)</button>
+            <label title="How much motion (frame changes) affects highlight detection. 'Off' is best for podcasts/chatting, 'Low' is recommended for gaming.">Motion:
+              <select id="motionWeightMode">
+                <option value="off" selected>Off</option>
+                <option value="low">Low</option>
+                <option value="normal">Normal</option>
+                <option value="high">High</option>
+              </select>
+            </label>
+            <label title="Which speech-to-text engine to use. Auto picks the best available.">Whisper:
+              <select id="whisperBackend">
+                <option value="auto" selected>Auto</option>
+                <option value="whispercpp">whisper.cpp</option>
+                <option value="faster_whisper">faster-whisper</option>
+              </select>
+            </label>
             <button class="primary" id="btnAnalyzeHighlights">Analyze highlights</button>
             <button id="btnAnalyzeAudio">Audio only</button>
             <button id="btnAnalyzeAudioEvents" title="Detect laughter, cheering, shouting events">Audio events</button>
             <button id="btnAnalyzeSpeech" title="Transcribe with Whisper and extract speech/reaction features">Speech</button>
             <button id="btnAnalyzeContext" title="Generate clip variants and AI titles/hooks">Context + Titles (AI)</button>
+            <button id="btnResetAnalysis" style="background:#dc2626" title="Delete all analysis data and start fresh">🗑 Reset Analysis</button>
           </div>
           <div class="row">
             <span class="small" id="analysisStatus"></span>

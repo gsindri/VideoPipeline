@@ -51,10 +51,13 @@ def default_profile() -> Dict[str, Any]:
             },
             "speech": {
                 "enabled": True,
-                "model_size": "small",
-                "language": None,
-                "device": "cpu",
-                "compute_type": "int8",
+                "backend": "auto",  # "auto", "whispercpp", or "faster_whisper"
+                "model_size": "small",  # tiny, base, small, medium, large
+                "language": None,  # None for auto-detect
+                "device": "cpu",  # cpu or cuda (faster-whisper only)
+                "compute_type": "int8",  # int8 (CPU), float16 (GPU)
+                "use_gpu": False,  # Request GPU if available
+                "threads": 0,  # CPU threads (0 = auto, whisper.cpp only)
                 "vad_filter": True,
                 "word_timestamps": True,
                 "hop_seconds": 0.5,

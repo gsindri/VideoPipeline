@@ -27,13 +27,30 @@ class Job:
     id: str
     kind: str
     created_at: str = field(default_factory=_utc_iso)
-    status: str = "queued"  # queued|running|succeeded|failed
+    status: str = "queued"  # queued|running|succeeded|failed|cancelled
     progress: float = 0.0
     message: str = ""
     result: Dict[str, Any] = field(default_factory=dict)
+    
+    # Timing fields
+    started_at: Optional[float] = field(default=None)  # time.time() when job started running
+    
+    # Cancellation flag - threads should check this periodically
+    _cancel_requested: bool = field(default=False, repr=False)
 
     # SSE event stream
     events: "queue.Queue[str]" = field(default_factory=lambda: queue.Queue(maxsize=1000))
+    
+    @property
+    def cancel_requested(self) -> bool:
+        return self._cancel_requested
+    
+    @property
+    def elapsed_seconds(self) -> Optional[float]:
+        """Return elapsed seconds since job started, or None if not started."""
+        if self.started_at is None:
+            return None
+        return time.time() - self.started_at
 
 
 class JobManager:
@@ -58,6 +75,8 @@ class JobManager:
             "id": job.id,
             "kind": job.kind,
             "created_at": job.created_at,
+            "started_at": job.started_at,
+            "elapsed_seconds": job.elapsed_seconds,
             "status": job.status,
             "progress": job.progress,
             "message": job.message,
@@ -74,6 +93,9 @@ class JobManager:
     def _set(self, job: Job, *, status: Optional[str] = None, progress: Optional[float] = None, message: Optional[str] = None, result: Optional[Dict[str, Any]] = None) -> None:
         if status is not None:
             job.status = status
+            # Record start time when job begins running
+            if status == "running" and job.started_at is None:
+                job.started_at = time.time()
         if progress is not None:
             job.progress = max(0.0, min(1.0, float(progress)))
         if message is not None:
@@ -81,6 +103,17 @@ class JobManager:
         if result is not None:
             job.result = result
         self._emit(job, {"type": "job_update", "job": self._public(job)})
+
+    def cancel(self, job_id: str) -> bool:
+        """Request cancellation of a job. Returns True if job was found and cancellable."""
+        job = self.get(job_id)
+        if not job:
+            return False
+        if job.status not in ("queued", "running"):
+            return False  # Already finished
+        job._cancel_requested = True
+        self._set(job, status="cancelled", message="Cancelled by user")
+        return True
 
     def start_export(
         self,

@@ -147,6 +147,9 @@ button:disabled {
 .item .title {
   font-weight: 600;
   font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .item .meta {
@@ -168,6 +171,66 @@ button:disabled {
   border-radius: 999px;
   border: 1px solid var(--border);
   color: var(--muted);
+}
+
+.badge-favorite {
+  background: #fbbf24;
+  color: #000;
+  border-color: #f59e0b;
+}
+
+/* Favorite button */
+.btn-favorite {
+  background: transparent;
+  border: none;
+  font-size: 20px;
+  cursor: pointer;
+  padding: 2px 6px;
+  color: var(--muted);
+  transition: color 0.2s, transform 0.15s;
+  flex-shrink: 0;
+}
+
+.btn-favorite:hover {
+  color: #fbbf24;
+  transform: scale(1.15);
+}
+
+.btn-favorite.active {
+  color: #fbbf24;
+}
+
+/* Video item header with favorite */
+.item-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.item-header .title {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Video checkbox styling */
+.video-checkbox {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}
+
+.item:has(.video-checkbox:checked) {
+  background: rgba(79, 140, 255, 0.1);
+  border-color: var(--accent);
+}
+
+/* Favorite items highlight */
+.item.favorite {
+  border-left: 3px solid #fbbf24;
+  padding-left: 12px;
 }
 
 kbd {
@@ -405,7 +468,7 @@ details[open] summary::before {
 
 /* Chat panel styles */
 .chat-messages {
-  max-height: 300px;
+  height: 300px;
   overflow-y: auto;
   margin-top: 10px;
   background: #0a0c0f;

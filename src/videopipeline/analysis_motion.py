@@ -33,17 +33,25 @@ def compute_motion_analysis(
 
     prev: Optional[np.ndarray] = None
     diffs: list[float] = []
+    frame_count = 0
 
     for frame in stream_video_frames_gray(video_path, fps=sample_fps, width=scale_width, height=scale_height):
         if prev is not None:
             diff = np.mean(np.abs(frame.astype(np.float32) - prev.astype(np.float32)))
             diffs.append(float(diff))
-            processed += 1
-            if on_progress and processed % 20 == 0:
-                on_progress(min(0.95, processed / total_frames))
+        else:
+            # First frame has no previous frame to compare, use 0 diff
+            # This ensures diffs[i] corresponds to time i/sample_fps
+            diffs.append(0.0)
         prev = frame
+        frame_count += 1
+        processed += 1
+        if on_progress and processed % 20 == 0:
+            on_progress(min(0.95, processed / total_frames))
 
     x = np.array(diffs, dtype=np.float64)
+    # Create explicit times array aligned with diffs
+    times = np.arange(len(x)) / sample_fps
     smooth_frames = max(1, int(round(smooth_s * sample_fps)))
     xs = moving_average(x, smooth_frames) if len(x) > 0 else x
     scores = robust_z(xs) if len(xs) > 0 else xs
@@ -54,6 +62,7 @@ def compute_motion_analysis(
         smoothed=xs,
         scores=scores,
         fps=np.array([sample_fps], dtype=np.float64),
+        times=times,
     )
 
     payload = {

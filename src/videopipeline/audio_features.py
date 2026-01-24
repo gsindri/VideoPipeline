@@ -14,6 +14,9 @@ class AudioFeatureConfig:
     sample_rate: int = 16000
     hop_seconds: float = 0.5
     eps: float = 1e-12
+    # Prevent extreme -inf-like values from dominating statistics when audio is silent.
+    # (dBFS floor; keep very low to preserve dynamics.)
+    db_floor: float | None = -120.0
 
 
 def audio_rms_db_timeline(video_path: Path, cfg: AudioFeatureConfig) -> List[float]:
@@ -30,10 +33,17 @@ def audio_rms_db_timeline(video_path: Path, cfg: AudioFeatureConfig) -> List[flo
     params = AudioStreamParams(sample_rate=cfg.sample_rate, channels=1)
     timeline_db: List[float] = []
 
-    for block in stream_audio_blocks_f32le(video_path, params=params, block_samples=hop_samples):
+    for block in stream_audio_blocks_f32le(
+        video_path,
+        params=params,
+        block_samples=hop_samples,
+        yield_partial=True,
+    ):
         block64 = block.astype(np.float64, copy=False)
         rms = float(np.sqrt(np.mean(block64 * block64)))
         db = float(20.0 * np.log10(rms + cfg.eps))
+        if cfg.db_floor is not None:
+            db = max(float(cfg.db_floor), db)
         timeline_db.append(db)
 
     return timeline_db

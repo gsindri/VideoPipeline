@@ -25,7 +25,7 @@ from ..analysis_boundaries import BoundaryConfig, compute_boundaries_analysis
 from ..clip_variants import VariantGeneratorConfig, VariantDurationConfig, compute_clip_variants, load_clip_variants
 from ..ai.director import DirectorConfig, compute_director_analysis
 from ..layouts import RectNorm
-from ..project import create_or_load_project, get_project_data, load_npz, set_layout_facecam, Project
+from ..project import create_or_load_project, get_project_data, load_npz, set_layout_facecam, Project, utc_now_iso
 from ..profile import load_profile
 from ..publisher.accounts import AccountStore
 from ..publisher.jobs import PublishJobStore
@@ -121,6 +121,21 @@ def create_app(
     def api_health() -> JSONResponse:
         return JSONResponse({"ok": True})
 
+    @app.get("/api/system/info")
+    def api_system_info() -> JSONResponse:
+        """Get system information including available transcription backends."""
+        from ..transcription import get_available_backends
+        
+        backends = get_available_backends()
+        
+        return JSONResponse({
+            "transcription": {
+                "backends": backends,
+                "recommended": "whispercpp" if backends.get("whispercpp") else "faster_whisper",
+                "gpu_available": backends.get("whispercpp_gpu") or backends.get("faster_whisper_gpu"),
+            },
+        })
+
     @app.get("/api/profile")
     def api_profile() -> JSONResponse:
         return JSONResponse(ctx.profile)
@@ -136,6 +151,84 @@ def create_app(
         proj = ctx.require_project()
         data = get_project_data(proj)
         return JSONResponse({"active": True, "project": data})
+
+    @app.post("/api/project/reset_analysis")
+    def api_project_reset_analysis(body: Dict[str, Any] = Body(default={})) -> JSONResponse:
+        """Reset all analysis data for the current project.
+        
+        This deletes all analysis files (audio, motion, highlights, transcript, etc.)
+        but keeps the project, video, selections, and exports intact.
+        
+        Body (optional):
+            keep_chat: bool - If True, keep chat data (default False)
+            keep_transcript: bool - If True, keep transcript (default False)
+        """
+        import shutil
+        
+        proj = ctx.require_project()
+        keep_chat = body.get("keep_chat", False)
+        keep_transcript = body.get("keep_transcript", False)
+        
+        deleted_files = []
+        
+        # List of analysis files to delete
+        analysis_files = [
+            proj.audio_features_path,
+            proj.motion_features_path,
+            proj.highlights_features_path,
+            proj.scenes_path,
+            proj.speech_features_path,
+            proj.reaction_audio_features_path,
+            proj.audio_events_features_path,
+            proj.analysis_dir / "silence.json",
+            proj.analysis_dir / "sentences.json",
+            proj.analysis_dir / "boundaries.json",
+            proj.analysis_dir / "chat_boundaries.json",
+            proj.analysis_dir / "clip_variants.json",
+            proj.analysis_dir / "director_results.json",
+        ]
+        
+        # Add chat files unless keeping
+        if not keep_chat:
+            analysis_files.extend([
+                proj.chat_features_path,
+                proj.chat_raw_path,
+                proj.chat_db_path,
+            ])
+        
+        # Add transcript files unless keeping
+        if not keep_transcript:
+            analysis_files.append(proj.transcript_path)
+        
+        # Delete each file
+        for fpath in analysis_files:
+            if fpath.exists():
+                try:
+                    fpath.unlink()
+                    deleted_files.append(fpath.name)
+                except Exception as e:
+                    pass  # Continue on error
+        
+        # Clear analysis data from project.json
+        proj_json_path = proj.project_json_path
+        if proj_json_path.exists():
+            import json
+            with open(proj_json_path, "r", encoding="utf-8") as f:
+                proj_data = json.load(f)
+            
+            # Clear analysis section but preserve other data
+            if "analysis" in proj_data:
+                del proj_data["analysis"]
+            
+            with open(proj_json_path, "w", encoding="utf-8") as f:
+                json.dump(proj_data, f, indent=2)
+        
+        return JSONResponse({
+            "reset": True,
+            "deleted_files": deleted_files,
+            "kept_chat": keep_chat,
+            "kept_transcript": keep_transcript,
+        })
 
     @app.get("/api/home/recent_projects")
     def api_home_recent_projects() -> JSONResponse:
@@ -210,6 +303,114 @@ def create_app(
             "video_path": video_path,
         })
 
+    @app.delete("/api/home/video")
+    def api_home_delete_video(body: Dict[str, Any] = Body(...)) -> JSONResponse:
+        """Delete a video file and optionally its project.
+        
+        Body:
+            video_path: str - Path to the video file
+            delete_project: bool - Also delete the associated project (default True)
+        """
+        import shutil
+        from ..project import default_projects_root, project_dir_for_video
+        
+        video_path = body.get("video_path")
+        delete_project = body.get("delete_project", True)
+        
+        if not video_path:
+            raise HTTPException(status_code=400, detail="video_path_required")
+        
+        video_path = Path(video_path)
+        if not video_path.exists():
+            raise HTTPException(status_code=404, detail="video_not_found")
+        
+        deleted_files = []
+        project_deleted = False
+        
+        # Close project if this video is currently open
+        if ctx.project and Path(ctx.project.video_path).resolve() == video_path.resolve():
+            ctx.close_project()
+        
+        # Delete associated project if requested
+        if delete_project:
+            try:
+                project_dir = project_dir_for_video(video_path)
+                if project_dir.exists():
+                    shutil.rmtree(project_dir)
+                    project_deleted = True
+            except Exception:
+                pass  # Project may not exist, continue
+        
+        # Delete the video file
+        try:
+            video_path.unlink()
+            deleted_files.append(str(video_path))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to delete video: {e}")
+        
+        # Delete associated metadata files (.info.json, .description, etc.)
+        for ext in [".info.json", ".description", ".jpg", ".webp", ".png"]:
+            meta_file = video_path.with_suffix(ext)
+            if meta_file.exists():
+                try:
+                    meta_file.unlink()
+                    deleted_files.append(str(meta_file))
+                except Exception:
+                    pass
+        
+        return JSONResponse({
+            "deleted": True,
+            "video_path": str(video_path),
+            "deleted_files": deleted_files,
+            "project_deleted": project_deleted,
+        })
+
+    @app.post("/api/home/favorite")
+    def api_home_toggle_favorite(body: Dict[str, Any] = Body(...)) -> JSONResponse:
+        """Toggle favorite status for a video/project.
+        
+        Body:
+            video_path: str - Path to the video file
+            favorite: bool - Set favorite status (if omitted, toggles current state)
+        """
+        from ..project import project_dir_for_video, load_json, save_json
+        
+        video_path = body.get("video_path")
+        if not video_path:
+            raise HTTPException(status_code=400, detail="video_path_required")
+        
+        video_path = Path(video_path)
+        if not video_path.exists():
+            raise HTTPException(status_code=404, detail="video_not_found")
+        
+        # Get or create project directory
+        project_dir = project_dir_for_video(video_path)
+        project_json_path = project_dir / "project.json"
+        
+        # Load existing project data or create minimal structure
+        if project_json_path.exists():
+            data = load_json(project_json_path)
+        else:
+            # Create minimal project just for favorite status
+            project_dir.mkdir(parents=True, exist_ok=True)
+            data = {
+                "project_id": project_dir.name,
+                "created_at": utc_now_iso(),
+                "video": {"path": str(video_path)},
+            }
+        
+        # Toggle or set favorite
+        current_favorite = data.get("favorite", False)
+        new_favorite = body.get("favorite", not current_favorite)
+        data["favorite"] = bool(new_favorite)
+        
+        save_json(project_json_path, data)
+        
+        return JSONResponse({
+            "video_path": str(video_path),
+            "favorite": data["favorite"],
+        })
+
     @app.get("/api/home/videos")
     def api_home_videos() -> JSONResponse:
         """Unified list of all videos (projects + downloads merged).
@@ -269,6 +470,7 @@ def create_app(
                             "project_id": project_info.get("project_id") if project_info else None,
                             "selections_count": project_info.get("selections_count", 0) if project_info else 0,
                             "exports_count": project_info.get("exports_count", 0) if project_info else 0,
+                            "favorite": project_info.get("favorite", False) if project_info else False,
                         })
                     except Exception:
                         continue
@@ -399,7 +601,11 @@ def create_app(
                 elif current_chat_status["status"] == "success":
                     chat_info = " | 💬 Chat: ✓ done"
                 elif current_chat_status["status"] == "failed":
-                    chat_info = f" | 💬 Chat: ✗ failed"
+                    err = str(current_chat_status.get("message", "") or "")
+                    err = err.replace("\n", " ").replace("\r", " ").strip()
+                    if len(err) > 120:
+                        err = err[:117] + "..."
+                    chat_info = f" | 💬 Chat: ✗ failed ({err})" if err else " | 💬 Chat: ✗ failed"
                 elif current_chat_status["status"] == "pending" and "twitch.tv/videos/" in url.lower():
                     chat_info = " | 💬 Chat: pending"
                 
@@ -422,8 +628,13 @@ def create_app(
 
             def download_chat():
                 nonlocal chat_result, chat_error, current_chat_status
+                import logging
+                log = logging.getLogger("videopipeline.studio")
+                log.info(f"[CHAT DEBUG] Starting chat download for URL: {url}")
+                
                 # Only download chat for Twitch VODs
                 if "twitch.tv/videos/" not in url.lower():
+                    log.info(f"[CHAT DEBUG] Skipped: not a Twitch VOD")
                     chat_result = {"status": "skipped", "message": "Not a Twitch VOD"}
                     current_chat_status = chat_result
                     return chat_result
@@ -432,6 +643,7 @@ def create_app(
                     from ..chat.downloader import download_chat as dl_chat, find_twitch_downloader_cli
                     
                     cli_path = find_twitch_downloader_cli()
+                    log.info(f"[CHAT DEBUG] TwitchDownloaderCLI path: {cli_path}")
                     if not cli_path:
                         chat_result = {"status": "skipped", "message": "TwitchDownloaderCLI not found"}
                         current_chat_status = chat_result
@@ -441,21 +653,51 @@ def create_app(
                     import re
                     match = re.search(r'twitch\.tv/videos/(\d+)', url)
                     if not match:
+                        log.info(f"[CHAT DEBUG] Could not extract video ID from URL")
                         chat_result = {"status": "skipped", "message": "Could not extract video ID"}
                         current_chat_status = chat_result
                         return chat_result
                     
                     video_id = match.group(1)
+                    log.info(f"[CHAT DEBUG] Extracted video ID: {video_id}")
                     
                     # Download to temp location first, will move to project later
+                    # Use job-unique filename to avoid overwrite prompts on repeat runs
                     from ..ingest.ytdlp_runner import _default_downloads_dir
-                    chat_temp_path = _default_downloads_dir() / f"chat_{video_id}.json"
+                    chat_temp_path = _default_downloads_dir() / f"chat_{video_id}_{job.id}.json"
+                    log.info(f"[CHAT DEBUG] Chat temp path: {chat_temp_path}")
                     
                     # Update status to downloading
                     current_chat_status["status"] = "downloading"
                     current_chat_status["message"] = "Downloading Twitch chat..."
                     
-                    dl_chat(url, chat_temp_path)
+                    def on_chat_progress(frac: float, msg: str) -> None:
+                        current_chat_status["message"] = msg
+                        # Update job progress if video is done (progress > 90%)
+                        # Chat download is 90-95%, import is 95-100%
+                        pct_display = int(frac * 100)
+                        JOB_MANAGER._set(
+                            job,
+                            progress=0.90 + frac * 0.05,
+                            message=f"Chat: {msg}",
+                            result={
+                                "video_status": "complete",
+                                "chat_status": "downloading",
+                                "chat_progress": frac,
+                                "chat_message": msg,
+                            }
+                        )
+                    
+                    log.info(f"[CHAT DEBUG] Calling dl_chat...")
+                    dl_chat(url, chat_temp_path, on_progress=on_chat_progress)
+                    log.info(f"[CHAT DEBUG] dl_chat completed")
+                    
+                    # Check if file was created
+                    if chat_temp_path.exists():
+                        file_size = chat_temp_path.stat().st_size
+                        log.info(f"[CHAT DEBUG] Chat file created: {file_size} bytes")
+                    else:
+                        log.warning(f"[CHAT DEBUG] Chat file NOT created!")
                     
                     chat_result = {
                         "status": "success",
@@ -465,14 +707,35 @@ def create_app(
                     }
                     current_chat_status["status"] = "success"
                     current_chat_status["message"] = "Chat downloaded"
+                    log.info(f"[CHAT DEBUG] chat_result: {chat_result}")
                     return chat_result
                     
                 except Exception as e:
+                    import traceback
+                    log.error(f"[CHAT DEBUG] Exception: {e}\n{traceback.format_exc()}")
                     chat_error = str(e)
                     chat_result = {"status": "failed", "message": str(e)}
                     current_chat_status["status"] = "failed"
                     current_chat_status["message"] = str(e)
                     return chat_result
+
+            # Helper to clean up downloaded files on cancellation
+            def cleanup_downloads():
+                try:
+                    if video_result and video_result.video_path:
+                        vp = Path(video_result.video_path)
+                        if vp.exists():
+                            vp.unlink()
+                    if video_result and video_result.preview_path:
+                        pp = Path(video_result.preview_path)
+                        if pp.exists():
+                            pp.unlink()
+                    if chat_result.get("temp_path"):
+                        cp = Path(chat_result["temp_path"])
+                        if cp.exists():
+                            cp.unlink()
+                except Exception:
+                    pass  # Best effort cleanup
 
             try:
                 # Run video and chat downloads in parallel
@@ -480,32 +743,115 @@ def create_app(
                     video_future = executor.submit(download_video)
                     chat_future = executor.submit(download_chat)
                     
-                    # Wait for both to complete
-                    video_future.result()  # This will raise if video download failed
-                    chat_future.result()   # Chat failures are non-fatal
+                    # Wait for both to complete, checking for cancellation
+                    while True:
+                        if job.cancel_requested:
+                            # Job was cancelled - clean up and exit
+                            cleanup_downloads()
+                            return
+                        
+                        # Check if futures are done
+                        video_done = video_future.done()
+                        chat_done = chat_future.done()
+                        
+                        if video_done and chat_done:
+                            break
+                        
+                        # Small sleep to avoid busy-waiting
+                        import time
+                        time.sleep(0.5)
+                    
+                    # Get results (will raise if video download failed)
+                    video_future.result()
+                    chat_future.result()  # Chat failures are non-fatal
+
+                # Check cancellation again after downloads complete
+                if job.cancel_requested:
+                    cleanup_downloads()
+                    return
 
                 result_dict = video_result.to_dict()
                 result_dict["chat"] = chat_result
 
                 # Auto-open the project if requested
                 if auto_open:
+                    import logging
+                    log = logging.getLogger("videopipeline.studio")
+                    
                     # Use preview if available, otherwise original
                     video_to_open = video_result.preview_path or video_result.video_path
                     proj = ctx.open_project(video_to_open)
+                    log.info(f"[CHAT DEBUG] Project opened: {proj.project_dir}")
                     
                     # Store the source URL for chat download later
                     from ..project import set_source_url
                     set_source_url(proj, url)
                     
                     # If chat was downloaded, import it into the project
+                    log.info(f"[CHAT DEBUG] Checking chat_result: status={chat_result.get('status')}, temp_path={chat_result.get('temp_path')}")
                     if chat_result.get("status") == "success" and chat_result.get("temp_path"):
-                        JOB_MANAGER._set(job, progress=0.95, message="Importing chat into project...")
+                        chat_temp = Path(chat_result["temp_path"])
+                        log.info(f"[CHAT DEBUG] Chat temp file exists: {chat_temp.exists()}")
+                        if chat_temp.exists():
+                            log.info(f"[CHAT DEBUG] Chat temp file size: {chat_temp.stat().st_size} bytes")
+                        
+                        JOB_MANAGER._set(
+                            job, 
+                            progress=0.95, 
+                            message="Importing chat into project...",
+                            result={
+                                "video_status": "complete",
+                                "chat_status": "importing",
+                                "chat_message": "Reading chat file...",
+                            }
+                        )
                         try:
                             from ..chat.downloader import import_chat_to_project
-                            import_chat_to_project(proj, Path(chat_result["temp_path"]))
+                            
+                            # Update progress during import
+                            JOB_MANAGER._set(
+                                job,
+                                progress=0.96,
+                                message="Importing chat: parsing messages...",
+                                result={
+                                    "video_status": "complete",
+                                    "chat_status": "importing",
+                                    "chat_message": "Parsing messages...",
+                                }
+                            )
+                            
+                            log.info(f"[CHAT DEBUG] Calling import_chat_to_project...")
+                            import_chat_to_project(proj, chat_temp)
+                            log.info(f"[CHAT DEBUG] import_chat_to_project completed successfully")
+                            
+                            # Verify the chat.sqlite was created
+                            chat_db = proj.chat_db_path
+                            log.info(f"[CHAT DEBUG] chat_db_path: {chat_db}, exists: {chat_db.exists()}")
+                            
+                            JOB_MANAGER._set(
+                                job,
+                                progress=0.99,
+                                message="Chat imported successfully",
+                                result={
+                                    "video_status": "complete",
+                                    "chat_status": "importing",
+                                    "chat_message": "Done!",
+                                }
+                            )
                             chat_result["imported"] = True
+                            
+                            # Clean up temp file after successful import
+                            try:
+                                chat_temp.unlink()
+                                log.info(f"[CHAT DEBUG] Cleaned up temp file")
+                            except Exception:
+                                pass
                         except Exception as e:
+                            import traceback
+                            log.error(f"[CHAT DEBUG] Import exception: {e}\n{traceback.format_exc()}")
                             chat_result["import_error"] = str(e)
+                    else:
+                        log.info(f"[CHAT DEBUG] Skipping import - condition not met")
                     
                     result_dict["project"] = get_project_data(proj)
                     result_dict["auto_opened"] = True
@@ -531,9 +877,11 @@ def create_app(
                 )
 
             except ImportError as e:
-                JOB_MANAGER._set(job, status="failed", message=str(e))
+                if not job.cancel_requested:
+                    JOB_MANAGER._set(job, status="failed", message=str(e))
             except Exception as e:
-                JOB_MANAGER._set(job, status="failed", message=f"{type(e).__name__}: {e}")
+                if not job.cancel_requested:
+                    JOB_MANAGER._set(job, status="failed", message=f"{type(e).__name__}: {e}")
 
         threading.Thread(target=runner, daemon=True).start()
         return JSONResponse({"job_id": job.id})
@@ -699,6 +1047,16 @@ def create_app(
         highlights_cfg = {**analysis_cfg.get("highlights", {}), **(body.get("highlights") or {})}
         audio_events_cfg = {**analysis_cfg.get("audio_events", {}), **(body.get("audio_events") or {})}
 
+        # Normalize motion_weight_mode into actual numeric weight
+        motion_mode = str(highlights_cfg.get("motion_weight_mode", "off")).lower()
+        motion_weight = {
+            "off": 0.0,
+            "low": 0.15,
+            "normal": 0.35,
+            "high": 0.8,
+        }.get(motion_mode, 0.0)
+        highlights_cfg.setdefault("weights", {})["motion"] = motion_weight
+
         job = JOB_MANAGER.create("analyze_highlights")
 
         def runner() -> None:
@@ -795,12 +1153,17 @@ def create_app(
                     JOB_MANAGER._set(job, progress=0.05, message="Transcribing audio with Whisper...")
                     
                     transcript_config = TranscriptConfig(
+                        backend=str(speech_cfg.get("backend", "auto")),
                         model_size=str(speech_cfg.get("model_size", "small")),
                         language=speech_cfg.get("language"),
                         device=str(speech_cfg.get("device", "cpu")),
                         compute_type=str(speech_cfg.get("compute_type", "int8")),
                         vad_filter=bool(speech_cfg.get("vad_filter", True)),
                         word_timestamps=bool(speech_cfg.get("word_timestamps", True)),
+                        use_gpu=bool(speech_cfg.get("use_gpu", False)),
+                        threads=int(speech_cfg.get("threads", 0)),
+                        n_processors=int(speech_cfg.get("n_processors", 1)),
+                        strict=bool(speech_cfg.get("strict", False)),
                     )
                     
                     def on_transcript_progress(frac: float) -> None:
@@ -939,7 +1302,7 @@ def create_app(
                 if proj.chat_features_path.exists() and not chat_boundaries_path.exists():
                     JOB_MANAGER._set(job, progress=0.25, message="Detecting chat valleys/bursts...")
                     chat_boundary_cfg = ChatBoundaryConfig(
-                        valley_window_s=float(context_cfg.get("boundaries", {}).get("chat_valley_window_s", 12.0)),
+                        min_valley_gap_s=float(context_cfg.get("boundaries", {}).get("chat_valley_window_s", 5.0)),
                     )
                     compute_chat_boundaries_analysis(proj, cfg=chat_boundary_cfg)
 
@@ -1067,6 +1430,19 @@ def create_app(
         context_cfg = {**context_cfg, **(body.get("context") or {})}
         ai_cfg = {**ai_cfg, **(body.get("ai") or {})}
 
+        # Normalize motion_weight_mode into actual numeric weight
+        motion_mode = str(highlights_cfg.get("motion_weight_mode", "off")).lower()
+        motion_weight = {
+            "off": 0.0,
+            "low": 0.15,
+            "normal": 0.35,
+            "high": 0.8,
+        }.get(motion_mode, 0.0)
+        highlights_cfg.setdefault("weights", {})["motion"] = motion_weight
+        
+        # Skip motion/scenes analysis entirely if motion weight is off
+        include_motion = motion_mode != "off"
+
         # Options
         include_speech = bool(body.get("include_speech", True))
         include_context = bool(body.get("include_context", True))
@@ -1075,6 +1451,8 @@ def create_app(
         job = JOB_MANAGER.create("analyze_full")
 
         def runner() -> None:
+            import time as _time
+            import threading
             from ..analysis_motion import compute_motion_analysis
             from ..analysis_scenes import compute_scene_analysis
 
@@ -1082,141 +1460,351 @@ def create_app(
             
             completed_stages = []
             errors = []
+            stage_times: Dict[str, float] = {}  # stage_name -> elapsed seconds
+            current_stage: Dict[str, Any] = {}  # For in-progress tracking
+            
+            # Task-level progress for parallel Stage 1 tasks
+            # Key: task name, Value: {"progress": 0.0-1.0, "message": "..."}
+            task_progress: Dict[str, Dict[str, Any]] = {}
+            task_progress_lock = threading.Lock()
+            
+            # These will be populated before tasks run
+            pending_tasks: set = set()
+            task_start_times: Dict[str, float] = {}
+            stage1_completed: list = []
+            stage1_failed: list = []
+            stage1_task_times: Dict[str, Any] = {}
+            
+            def update_task_progress(task_name: str, progress: float, message: str = "") -> None:
+                """Update progress for a specific task (thread-safe)."""
+                with task_progress_lock:
+                    task_progress[task_name] = {"progress": progress, "message": message}
+                # Trigger a job update so frontend sees the progress
+                JOB_MANAGER._set(
+                    job,
+                    result=update_timing_result({
+                        "stage": 1,
+                        "pending": list(pending_tasks),
+                        "completed": list(stage1_completed),
+                        "failed": list(stage1_failed),
+                        "task_times": dict(stage1_task_times),
+                        "task_start_times": {k: v for k, v in task_start_times.items() if k in pending_tasks},
+                        "task_progress": dict(task_progress),
+                    })
+                )
+            
+            def check_cancelled() -> bool:
+                """Check if job was cancelled. Returns True if cancelled."""
+                if job.cancel_requested:
+                    current_stage.clear()
+                    return True
+                return False
+
+            def update_timing_result(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                """Build result dict with timing info."""
+                result = {
+                    "stage_times": stage_times,
+                    "current_stage": current_stage,
+                    "task_progress": dict(task_progress),
+                }
+                if extra:
+                    result.update(extra)
+                return result
 
             # Stage 1: Run independent analyses in parallel
+            # Each function returns a tuple: (stage_name, was_cached)
             def run_audio():
-                if not proj.audio_features_path.exists():
-                    hop_s = float(audio_cfg.get("hop_seconds", 0.5))
-                    compute_audio_analysis(
-                        proj,
-                        sample_rate=int(audio_cfg.get("sample_rate", 16000)),
-                        hop_s=hop_s,
-                        smooth_s=float(audio_cfg.get("smooth_seconds", 3.0)),
-                        top=int(audio_cfg.get("top", 12)),
-                        min_gap_s=float(audio_cfg.get("min_gap_seconds", 20.0)),
-                        pre_s=float(audio_cfg.get("pre_seconds", 8.0)),
-                        post_s=float(audio_cfg.get("post_seconds", 22.0)),
-                        skip_start_s=float(audio_cfg.get("skip_start_seconds", 10.0)),
-                    )
-                return "audio"
+                if proj.audio_features_path.exists():
+                    return ("audio", True)  # cached
+                    
+                def audio_progress(p: float) -> None:
+                    if p < 0.5:
+                        update_task_progress("audio", p, "analyzing audio...")
+                    else:
+                        pct = int((p - 0.5) * 200)
+                        update_task_progress("audio", p, f"computing peaks {pct}%")
+                        
+                hop_s = float(audio_cfg.get("hop_seconds", 0.5))
+                compute_audio_analysis(
+                    proj,
+                    sample_rate=int(audio_cfg.get("sample_rate", 16000)),
+                    hop_s=hop_s,
+                    smooth_s=float(audio_cfg.get("smooth_seconds", 3.0)),
+                    top=int(audio_cfg.get("top", 12)),
+                    min_gap_s=float(audio_cfg.get("min_gap_seconds", 20.0)),
+                    pre_s=float(audio_cfg.get("pre_seconds", 8.0)),
+                    post_s=float(audio_cfg.get("post_seconds", 22.0)),
+                    skip_start_s=float(audio_cfg.get("skip_start_seconds", 10.0)),
+                    on_progress=audio_progress,
+                )
+                return ("audio", False)  # computed
 
             def run_motion():
-                if not proj.motion_features_path.exists():
-                    compute_motion_analysis(
-                        proj,
-                        sample_fps=float(motion_cfg.get("sample_fps", 3.0)),
-                        scale_width=int(motion_cfg.get("scale_width", 160)),
-                        smooth_s=float(motion_cfg.get("smooth_seconds", 2.5)),
-                    )
-                return "motion"
-
-            def run_scenes():
-                if bool(scenes_cfg.get("enabled", True)) and not proj.scenes_path.exists():
-                    compute_scene_analysis(
-                        proj,
-                        threshold_z=float(scenes_cfg.get("threshold_z", 3.5)),
-                        min_scene_len_seconds=float(scenes_cfg.get("min_scene_len_seconds", 1.2)),
-                        snap_window_seconds=float(scenes_cfg.get("snap_window_seconds", 1.0)),
-                    )
-                return "scenes"
+                if proj.motion_features_path.exists():
+                    return ("motion", True)  # cached
+                    
+                def motion_progress(p: float) -> None:
+                    pct = int(p * 100)
+                    update_task_progress("motion", p, f"analyzing frames {pct}%")
+                    
+                compute_motion_analysis(
+                    proj,
+                    sample_fps=float(motion_cfg.get("sample_fps", 3.0)),
+                    scale_width=int(motion_cfg.get("scale_width", 160)),
+                    smooth_s=float(motion_cfg.get("smooth_seconds", 2.5)),
+                    on_progress=motion_progress,
+                )
+                return ("motion", False)  # computed
 
             def run_audio_events():
-                if bool(audio_events_cfg.get("enabled", True)) and not proj.audio_events_features_path.exists():
-                    cfg = AudioEventsConfig.from_dict(audio_events_cfg)
-                    compute_audio_events_analysis(proj, cfg=cfg)
-                return "audio_events"
+                if not bool(audio_events_cfg.get("enabled", True)):
+                    return ("audio_events", True)  # disabled = treat as cached/skipped
+                if proj.audio_events_features_path.exists():
+                    return ("audio_events", True)  # cached
+                    
+                def audio_events_progress(p: float) -> None:
+                    pct = int(p * 100)
+                    update_task_progress("audio_events", p, f"detecting events {pct}%")
+                    
+                cfg = AudioEventsConfig.from_dict(audio_events_cfg)
+                compute_audio_events_analysis(proj, cfg=cfg, on_progress=audio_events_progress)
+                return ("audio_events", False)  # computed
 
             def run_transcript():
-                if include_speech and speech_cfg.get("enabled", True) and not proj.transcript_path.exists():
-                    transcript_config = TranscriptConfig(
-                        model_size=str(speech_cfg.get("model_size", "small")),
-                        language=speech_cfg.get("language"),
-                        device=str(speech_cfg.get("device", "cpu")),
-                        compute_type=str(speech_cfg.get("compute_type", "int8")),
-                        vad_filter=bool(speech_cfg.get("vad_filter", True)),
-                        word_timestamps=bool(speech_cfg.get("word_timestamps", True)),
-                    )
-                    compute_transcript_analysis(proj, cfg=transcript_config)
-                return "transcript"
+                if not (include_speech and speech_cfg.get("enabled", True)):
+                    return ("transcript", True)  # disabled
+                if proj.transcript_path.exists():
+                    return ("transcript", True)  # cached
+                    
+                # Progress callback for transcript - maps internal 0-1 to descriptive messages
+                def transcript_progress(p: float) -> None:
+                    if p < 0.1:
+                        msg = "extracting audio..."
+                    elif p < 0.2:
+                        msg = "loading model..."
+                    elif p < 0.9:
+                        # Map 0.2-0.9 to percentage
+                        pct = int((p - 0.2) / 0.7 * 100)
+                        msg = f"transcribing {pct}%"
+                    else:
+                        msg = "saving..."
+                    update_task_progress("transcript", p, msg)
+                
+                transcript_config = TranscriptConfig(
+                    backend=str(speech_cfg.get("backend", "auto")),
+                    model_size=str(speech_cfg.get("model_size", "small")),
+                    language=speech_cfg.get("language"),
+                    device=str(speech_cfg.get("device", "cpu")),
+                    compute_type=str(speech_cfg.get("compute_type", "int8")),
+                    vad_filter=bool(speech_cfg.get("vad_filter", True)),
+                    word_timestamps=bool(speech_cfg.get("word_timestamps", True)),
+                    use_gpu=bool(speech_cfg.get("use_gpu", False)),
+                    threads=int(speech_cfg.get("threads", 0)),
+                    n_processors=int(speech_cfg.get("n_processors", 1)),
+                    strict=bool(speech_cfg.get("strict", False)),
+                )
+                compute_transcript_analysis(proj, cfg=transcript_config, on_progress=transcript_progress)
+                return ("transcript", False)  # computed
 
             def run_chat_features():
                 if proj.chat_features_path.exists():
-                    return "chat_features_cached"
+                    return ("chat", True)  # cached
                 chat_db_path = proj.analysis_dir / "chat.sqlite"
                 if chat_db_path.exists():
                     from ..chat.features import compute_and_save_chat_features
                     hop_s = float(audio_cfg.get("hop_seconds", 0.5))
                     smooth_s = float(highlights_cfg.get("chat_smooth_seconds", 3.0))
-                    compute_and_save_chat_features(proj, hop_s=hop_s, smooth_s=smooth_s)
-                return "chat_features"
+                    
+                    # Get LLM for laugh emote learning (with auto-start)
+                    ai_cfg = ctx.profile.get("ai", {}).get("director", {})
+                    llm_complete_fn = None
+                    if ai_cfg.get("enabled", True):
+                        try:
+                            from pathlib import Path as P
+                            from ..ai.llm_server import ensure_llm_server
+                            from ..ai.llm_client import create_llm_client
+                            
+                            # Auto-start server if configured
+                            endpoint = str(ai_cfg.get("endpoint", "http://127.0.0.1:11435"))
+                            if ai_cfg.get("auto_start", False):
+                                server_path = P(ai_cfg.get("server_path", "C:/llama.cpp/llama-server.exe"))
+                                model_path = P(ai_cfg.get("model_path", "C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf"))
+                                auto_stop_s = ai_cfg.get("auto_stop_idle_s", 600.0)
+                                started_endpoint = ensure_llm_server(
+                                    server_path=server_path,
+                                    model_path=model_path,
+                                    port=int(endpoint.split(":")[-1]),
+                                    auto_stop_after_idle_s=auto_stop_s,
+                                )
+                                if started_endpoint:
+                                    endpoint = started_endpoint
+                            
+                            llm_client = create_llm_client(
+                                endpoint=endpoint,
+                                cache_dir=proj.analysis_dir,
+                            )
+                            if llm_client.is_available():
+                                def llm_complete_fn(prompt: str) -> str:
+                                    resp = llm_client.complete(prompt, json_mode=True)
+                                    return json.dumps(resp) if isinstance(resp, dict) else str(resp)
+                        except Exception:
+                            pass
+                    
+                    compute_and_save_chat_features(
+                        proj,
+                        hop_s=hop_s,
+                        smooth_s=smooth_s,
+                        llm_complete=llm_complete_fn,
+                    )
+                    return ("chat", False)  # computed
+                return ("chat", True)  # no chat data = skip
 
             # Build stage 1 task list with display names
+            # Note: scenes is NOT included here - it depends on motion and runs after Stage 1
             stage1_tasks = [
                 (run_audio, "run_audio", "audio"),
-                (run_motion, "run_motion", "motion"),
-                (run_scenes, "run_scenes", "scenes"),
                 (run_audio_events, "run_audio_events", "audio_events"),
                 (run_chat_features, "run_chat_features", "chat"),
             ]
+            # Only include motion if motion weight is not "off"
+            if include_motion:
+                stage1_tasks.append((run_motion, "run_motion", "motion"))
             if include_speech:
                 stage1_tasks.append((run_transcript, "run_transcript", "transcript"))
 
             total_tasks = len(stage1_tasks)
             task_names = [t[2] for t in stage1_tasks]
-            pending_tasks = set(task_names)
+            pending_tasks.update(task_names)
             
+            # Track start times for parallel tasks
+            for name in task_names:
+                task_start_times[name] = _time.time()
+            
+            current_stage = {"name": "stage1", "started_at": _time.time()}
             JOB_MANAGER._set(
                 job, 
                 progress=0.05, 
                 message=f"Stage 1: Starting {total_tasks} parallel tasks: {', '.join(task_names)}",
-                result={"stage": 1, "pending": list(pending_tasks), "completed": [], "failed": []}
+                result=update_timing_result({
+                    "stage": 1, 
+                    "pending": list(pending_tasks), 
+                    "completed": [], 
+                    "failed": [],
+                    "task_start_times": task_start_times,
+                })
             )
 
             # Run Stage 1 in parallel using ThreadPoolExecutor
-            stage1_completed = []
-            stage1_failed = []
+            stage1_cached = []  # Track which stages were cached
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 futures = {executor.submit(task[0]): (task[1], task[2]) for task in stage1_tasks}
                 for i, future in enumerate(concurrent.futures.as_completed(futures)):
                     func_name, display_name = futures[future]
+                    elapsed = _time.time() - task_start_times[display_name]
                     try:
-                        result = future.result()
-                        completed_stages.append(result)
+                        stage_name, was_cached = future.result()
+                        completed_stages.append(stage_name)
                         stage1_completed.append(display_name)
                         pending_tasks.discard(display_name)
+                        
+                        if was_cached:
+                            stage1_cached.append(display_name)
+                            stage1_task_times[display_name] = "cached"
+                            stage_times[display_name] = "cached"
+                            msg = f"Stage 1: ✓ {display_name} (cached) ({len(stage1_completed)}/{total_tasks})"
+                        else:
+                            stage1_task_times[display_name] = elapsed
+                            stage_times[display_name] = elapsed
+                            msg = f"Stage 1: ✓ {display_name} ({len(stage1_completed)}/{total_tasks}) [{elapsed:.1f}s]"
+                        
                         progress = 0.05 + 0.30 * ((i + 1) / total_tasks)
                         JOB_MANAGER._set(
                             job, 
                             progress=progress, 
-                            message=f"Stage 1: ✓ {display_name} ({len(stage1_completed)}/{total_tasks})",
-                            result={
+                            message=msg,
+                            result=update_timing_result({
                                 "stage": 1, 
                                 "pending": list(pending_tasks), 
                                 "completed": stage1_completed,
+                                "cached": stage1_cached,
                                 "failed": stage1_failed,
-                            }
+                                "task_times": stage1_task_times,
+                                "task_start_times": {k: v for k, v in task_start_times.items() if k in pending_tasks},
+                            })
                         )
                     except Exception as e:
                         err_msg = f"{display_name}: {e}"
                         errors.append(err_msg)
                         stage1_failed.append(display_name)
+                        stage1_task_times[display_name] = elapsed
+                        stage_times[display_name] = elapsed
                         pending_tasks.discard(display_name)
                         progress = 0.05 + 0.30 * ((i + 1) / total_tasks)
                         JOB_MANAGER._set(
                             job,
                             progress=progress,
                             message=f"Stage 1: ✗ {display_name} failed ({len(stage1_completed)}/{total_tasks} ok)",
-                            result={
+                            result=update_timing_result({
                                 "stage": 1,
                                 "pending": list(pending_tasks),
                                 "completed": stage1_completed,
+                                "cached": stage1_cached,
                                 "failed": stage1_failed,
-                            }
+                                "task_times": stage1_task_times,
+                                "task_start_times": {k: v for k, v in task_start_times.items() if k in pending_tasks},
+                            })
                         )
 
+            # Stage 1.5: Scenes analysis (depends on motion -> must run AFTER Stage 1)
+            # Only run if motion analysis is enabled (scenes detection uses motion data)
+            if check_cancelled():
+                return
+                
+            if include_motion and bool(scenes_cfg.get("enabled", True)):
+                if proj.scenes_path.exists():
+                    completed_stages.append("scenes")
+                    stage_times["scenes"] = "cached"
+                else:
+                    scenes_start = _time.time()
+                    current_stage = {"name": "scenes", "started_at": scenes_start}
+                    JOB_MANAGER._set(
+                        job,
+                        progress=0.36,
+                        message="Stage 1.5: Detecting scene cuts...",
+                        result=update_timing_result()
+                    )
+                    try:
+                        # Safety net: if motion file somehow isn't there, compute it now
+                        if not proj.motion_features_path.exists():
+                            compute_motion_analysis(
+                                proj,
+                                sample_fps=float(motion_cfg.get("sample_fps", 3.0)),
+                                scale_width=int(motion_cfg.get("scale_width", 160)),
+                                smooth_s=float(motion_cfg.get("smooth_seconds", 2.5)),
+                            )
+                            if "motion" not in completed_stages:
+                                completed_stages.append("motion")
+
+                        compute_scene_analysis(
+                            proj,
+                            threshold_z=float(scenes_cfg.get("threshold_z", 3.5)),
+                            min_scene_len_seconds=float(scenes_cfg.get("min_scene_len_seconds", 1.2)),
+                            snap_window_seconds=float(scenes_cfg.get("snap_window_seconds", 1.0)),
+                        )
+                        completed_stages.append("scenes")
+                        stage_times["scenes"] = _time.time() - scenes_start
+                    except Exception as e:
+                        errors.append(f"scenes: {e}")
+                        stage_times["scenes"] = _time.time() - scenes_start
+
             # Stage 2: Combine signals into highlight scores
-            JOB_MANAGER._set(job, progress=0.35, message="Stage 2: Computing highlight scores...")
+            if check_cancelled():
+                return
+                
+            highlights_start = _time.time()
+            current_stage = {"name": "highlights", "started_at": highlights_start}
+            JOB_MANAGER._set(job, progress=0.38, message="Stage 2: Computing highlight scores...", result=update_timing_result())
             try:
                 compute_highlights_analysis(
                     proj,
@@ -1229,14 +1817,21 @@ def create_app(
                     include_audio_events=bool(audio_events_cfg.get("enabled", True)),
                 )
                 completed_stages.append("highlights")
+                stage_times["highlights"] = _time.time() - highlights_start
             except Exception as e:
                 errors.append(f"highlights: {e}")
+                stage_times["highlights"] = _time.time() - highlights_start
 
             # Stage 3: Speech features + reranking (if speech enabled)
+            if check_cancelled():
+                return
+                
             if include_speech and speech_cfg.get("enabled", True):
                 # Speech features
                 if proj.transcript_path.exists() and not proj.speech_features_path.exists():
-                    JOB_MANAGER._set(job, progress=0.45, message="Stage 3: Extracting speech features...")
+                    speech_feat_start = _time.time()
+                    current_stage = {"name": "speech_features", "started_at": speech_feat_start}
+                    JOB_MANAGER._set(job, progress=0.45, message="Stage 3: Extracting speech features...", result=update_timing_result())
                     try:
                         hook_cfg = rerank_cfg_dict.get("hook", {})
                         phrases = hook_cfg.get("phrases", [])
@@ -1246,28 +1841,43 @@ def create_app(
                         )
                         compute_speech_features(proj, cfg=speech_feature_config)
                         completed_stages.append("speech_features")
+                        stage_times["speech_features"] = _time.time() - speech_feat_start
                     except Exception as e:
                         errors.append(f"speech_features: {e}")
+                        stage_times["speech_features"] = _time.time() - speech_feat_start
+                elif proj.speech_features_path.exists():
+                    completed_stages.append("speech_features")
+                    stage_times["speech_features"] = "cached"
 
                 # Reaction audio
-                if reaction_cfg.get("enabled", True) and not proj.reaction_audio_features_path.exists():
-                    JOB_MANAGER._set(job, progress=0.55, message="Stage 3: Analyzing reaction audio...")
-                    try:
-                        reaction_audio_config = ReactionAudioConfig(
-                            sample_rate=int(reaction_cfg.get("sample_rate", 16000)),
-                            hop_seconds=float(reaction_cfg.get("hop_seconds", 0.5)),
-                            smooth_seconds=float(reaction_cfg.get("smooth_seconds", 1.5)),
-                        )
-                        compute_reaction_audio_features(proj, cfg=reaction_audio_config)
+                if reaction_cfg.get("enabled", True):
+                    if proj.reaction_audio_features_path.exists():
                         completed_stages.append("reaction_audio")
-                    except Exception as e:
-                        errors.append(f"reaction_audio: {e}")
+                        stage_times["reaction_audio"] = "cached"
+                    else:
+                        reaction_start = _time.time()
+                        current_stage = {"name": "reaction_audio", "started_at": reaction_start}
+                        JOB_MANAGER._set(job, progress=0.55, message="Stage 3: Analyzing reaction audio...", result=update_timing_result())
+                        try:
+                            reaction_audio_config = ReactionAudioConfig(
+                                sample_rate=int(reaction_cfg.get("sample_rate", 16000)),
+                                hop_seconds=float(reaction_cfg.get("hop_seconds", 0.5)),
+                                smooth_seconds=float(reaction_cfg.get("smooth_seconds", 1.5)),
+                            )
+                            compute_reaction_audio_features(proj, cfg=reaction_audio_config)
+                            completed_stages.append("reaction_audio")
+                            stage_times["reaction_audio"] = _time.time() - reaction_start
+                        except Exception as e:
+                            errors.append(f"reaction_audio: {e}")
+                            stage_times["reaction_audio"] = _time.time() - reaction_start
 
-                # Rerank
+                # Rerank - always recompute since it depends on current highlights
                 proj_data = get_project_data(proj)
                 has_candidates = bool(proj_data.get("analysis", {}).get("highlights", {}).get("candidates"))
                 if rerank_cfg_dict.get("enabled", True) and has_candidates:
-                    JOB_MANAGER._set(job, progress=0.65, message="Stage 3: Reranking candidates...")
+                    rerank_start = _time.time()
+                    current_stage = {"name": "rerank", "started_at": rerank_start}
+                    JOB_MANAGER._set(job, progress=0.65, message="Stage 3: Reranking candidates...", result=update_timing_result())
                     try:
                         hook_cfg = rerank_cfg_dict.get("hook", {})
                         quote_cfg = rerank_cfg_dict.get("quote", {})
@@ -1282,12 +1892,19 @@ def create_app(
                         )
                         compute_reranked_candidates(proj, cfg=rerank_config)
                         completed_stages.append("rerank")
+                        stage_times["rerank"] = _time.time() - rerank_start
                     except Exception as e:
                         errors.append(f"rerank: {e}")
+                        stage_times["rerank"] = _time.time() - rerank_start
 
             # Stage 4: Context + AI Director (optional)
+            if check_cancelled():
+                return
+                
             if include_context:
-                JOB_MANAGER._set(job, progress=0.70, message="Stage 4: Computing context boundaries...")
+                boundaries_start = _time.time()
+                current_stage = {"name": "boundaries", "started_at": boundaries_start}
+                JOB_MANAGER._set(job, progress=0.70, message="Stage 4: Computing context boundaries...", result=update_timing_result())
                 try:
                     # Silence detection
                     silence_path = proj.analysis_dir / "silence.json"
@@ -1310,7 +1927,7 @@ def create_app(
                     chat_boundaries_path = proj.analysis_dir / "chat_boundaries.json"
                     if proj.chat_features_path.exists() and not chat_boundaries_path.exists():
                         chat_boundary_cfg = ChatBoundaryConfig(
-                            valley_window_s=float(context_cfg.get("boundaries", {}).get("chat_valley_window_s", 12.0)),
+                            min_valley_gap_s=float(context_cfg.get("boundaries", {}).get("chat_valley_window_s", 5.0)),
                         )
                         compute_chat_boundaries_analysis(proj, cfg=chat_boundary_cfg)
 
@@ -1324,9 +1941,12 @@ def create_app(
                     )
                     compute_boundaries_analysis(proj, cfg=boundary_cfg)
                     completed_stages.append("boundaries")
+                    stage_times["boundaries"] = _time.time() - boundaries_start
 
                     # Clip variants
-                    JOB_MANAGER._set(job, progress=0.80, message="Stage 4: Generating clip variants...")
+                    variants_start = _time.time()
+                    current_stage = {"name": "clip_variants", "started_at": variants_start}
+                    JOB_MANAGER._set(job, progress=0.80, message="Stage 4: Generating clip variants...", result=update_timing_result())
                     variants_cfg_dict = context_cfg.get("variants", {})
                     short_cfg = variants_cfg_dict.get("short", {})
                     medium_cfg = variants_cfg_dict.get("medium", {})
@@ -1349,13 +1969,22 @@ def create_app(
                     top_n = int(context_cfg.get("top_n", 25))
                     compute_clip_variants(proj, cfg=variant_cfg, top_n=top_n)
                     completed_stages.append("clip_variants")
+                    stage_times["clip_variants"] = _time.time() - variants_start
 
                 except Exception as e:
                     errors.append(f"context: {e}")
+                    # Record partial times if we fail partway
+                    if "boundaries" not in stage_times:
+                        stage_times["boundaries"] = _time.time() - boundaries_start
 
             # AI Director (if enabled)
+            if check_cancelled():
+                return
+                
             if include_director and ai_cfg.get("enabled", True):
-                JOB_MANAGER._set(job, progress=0.90, message="Stage 4: Running AI Director...")
+                director_start = _time.time()
+                current_stage = {"name": "director", "started_at": director_start}
+                JOB_MANAGER._set(job, progress=0.90, message="Stage 4: Running AI Director...", result=update_timing_result())
                 try:
                     director_cfg = DirectorConfig(
                         enabled=True,
@@ -1371,16 +2000,20 @@ def create_app(
                     top_n = int(context_cfg.get("top_n", 25))
                     compute_director_analysis(proj, cfg=director_cfg, top_n=top_n)
                     completed_stages.append("director")
+                    stage_times["director"] = _time.time() - director_start
                 except Exception as e:
                     errors.append(f"director: {e}")
+                    stage_times["director"] = _time.time() - director_start
 
             # Final result
+            current_stage = {}  # Clear current stage since we're done
             final_proj_data = get_project_data(proj)
             result = {
                 "completed_stages": completed_stages,
                 "errors": errors,
                 "candidates_count": len(final_proj_data.get("analysis", {}).get("highlights", {}).get("candidates", [])),
                 "signals_used": final_proj_data.get("analysis", {}).get("highlights", {}).get("signals_used", {}),
+                "stage_times": stage_times,
             }
 
             if errors:
@@ -1772,15 +2405,68 @@ def create_app(
                 ))
                 store.close()
 
-                # Compute features
+                # Compute features (with optional LLM-based laugh emote learning)
                 JOB_MANAGER._set(job, progress=0.7, message="Computing chat features...")
                 hop_s = float(ctx.profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
                 smooth_s = float(ctx.profile.get("analysis", {}).get("highlights", {}).get("chat_smooth_seconds", 3.0))
+                
+                # Get LLM config for laugh emote learning (with auto-start)
+                ai_cfg = ctx.profile.get("ai", {}).get("director", {})
+                llm_complete_fn = None
+                if ai_cfg.get("enabled", True):
+                    try:
+                        from pathlib import Path as P
+                        from ..ai.llm_server import ensure_llm_server
+                        from ..ai.llm_client import create_llm_client
+                        
+                        # Auto-start server if configured
+                        endpoint = str(ai_cfg.get("endpoint", "http://127.0.0.1:11435"))
+                        if ai_cfg.get("auto_start", False):
+                            server_path = P(ai_cfg.get("server_path", "C:/llama.cpp/llama-server.exe"))
+                            model_path = P(ai_cfg.get("model_path", "C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf"))
+                            auto_stop_s = ai_cfg.get("auto_stop_idle_s", 600.0)
+                            
+                            def on_server_status(msg: str) -> None:
+                                JOB_MANAGER._set(job, message=msg)
+                            
+                            started_endpoint = ensure_llm_server(
+                                server_path=server_path,
+                                model_path=model_path,
+                                port=int(endpoint.split(":")[-1]),
+                                auto_stop_after_idle_s=auto_stop_s,
+                                on_status=on_server_status,
+                            )
+                            if started_endpoint:
+                                endpoint = started_endpoint
+                        
+                        llm_client = create_llm_client(
+                            endpoint=endpoint,
+                            cache_dir=proj.analysis_dir,
+                            timeout_s=float(ai_cfg.get("timeout_s", 30)),
+                            max_tokens=int(ai_cfg.get("max_tokens", 256)),
+                            temperature=float(ai_cfg.get("temperature", 0.2)),
+                        )
+                        if llm_client.is_available():
+                            def llm_complete_fn(prompt: str) -> str:
+                                resp = llm_client.complete(prompt, json_mode=True)
+                                return json.dumps(resp) if isinstance(resp, dict) else str(resp)
+                    except Exception:
+                        pass  # LLM not available, will use seed tokens only
 
                 def on_feature_progress(frac: float) -> None:
-                    JOB_MANAGER._set(job, progress=0.7 + 0.25 * frac, message="Computing chat features...")
+                    JOB_MANAGER._set(job, progress=0.7 + 0.25 * frac)
+                
+                def on_feature_status(msg: str) -> None:
+                    JOB_MANAGER._set(job, message=msg)
 
-                compute_and_save_chat_features(proj, hop_s=hop_s, smooth_s=smooth_s, on_progress=on_feature_progress)
+                compute_and_save_chat_features(
+                    proj,
+                    hop_s=hop_s,
+                    smooth_s=smooth_s,
+                    on_progress=on_feature_progress,
+                    on_status=on_feature_status,
+                    llm_complete=llm_complete_fn,
+                )
 
                 # Update project config
                 set_chat_config(proj, enabled=True, source_url=source_url)
@@ -2168,6 +2854,17 @@ def create_app(
                 "result": job.result,
             }
         )
+
+    @app.post("/api/jobs/{job_id}/cancel")
+    def api_job_cancel(job_id: str):
+        """Cancel a running or queued job."""
+        success = JOB_MANAGER.cancel(job_id)
+        if not success:
+            job = JOB_MANAGER.get(job_id)
+            if not job:
+                raise HTTPException(status_code=404, detail="job_not_found")
+            raise HTTPException(status_code=400, detail="job_not_cancellable")
+        return JSONResponse({"cancelled": True})
 
     @app.get("/api/jobs/{job_id}/events")
     def api_job_events(job_id: str):

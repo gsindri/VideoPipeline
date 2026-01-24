@@ -144,11 +144,18 @@ def stream_audio_blocks_f32le(
     *,
     params: AudioStreamParams,
     block_samples: int,
+    yield_partial: bool = False,
+    pad_final: bool = False,
 ) -> Iterator[np.ndarray]:
     """
     Stream mono float32 PCM blocks from ffmpeg without loading whole audio into memory.
 
-    Yields numpy arrays of length block_samples. The final partial block is discarded.
+    Yields numpy arrays of length block_samples.
+
+    By default the final partial block is discarded (to preserve older behavior).
+    If `yield_partial=True`, the last short block (if any) is yielded.
+    If `pad_final=True` as well, that final block is zero-padded up to
+    `block_samples`.
     """
     _require_cmd("ffmpeg")
     video_path = Path(video_path)
@@ -190,8 +197,24 @@ def stream_audio_blocks_f32le(
             raw = _read_exact(proc.stdout, block_bytes)
             if not raw:
                 break
+
             if len(raw) < block_bytes:
+                if not yield_partial:
+                    break
+
+                # Guard against odd byte counts (shouldn't happen, but be safe).
+                nbytes = len(raw) - (len(raw) % bytes_per_sample)
+                if nbytes <= 0:
+                    break
+                raw = raw[:nbytes]
+
+                block = np.frombuffer(raw, dtype=params.dtype)
+                if pad_final and block.size < (block_samples * params.channels):
+                    pad = (block_samples * params.channels) - block.size
+                    block = np.pad(block, (0, pad), mode="constant")
+                yield block
                 break
+
             block = np.frombuffer(raw, dtype=params.dtype)
             yield block
     except Exception:
