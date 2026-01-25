@@ -51,12 +51,12 @@ def default_profile() -> Dict[str, Any]:
             },
             "speech": {
                 "enabled": True,
-                "backend": "auto",  # "auto", "whispercpp", or "faster_whisper"
+                "backend": "openai_whisper",  # "openai_whisper", "faster_whisper", "whispercpp", or "auto"
                 "model_size": "small",  # tiny, base, small, medium, large
                 "language": None,  # None for auto-detect
-                "device": "cpu",  # cpu or cuda (faster-whisper only)
-                "compute_type": "int8",  # int8 (CPU), float16 (GPU)
-                "use_gpu": False,  # Request GPU if available
+                "device": "cuda",  # cpu or cuda
+                "compute_type": "float16",  # int8 (CPU), float16 (GPU)
+                "use_gpu": True,  # Request GPU if available (AMD ROCm or NVIDIA CUDA)
                 "threads": 0,  # CPU threads (0 = auto, whisper.cpp only)
                 "vad_filter": True,
                 "word_timestamps": True,
@@ -81,13 +81,9 @@ def default_profile() -> Dict[str, Any]:
                     "shouting": 0.6,
                 },
             },
-            "rerank": {
+            "enrich": {
                 "enabled": True,
-                "weights": {
-                    "highlight": 0.55,
-                    "reaction": 0.25,
-                    "speech": 0.20,
-                },
+                # Note: weights removed - score fusion is handled by highlights analysis
                 "hook": {
                     "max_chars": 60,
                     "window_seconds": 4.0,

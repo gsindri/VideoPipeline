@@ -123,18 +123,21 @@
           </div>
         </div>
 
-        <div class="panel">
+        <div class="panel" data-panel="layout">
           <h2>Layout</h2>
+          <div class="panel-content">
           <div class="row">
             <button class="primary" id="btnCalibrateFacecam">Calibrate facecam</button>
             <button id="btnSaveFacecam" disabled>Save facecam</button>
             <span class="small" id="facecamStatus">No facecam calibration yet.</span>
           </div>
           <p class="small">Draw a rectangle around the facecam. Saved as normalized coordinates.</p>
+          </div>
         </div>
 
-        <div class="panel">
+        <div class="panel" data-panel="timeline">
           <h2>Interest timeline</h2>
+          <div class="panel-content">
           <div class="row">
             <button class="success" id="btnAnalyzeFull" title="Run all analysis stages in parallel (recommended)">⚡ Analyze (Full)</button>
             <label title="How much motion (frame changes) affects highlight detection. 'Off' is best for podcasts/chatting, 'Low' is recommended for gaming.">Motion:
@@ -145,19 +148,43 @@
                 <option value="high">High</option>
               </select>
             </label>
-            <label title="Which speech-to-text engine to use. Auto picks the best available.">Whisper:
+            <label title="Which speech-to-text engine to use. openai-whisper with GPU (AMD ROCm / NVIDIA CUDA) is recommended.">Whisper:
               <select id="whisperBackend">
-                <option value="auto" selected>Auto</option>
-                <option value="whispercpp">whisper.cpp</option>
+                <option value="openai_whisper" selected>openai-whisper</option>
                 <option value="faster_whisper">faster-whisper</option>
+                <option value="whispercpp">whisper.cpp</option>
+                <option value="auto">auto</option>
               </select>
             </label>
-            <button class="primary" id="btnAnalyzeHighlights">Analyze highlights</button>
-            <button id="btnAnalyzeAudio">Audio only</button>
-            <button id="btnAnalyzeAudioEvents" title="Detect laughter, cheering, shouting events">Audio events</button>
-            <button id="btnAnalyzeSpeech" title="Transcribe with Whisper and extract speech/reaction features">Speech</button>
-            <button id="btnAnalyzeContext" title="Generate clip variants and AI titles/hooks">Context + Titles (AI)</button>
-            <button id="btnResetAnalysis" style="background:#dc2626" title="Delete all analysis data and start fresh">🗑 Reset Analysis</button>
+            <div class="dropdown" style="position:relative">
+              <button id="btnAnalysisTools" title="Show/hide individual analysis tools">🔧 Tools ▾</button>
+              <div id="analysisToolsDropdown" class="dropdown-menu" style="display:none;position:absolute;top:100%;left:0;background:#1a1d24;border:1px solid var(--border);border-radius:6px;padding:8px;z-index:100;min-width:180px;margin-top:4px">
+                <label class="dropdown-item" style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;font-size:12px">
+                  <input type="checkbox" id="showBtnHighlights" /> Analyze highlights
+                </label>
+                <label class="dropdown-item" style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;font-size:12px">
+                  <input type="checkbox" id="showBtnAudio" /> Audio only
+                </label>
+                <label class="dropdown-item" style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;font-size:12px">
+                  <input type="checkbox" id="showBtnAudioEvents" /> Audio events
+                </label>
+                <label class="dropdown-item" style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;font-size:12px">
+                  <input type="checkbox" id="showBtnSpeech" /> Speech
+                </label>
+                <label class="dropdown-item" style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;font-size:12px">
+                  <input type="checkbox" id="showBtnContext" /> Context + Titles (AI)
+                </label>
+                <label class="dropdown-item" style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;font-size:12px">
+                  <input type="checkbox" id="showBtnReset" /> Reset Analysis
+                </label>
+              </div>
+            </div>
+            <button class="primary analysis-btn-optional" id="btnAnalyzeHighlights">Analyze highlights</button>
+            <button class="analysis-btn-optional" id="btnAnalyzeAudio">Audio only</button>
+            <button class="analysis-btn-optional" id="btnAnalyzeAudioEvents" title="Detect laughter, cheering, shouting events">Audio events</button>
+            <button class="analysis-btn-optional" id="btnAnalyzeSpeech" title="Transcribe with Whisper and extract speech/reaction features">Speech</button>
+            <button class="analysis-btn-optional" id="btnAnalyzeContext" title="Generate clip variants and AI titles/hooks">Context + Titles (AI)</button>
+            <button class="analysis-btn-optional" id="btnResetAnalysis" style="background:#dc2626" title="Delete all analysis data and start fresh">🗑 Reset Analysis</button>
           </div>
           <div class="row">
             <span class="small" id="analysisStatus"></span>
@@ -166,15 +193,28 @@
             <canvas id="chart" height="120"></canvas>
           </div>
           <p class="small">Higher score means more hype based on combined signals (audio energy + motion + chat spikes + audio events).</p>
+          </div>
         </div>
 
-        <div class="panel">
+        <div class="panel collapsed" data-panel="pipelinestatus">
+          <h2>📊 Analysis Pipeline Status</h2>
+          <div class="panel-content">
+            <div id="pipelineStatus" style="font-size:12px">
+              <div class="small">No analysis data yet. Run "Analyze (Full)" to start.</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" data-panel="jobs">
           <h2>Jobs</h2>
+          <div class="panel-content">
           <div class="list" id="jobs"></div>
+          </div>
         </div>
 
-        <div class="panel">
+        <div class="panel" data-panel="clipbuilder">
           <h2>Clip builder</h2>
+          <div class="panel-content">
           <div class="row">
             <label>Start (s)
               <input type="number" id="startS" step="0.1" />
@@ -201,12 +241,14 @@
             <button id="btnNudgeFwd">+0.5s ▶</button>
             <span class="small">Tip: fine-tune with arrow keys in the inputs.</span>
           </div>
+          </div>
         </div>
       </section>
 
       <section id="right">
-        <div class="panel" id="chatPanel">
+        <div class="panel" id="chatPanel" data-panel="chat">
           <h2>Chat Replay</h2>
+          <div class="panel-content">
           <div class="row" style="margin-bottom:10px;gap:8px;flex-wrap:wrap">
             <input type="text" id="chatSourceUrl" placeholder="Source URL (Twitch VOD, YouTube...)" style="flex:1;min-width:200px" />
             <button class="primary" id="btnDownloadChat">Download Chat</button>
@@ -224,15 +266,19 @@
           <div class="small" id="chatStatus">No chat replay available.</div>
           <div class="chat-messages" id="chatMessages"></div>
           <p class="small" style="margin-top:8px;opacity:0.7">Click a message to seek. Use offset to sync chat with video.</p>
+          </div>
         </div>
 
-        <div class="panel">
+        <div class="panel" data-panel="candidates">
           <h2>Top candidates</h2>
+          <div class="panel-content">
           <div class="list" id="candidates"></div>
+          </div>
         </div>
 
-        <div class="panel">
+        <div class="panel" data-panel="batch">
           <h2>Batch actions</h2>
+          <div class="panel-content">
           <div class="row">
             <label>Top N
               <input type="number" id="batchTopN" value="10" min="1" />
@@ -252,15 +298,19 @@
             <button id="btnBatchExport">Batch export selections</button>
           </div>
           <p class="small">Creates selections from top highlight candidates, then exports them sequentially.</p>
+          </div>
         </div>
 
-        <div class="panel">
+        <div class="panel" data-panel="selections">
           <h2>Selections</h2>
+          <div class="panel-content">
           <div class="list" id="selections"></div>
+          </div>
         </div>
 
-        <div class="panel">
+        <div class="panel" data-panel="export">
           <h2>Export</h2>
+          <div class="panel-content">
           <div class="row">
             <label>Width
               <input type="number" id="expW" value="1080" />
@@ -288,6 +338,7 @@
             <label><input type="checkbox" id="normalizeAudio" /> Normalize audio</label>
           </div>
           <p class="small">Captions require optional dependency: <code>pip install -e '.[whisper]'</code></p>
+          </div>
         </div>
       </section>
     </main>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time as _time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -18,6 +19,7 @@ def compute_motion_analysis(
     smooth_s: float,
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
+    start_time = _time.time()
     video_path = Path(proj.video_path)
     duration_s = ffprobe_duration_seconds(video_path)
     info = ffprobe_video_stream_info(video_path)
@@ -65,6 +67,7 @@ def compute_motion_analysis(
         times=times,
     )
 
+    elapsed_seconds = _time.time() - start_time
     payload = {
         "video": str(video_path),
         "duration_seconds": duration_s,
@@ -75,6 +78,7 @@ def compute_motion_analysis(
             "scale_height": scale_height,
             "smooth_seconds": smooth_s,
         },
+        "elapsed_seconds": elapsed_seconds,
         "generated_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
     }
 
@@ -83,6 +87,7 @@ def compute_motion_analysis(
         d["analysis"]["motion"] = {
             **payload,
             "features_npz": str(proj.motion_features_path.relative_to(proj.project_dir)),
+            "elapsed_seconds": elapsed_seconds,
         }
 
     update_project(proj, _upd)

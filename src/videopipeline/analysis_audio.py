@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time as _time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -57,6 +58,8 @@ def compute_audio_analysis(
         if desired > 0 and (end - start) > desired + 1e-6:
             end = min(duration_s, start + desired)
         return start, end
+
+    start_time = _time.time()
     video_path = Path(proj.video_path)
     duration_s = ffprobe_duration_seconds(video_path)
 
@@ -114,6 +117,7 @@ def compute_audio_analysis(
         hop_seconds=np.array([hop_s], dtype=np.float64),
     )
 
+    elapsed_seconds = _time.time() - start_time
     payload = {
         "video": str(video_path),
         "duration_seconds": duration_s,
@@ -130,6 +134,7 @@ def compute_audio_analysis(
             "min_clip_seconds": min_clip_s,
         },
         "candidates": candidates,
+        "elapsed_seconds": elapsed_seconds,
         "generated_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
     }
 
@@ -138,6 +143,7 @@ def compute_audio_analysis(
         d["analysis"]["audio"] = {
             **payload,
             "features_npz": str(proj.audio_features_path.relative_to(proj.project_dir)),
+            "elapsed_seconds": elapsed_seconds,
         }
 
     update_project(proj, _upd)

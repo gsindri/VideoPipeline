@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time as _time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
@@ -263,12 +264,12 @@ def shape_clip_bounds_with_boundaries(
     Returns:
         Dict with start_s and end_s, or None if no valid bounds found
     """
-    from .analysis_boundaries import find_best_start_boundary, find_best_end_boundary
+    from .analysis_boundaries import find_start_boundary_candidates, find_end_boundary_candidates
     
     peak_time = peak_idx * hop_s
     
-    # Find best start boundary (before peak, for context)
-    start_bp = find_best_start_boundary(
+    # Get ranked candidates for start boundaries
+    start_candidates = find_start_boundary_candidates(
         boundary_graph,
         target_s=peak_time - clip_cfg.min_pre_seconds,
         max_before_s=clip_cfg.max_pre_seconds - clip_cfg.min_pre_seconds,
@@ -276,8 +277,8 @@ def shape_clip_bounds_with_boundaries(
         prefer_before=True,
     )
     
-    # Find best end boundary (after peak, for payoff)
-    end_bp = find_best_end_boundary(
+    # Get ranked candidates for end boundaries
+    end_candidates = find_end_boundary_candidates(
         boundary_graph,
         target_s=peak_time + clip_cfg.min_post_seconds,
         max_before_s=clip_cfg.min_post_seconds,
@@ -285,30 +286,30 @@ def shape_clip_bounds_with_boundaries(
         prefer_after=True,
     )
     
-    if start_bp is None or end_bp is None:
+    if not start_candidates or not end_candidates:
         return None
     
-    start_s = start_bp.time_s
-    end_s = end_bp.time_s
+    # Try combinations of start/end boundaries to find one that fits duration constraints
+    # Prioritize higher-scored boundaries (they come first in the lists)
+    for start_bp in start_candidates[:10]:  # Top 10 start candidates
+        for end_bp in end_candidates[:10]:  # Top 10 end candidates
+            start_s = start_bp.time_s
+            end_s = end_bp.time_s
+            clip_duration = end_s - start_s
+            
+            if clip_duration >= clip_cfg.min_seconds and clip_duration <= clip_cfg.max_seconds:
+                # Found a valid combination
+                start_s = max(0.0, min(duration_s, start_s))
+                end_s = max(0.0, min(duration_s, end_s))
+                
+                if end_s > start_s:
+                    return {
+                        "start_s": float(start_s),
+                        "end_s": float(end_s),
+                        "used_boundary_graph": True,
+                    }
     
-    # Validate duration constraints
-    clip_duration = end_s - start_s
-    
-    if clip_duration < clip_cfg.min_seconds or clip_duration > clip_cfg.max_seconds:
-        return None
-    
-    # Ensure bounds are within video
-    start_s = max(0.0, min(duration_s, start_s))
-    end_s = max(0.0, min(duration_s, end_s))
-    
-    if end_s <= start_s:
-        return None
-    
-    return {
-        "start_s": float(start_s),
-        "end_s": float(end_s),
-        "used_boundary_graph": True,
-    }
+    return None
 
 
 def shape_clip_bounds(
@@ -398,6 +399,210 @@ def shape_clip_bounds(
     }
 
 
+# ==============================================================================
+# LLM Semantic Scoring for Highlight Candidates
+# ==============================================================================
+
+import json
+import logging
+import re as _re
+
+_highlight_logger = logging.getLogger(__name__)
+
+LLM_HIGHLIGHT_SYSTEM_PROMPT = """You are an expert video editor analyzing highlight candidates for a gaming/streaming video.
+
+Your task is to evaluate candidate moments based on their transcript content and assign semantic scores.
+
+Score each candidate from 0.0 to 1.0 based on:
+- Excitement/energy in the speech (reactions, exclamations)
+- Entertainment value (funny, surprising, impressive moments)
+- Quotability (memorable phrases viewers might share)
+- Context completeness (does it tell a mini-story or capture a full moment?)
+
+Output ONLY valid JSON. No explanations outside the JSON."""
+
+
+def _build_llm_highlight_prompt(
+    candidates: List[Dict[str, Any]],
+    transcript_segments: List[Dict[str, Any]],
+    chat_context: Optional[str] = None,
+) -> str:
+    """Build prompt for LLM to semantically score highlight candidates."""
+    import bisect
+    
+    # Pre-sort segments by start time for faster lookup
+    sorted_segments = sorted(transcript_segments, key=lambda s: s.get("start", 0.0))
+    seg_starts = [s.get("start", 0.0) for s in sorted_segments]
+    
+    # Get transcript text for each candidate's time window
+    candidate_data = []
+    for cand in candidates:
+        start_s = cand.get("start_s", 0.0)
+        end_s = cand.get("end_s", 0.0)
+        
+        # Use binary search to find relevant segments (much faster for large transcripts)
+        # Find first segment that could overlap (starts before end_s)
+        start_idx = bisect.bisect_left(seg_starts, start_s)
+        # Go back a bit to catch segments that started before but extend into our window
+        start_idx = max(0, start_idx - 5)
+        
+        relevant_text = []
+        for i in range(start_idx, len(sorted_segments)):
+            seg = sorted_segments[i]
+            seg_start = seg.get("start", 0.0)
+            seg_end = seg.get("end", 0.0)
+            
+            # If segment starts after our window ends, we're done
+            if seg_start > end_s:
+                break
+            
+            # Check for overlap
+            if seg_end >= start_s and seg_start <= end_s:
+                relevant_text.append(seg.get("text", "").strip())
+        
+        candidate_data.append({
+            "rank": cand.get("rank", 0),
+            "start_s": round(start_s, 1),
+            "end_s": round(end_s, 1),
+            "duration_s": round(end_s - start_s, 1),
+            "signal_score": round(cand.get("score", 0.0), 2),
+            "transcript": " ".join(relevant_text)[:500],  # Limit length
+            "breakdown": {
+                k: round(v, 2) if isinstance(v, (int, float)) else v 
+                for k, v in cand.get("breakdown", {}).items()
+            },
+        })
+    
+    prompt_data = {
+        "task": "Score highlight candidates by semantic/entertainment value",
+        "candidates": candidate_data,
+    }
+    
+    if chat_context:
+        prompt_data["chat_context"] = chat_context[:300]
+    
+    prompt = f"""Analyze these highlight candidates and score them by entertainment value.
+
+Input:
+{json.dumps(prompt_data, indent=2)}
+
+For each candidate, evaluate the transcript content and assign a semantic_score (0.0-1.0).
+Higher scores for: exciting reactions, funny moments, impressive plays, quotable phrases.
+Lower scores for: mundane commentary, incomplete thoughts, boring content.
+
+Output JSON array with one object per candidate:
+[
+  {{"rank": 1, "semantic_score": 0.8, "reason": "brief explanation", "best_quote": "short quotable phrase"}},
+  ...
+]
+
+Respond with ONLY the JSON array:"""
+    
+    return prompt
+
+
+def _parse_llm_highlight_scores(
+    response_text: str,
+    num_candidates: int,
+) -> Dict[int, Dict[str, Any]]:
+    """Parse LLM response into semantic scores by rank.
+    
+    Returns: Dict mapping rank -> {"semantic_score": float, "reason": str, "best_quote": str}
+    """
+    result = {}
+    
+    try:
+        # Try to parse as JSON
+        text = response_text.strip()
+        
+        # Handle markdown code blocks
+        if "```" in text:
+            match = _re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, _re.DOTALL)
+            if match:
+                text = match.group(1).strip()
+        
+        # Try to find JSON array
+        if not text.startswith("["):
+            match = _re.search(r"\[.*\]", text, _re.DOTALL)
+            if match:
+                text = match.group(0)
+        
+        scores = json.loads(text)
+        
+        if isinstance(scores, list):
+            for item in scores:
+                if isinstance(item, dict) and "rank" in item:
+                    rank = int(item["rank"])
+                    result[rank] = {
+                        "semantic_score": float(item.get("semantic_score", 0.5)),
+                        "reason": str(item.get("reason", "")),
+                        "best_quote": str(item.get("best_quote", "")),
+                    }
+    except (json.JSONDecodeError, ValueError, KeyError) as e:
+        _highlight_logger.warning(f"Failed to parse LLM highlight scores: {e}")
+    
+    return result
+
+
+def compute_llm_semantic_scores(
+    candidates: List[Dict[str, Any]],
+    proj: "Project",
+    llm_complete: Callable[[str], str],
+    *,
+    max_candidates: int = 20,
+) -> Dict[int, Dict[str, Any]]:
+    """Use LLM to compute semantic scores for highlight candidates.
+    
+    Args:
+        candidates: List of candidate dicts with start_s, end_s, score, breakdown
+        proj: Project instance for accessing transcript
+        llm_complete: Function that takes prompt string and returns response string
+        max_candidates: Maximum candidates to send to LLM (for token limits)
+        
+    Returns:
+        Dict mapping candidate rank -> {"semantic_score": float, "reason": str, "best_quote": str}
+    """
+    from .analysis_transcript import load_transcript
+    
+    # Load transcript
+    transcript = load_transcript(proj)
+    if transcript is None:
+        _highlight_logger.info("No transcript available for LLM semantic scoring")
+        return {}
+    
+    # Get transcript segments as dicts
+    transcript_segments = [
+        {"start": seg.start, "end": seg.end, "text": seg.text}
+        for seg in transcript.segments
+    ]
+    
+    # Limit candidates for LLM
+    candidates_to_score = candidates[:max_candidates]
+    
+    if not candidates_to_score:
+        return {}
+    
+    # Build prompt
+    prompt = _build_llm_highlight_prompt(candidates_to_score, transcript_segments)
+    
+    try:
+        prompt_len = len(prompt)
+        _highlight_logger.info(f"Requesting LLM semantic scores for {len(candidates_to_score)} candidates (prompt: {prompt_len} chars)")
+        
+        import time as _t
+        start = _t.time()
+        response = llm_complete(prompt)
+        elapsed = _t.time() - start
+        
+        _highlight_logger.info(f"LLM responded in {elapsed:.1f}s ({len(response)} chars)")
+        scores = _parse_llm_highlight_scores(response, len(candidates_to_score))
+        _highlight_logger.info(f"LLM returned semantic scores for {len(scores)} candidates")
+        return scores
+    except Exception as e:
+        _highlight_logger.warning(f"LLM semantic scoring failed: {e}")
+        return {}
+
+
 def compute_highlights_analysis(
     proj: Project,
     *,
@@ -408,8 +613,27 @@ def compute_highlights_analysis(
     audio_events_cfg: Optional[Dict[str, Any]] = None,
     include_chat: bool = True,
     include_audio_events: bool = True,
+    llm_complete: Optional[Callable[[str], str]] = None,
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
+    """Compute highlight analysis with optional LLM semantic scoring.
+    
+    Args:
+        proj: Project instance
+        audio_cfg: Audio analysis config
+        motion_cfg: Motion analysis config  
+        scenes_cfg: Scenes analysis config
+        highlights_cfg: Highlights config with weights, clip settings, etc.
+        audio_events_cfg: Audio events (laughter, applause) config
+        include_chat: Whether to include chat signal
+        include_audio_events: Whether to include audio events signal
+        llm_complete: Optional LLM completion function for semantic scoring
+        on_progress: Optional progress callback
+        
+    Returns:
+        Dict with candidates, weights, config used, etc.
+    """
+    start_time = _time.time()
     proj_data = get_project_data(proj)
 
     hop_s = float(audio_cfg.get("hop_seconds", 0.5))
@@ -479,11 +703,17 @@ def compute_highlights_analysis(
                 on_progress=None,
             )
 
+    if on_progress:
+        on_progress(0.20)  # Done loading dependencies
+
     audio_data = load_npz(proj.audio_features_path)
     audio_scores = audio_data.get("scores")
     if audio_scores is None:
         raise ValueError("audio_features.npz missing scores")
     audio_scores = audio_scores.astype(np.float64)
+
+    if on_progress:
+        on_progress(0.25)
 
     motion_data = load_npz(proj.motion_features_path)
     motion_scores = motion_data.get("scores")
@@ -523,14 +753,24 @@ def compute_highlights_analysis(
     if include_audio_events:
         # Fix #12: Auto-compute audio events if missing
         if not proj.audio_events_features_path.exists() and audio_events_cfg is not None:
+            # Check video duration - skip auto-compute for long videos (>1 hour)
+            # Audio events ML inference can take 30+ minutes for 4-hour videos
             try:
                 from .analysis_audio_events import compute_audio_events_analysis, AudioEventsConfig
                 if on_progress:
                     on_progress(0.65)
+                
+                # Create a sub-progress callback to scale audio events progress (0-0.85) into (0.65-0.85)
+                def audio_events_progress(p: float) -> None:
+                    if on_progress:
+                        # Scale: 0.0 -> 0.65, 0.85 -> 0.82
+                        scaled = 0.65 + p * 0.20
+                        on_progress(min(0.85, scaled))
+                
                 compute_audio_events_analysis(
                     proj,
                     cfg=AudioEventsConfig.from_dict(audio_events_cfg),
-                    on_progress=None,
+                    on_progress=audio_events_progress,
                 )
             except Exception:
                 pass  # Continue without audio events if computation fails
@@ -738,6 +978,9 @@ def compute_highlights_analysis(
     if skip_start_frames > 0 and skip_start_frames < len(scores_for_peaks):
         scores_for_peaks[:skip_start_frames] = -np.inf
 
+    if on_progress:
+        on_progress(0.50)  # Done with signal fusion
+
     min_gap_frames = max(1, int(round(float(highlights_cfg.get("min_gap_seconds", 15.0)) / hop_s)))
     min_peak_score = float(highlights_cfg.get("min_peak_score", 0.0))
     peak_idxs = pick_top_peaks(
@@ -746,6 +989,9 @@ def compute_highlights_analysis(
         min_gap_frames=min_gap_frames,
         min_score=min_peak_score,
     )
+
+    if on_progress:
+        on_progress(0.55)  # Done picking peaks
 
     scene_cuts = []
     snap_window_s = float(scenes_cfg.get("snap_window_seconds", 0.0))
@@ -796,6 +1042,15 @@ def compute_highlights_analysis(
         end_s = bounds["end_s"]
         if end_s - start_s < max(1.0, clip_cfg.min_seconds * 0.5):
             continue
+        
+        # Compute weighted breakdown contributions (what actually goes into score)
+        weighted_audio = float(term_audio[idx])
+        weighted_motion = float(term_motion[idx])
+        weighted_chat = float(term_chat[idx]) if chat_used else 0.0
+        weighted_events = float(term_audio_events[idx]) if audio_events_used else 0.0
+        weighted_speech = float(term_speech[idx]) if speech_used else 0.0
+        weighted_reaction = float(term_reaction[idx]) if reaction_used else 0.0
+        
         raw_candidates.append(
             {
                 "rank": rank,
@@ -805,6 +1060,15 @@ def compute_highlights_analysis(
                 "score": float(combined_scores[idx]),
                 "used_boundary_graph": bounds.get("used_boundary_graph", False),
                 "breakdown": {
+                    "audio": weighted_audio,
+                    "motion": weighted_motion,
+                    "chat": weighted_chat,
+                    "audio_events": weighted_events,
+                    "speech": weighted_speech,
+                    "reaction": weighted_reaction,
+                },
+                # Also keep raw signals for debugging
+                "raw_signals": {
                     "audio": float(audio_scores[idx]),
                     "motion": float(motion_resampled[idx]),
                     "chat": float(chat_scores[idx]) if chat_used else 0.0,
@@ -831,6 +1095,62 @@ def compute_highlights_analysis(
             # Re-assign rank based on filtered position
             cand["rank"] = len(candidates) + 1
             candidates.append(cand)
+
+    if on_progress:
+        on_progress(0.70)  # Done shaping candidates
+
+    # LLM Semantic Scoring (optional enhancement)
+    llm_semantic_used = False
+    llm_semantic_scores: Dict[int, Dict[str, Any]] = {}
+    
+    if llm_complete is not None and candidates:
+        if on_progress:
+            on_progress(0.75)  # Starting LLM scoring
+        
+        try:
+            _highlight_logger.info(f"[highlights] Starting LLM semantic scoring for {len(candidates)} candidates...")
+            llm_semantic_scores = compute_llm_semantic_scores(
+                candidates=candidates,
+                proj=proj,
+                llm_complete=llm_complete,
+                max_candidates=int(highlights_cfg.get("llm_max_candidates", 15)),
+            )
+            
+            if on_progress:
+                on_progress(0.90)  # LLM scoring done
+            
+            if llm_semantic_scores:
+                llm_semantic_used = True
+                # Blend semantic score with signal score
+                semantic_weight = float(highlights_cfg.get("llm_semantic_weight", 0.3))
+                
+                for cand in candidates:
+                    rank = cand.get("rank", 0)
+                    if rank in llm_semantic_scores:
+                        llm_data = llm_semantic_scores[rank]
+                        semantic_score = llm_data.get("semantic_score", 0.5)
+                        signal_score = cand.get("score", 0.0)
+                        
+                        # Blend: final = (1 - w) * signal + w * semantic (normalized to signal scale)
+                        # Semantic is 0-1, signal is z-score (~-2 to +4 typically)
+                        # Convert semantic to z-score scale: (semantic - 0.5) * 4 gives ~-2 to +2
+                        semantic_z = (semantic_score - 0.5) * 4.0
+                        blended_score = (1.0 - semantic_weight) * signal_score + semantic_weight * semantic_z
+                        
+                        cand["score_signal"] = signal_score
+                        cand["score_semantic"] = semantic_score
+                        cand["score"] = blended_score
+                        cand["llm_reason"] = llm_data.get("reason", "")
+                        cand["llm_quote"] = llm_data.get("best_quote", "")
+                
+                # Re-sort by blended score and re-rank
+                candidates.sort(key=lambda c: c.get("score", 0.0), reverse=True)
+                for i, cand in enumerate(candidates, start=1):
+                    cand["rank"] = i
+                    
+                _highlight_logger.info(f"LLM semantic scoring applied to {len(llm_semantic_scores)} candidates")
+        except Exception as e:
+            _highlight_logger.warning(f"LLM semantic scoring failed, continuing without: {e}")
 
     save_npz(
         proj.highlights_features_path,
@@ -878,6 +1198,7 @@ def compute_highlights_analysis(
             "speech": speech_used,
             "reaction": reaction_used,
             "boundary_graph": boundary_graph is not None,
+            "llm_semantic": llm_semantic_used,
         },
         "signal_processing": {
             "relu_zscores": use_relu,
@@ -899,6 +1220,7 @@ def compute_highlights_analysis(
             "candidates_after_filter": len(candidates),
         },
         "candidates": candidates,
+        "elapsed_seconds": _time.time() - start_time,
         "generated_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
     }
 

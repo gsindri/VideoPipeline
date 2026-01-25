@@ -13,11 +13,12 @@ from fastapi.staticfiles import StaticFiles
 
 from ..analysis_audio import compute_audio_analysis
 from ..analysis_audio_events import AudioEventsConfig, compute_audio_events_analysis, load_audio_events_features
+from ..analysis_chapters import ChapterConfig, compute_chapters_analysis
 from ..analysis_highlights import compute_highlights_analysis
 from ..analysis_transcript import TranscriptConfig, compute_transcript_analysis, load_transcript
 from ..analysis_speech_features import SpeechFeatureConfig, compute_speech_features, load_speech_features
 from ..analysis_reaction_audio import ReactionAudioConfig, compute_reaction_audio_features
-from ..rerank_candidates import RerankConfig, compute_reranked_candidates
+from ..enrich_candidates import EnrichConfig, enrich_candidates
 from ..analysis_silence import SilenceConfig, compute_silence_analysis
 from ..analysis_sentences import SentenceConfig, compute_sentences_analysis
 from ..analysis_chat_boundaries import ChatBoundaryConfig, compute_chat_boundaries_analysis
@@ -128,11 +129,21 @@ def create_app(
         
         backends = get_available_backends()
         
+        # Recommended: openai_whisper with GPU (supports AMD ROCm + NVIDIA CUDA)
+        if backends.get("openai_whisper_gpu"):
+            recommended = "openai_whisper"
+        elif backends.get("openai_whisper"):
+            recommended = "openai_whisper"
+        elif backends.get("faster_whisper"):
+            recommended = "faster_whisper"
+        else:
+            recommended = "whispercpp"
+        
         return JSONResponse({
             "transcription": {
                 "backends": backends,
-                "recommended": "whispercpp" if backends.get("whispercpp") else "faster_whisper",
-                "gpu_available": backends.get("whispercpp_gpu") or backends.get("faster_whisper_gpu"),
+                "recommended": recommended,
+                "gpu_available": backends.get("openai_whisper_gpu") or backends.get("faster_whisper_gpu") or backends.get("whispercpp_gpu"),
             },
         })
 
@@ -150,6 +161,57 @@ def create_app(
             return JSONResponse({"active": False})
         proj = ctx.require_project()
         data = get_project_data(proj)
+        
+        # Add chat AI analysis status
+        chat_ai_status = None
+        if proj.chat_db_path.exists():
+            try:
+                from ..chat.store import ChatStore
+                store = ChatStore(proj.chat_db_path)
+                
+                # Check for laugh tokens (AI-learned emotes)
+                laugh_tokens_json = store.get_meta("laugh_tokens_json", "[]")
+                laugh_tokens = json.loads(laugh_tokens_json) if laugh_tokens_json else []
+                laugh_source = store.get_meta("laugh_tokens_source", "")
+                laugh_updated = store.get_meta("laugh_tokens_updated_at", "")
+                
+                # Get LLM-learned tokens specifically (vs seed tokens)
+                llm_learned_json = store.get_meta("laugh_tokens_llm_learned", "[]")
+                llm_learned = json.loads(llm_learned_json) if llm_learned_json else []
+                
+                # Get message counts
+                total_messages = store.get_message_count()
+                
+                # Get additional stats from project.json if available
+                chat_analysis = data.get("analysis", {}).get("chat", {})
+                newly_learned_count = chat_analysis.get("newly_learned_count", 0)
+                newly_learned_tokens = chat_analysis.get("newly_learned_tokens", [])
+                loaded_from_global = chat_analysis.get("loaded_from_global", 0)
+                
+                chat_ai_status = {
+                    "has_chat": total_messages > 0,
+                    "message_count": total_messages,
+                    "laugh_tokens": laugh_tokens,
+                    "laugh_tokens_count": len(laugh_tokens),
+                    "llm_learned_tokens": llm_learned,
+                    "llm_learned_count": len(llm_learned),
+                    "newly_learned_count": newly_learned_count,
+                    "newly_learned_tokens": newly_learned_tokens,
+                    "loaded_from_global": loaded_from_global,
+                    "laugh_source": laugh_source,  # "llm" or "seed" or ""
+                    "laugh_updated_at": laugh_updated,
+                    "ai_analyzed": laugh_source.startswith("llm") if laugh_source else False,
+                }
+                store.close()
+            except Exception as e:
+                import traceback
+                print(f"[chat_ai_status] Error reading chat DB: {e}")
+                traceback.print_exc()
+                chat_ai_status = {"has_chat": False, "error": f"Failed to read chat database: {e}"}
+        else:
+            chat_ai_status = {"has_chat": False}
+        
+        data["chat_ai_status"] = chat_ai_status
         return JSONResponse({"active": True, "project": data})
 
     @app.post("/api/project/reset_analysis")
@@ -177,6 +239,7 @@ def create_app(
             proj.motion_features_path,
             proj.highlights_features_path,
             proj.scenes_path,
+            proj.chapters_path,
             proj.speech_features_path,
             proj.reaction_audio_features_path,
             proj.audio_events_features_path,
@@ -576,16 +639,28 @@ def create_app(
 
         def runner() -> None:
             import concurrent.futures
+            import logging
+            log = logging.getLogger("videopipeline.studio")
             
             # Shared state for progress tracking
             current_chat_status = {"status": "pending", "message": "Waiting..."}
+            transcript_status = {"status": "pending", "progress": 0, "audio_path": None}
+            
+            # Cancellation support - raise this exception from callbacks to abort
+            class CancelledError(Exception):
+                pass
+            
+            def check_cancel():
+                """Check if job was cancelled, raise CancelledError if so."""
+                if job.cancel_requested:
+                    raise CancelledError("Job cancelled by user")
             
             JOB_MANAGER._set(
                 job, 
                 status="running", 
                 progress=0.0, 
                 message="Starting download...",
-                result={"video_status": "downloading", "chat_status": "pending"}
+                result={"video_status": "downloading", "chat_status": "pending", "transcript_status": "pending", "transcript_progress": 0}
             )
 
             video_result = None
@@ -593,11 +668,16 @@ def create_app(
             chat_error = None
 
             def on_video_progress(frac: float, msg: str) -> None:
+                # Check for cancellation
+                check_cancel()
+                
                 # Video download is 0-90%, chat is 90-100%
-                # Build combined message
+                # Build combined message for main status line
                 chat_info = ""
                 if current_chat_status["status"] == "downloading":
-                    chat_info = " | 💬 Chat: downloading..."
+                    chat_pct = current_chat_status.get("progress", 0)
+                    chat_pct_str = f"{int(chat_pct * 100)}%" if chat_pct > 0 else ""
+                    chat_info = f" | 💬 Chat: {chat_pct_str}" if chat_pct_str else " | 💬 Chat: starting..."
                 elif current_chat_status["status"] == "success":
                     chat_info = " | 💬 Chat: ✓ done"
                 elif current_chat_status["status"] == "failed":
@@ -609,15 +689,36 @@ def create_app(
                 elif current_chat_status["status"] == "pending" and "twitch.tv/videos/" in url.lower():
                     chat_info = " | 💬 Chat: pending"
                 
+                # Build transcript info for message
+                transcript_info = ""
+                ts = transcript_status.get("status", "pending")
+                if ts == "downloading_audio":
+                    transcript_info = " | 🎙️ Audio: downloading..."
+                elif ts == "transcribing":
+                    tp = transcript_status.get("progress", 0)
+                    transcript_info = f" | 🎙️ Transcribing: {int(tp * 100)}%"
+                elif ts == "complete":
+                    transcript_info = " | 🎙️ Transcript: ✓ done"
+                elif ts == "failed":
+                    transcript_info = " | 🎙️ Transcript: ✗ failed"
+                
                 JOB_MANAGER._set(
                     job, 
                     progress=frac * 0.9, 
-                    message=f"{msg}{chat_info}",
+                    message=f"{msg}{chat_info}{transcript_info}",
                     result={
                         "video_status": "downloading",
                         "video_progress": frac,
                         "chat_status": current_chat_status["status"],
+                        "chat_progress": current_chat_status.get("progress", 0),
                         "chat_message": current_chat_status.get("message", ""),
+                        "chat_messages_count": current_chat_status.get("messages_count", 0),
+                        "transcript_status": transcript_status.get("status", "pending"),
+                        "transcript_progress": transcript_status.get("progress", 0),
+                        "audio_progress": transcript_status.get("audio_progress", 0),
+                        "audio_total_bytes": transcript_status.get("audio_total_bytes"),
+                        "audio_downloaded_bytes": transcript_status.get("audio_downloaded_bytes"),
+                        "audio_speed": transcript_status.get("audio_speed"),
                     }
                 )
 
@@ -670,12 +771,24 @@ def create_app(
                     # Update status to downloading
                     current_chat_status["status"] = "downloading"
                     current_chat_status["message"] = "Downloading Twitch chat..."
+                    current_chat_status["progress"] = 0
+                    current_chat_status["messages_count"] = 0
                     
                     def on_chat_progress(frac: float, msg: str) -> None:
+                        # Check for cancellation
+                        check_cancel()
+                        
                         current_chat_status["message"] = msg
+                        current_chat_status["progress"] = frac
+                        
+                        # Try to extract message count from status text
+                        import re as re_mod
+                        count_match = re_mod.search(r"(\d+)\s*messages?", msg, re_mod.IGNORECASE)
+                        if count_match:
+                            current_chat_status["messages_count"] = int(count_match.group(1))
+                        
                         # Update job progress if video is done (progress > 90%)
                         # Chat download is 90-95%, import is 95-100%
-                        pct_display = int(frac * 100)
                         JOB_MANAGER._set(
                             job,
                             progress=0.90 + frac * 0.05,
@@ -685,11 +798,18 @@ def create_app(
                                 "chat_status": "downloading",
                                 "chat_progress": frac,
                                 "chat_message": msg,
+                                "chat_messages_count": current_chat_status.get("messages_count", 0),
+                                "transcript_status": transcript_status.get("status", "pending"),
+                                "transcript_progress": transcript_status.get("progress", 0),
                             }
                         )
                     
                     log.info(f"[CHAT DEBUG] Calling dl_chat...")
-                    dl_chat(url, chat_temp_path, on_progress=on_chat_progress)
+                    
+                    def check_cancel_chat() -> bool:
+                        return job.cancel_requested
+                    
+                    dl_chat(url, chat_temp_path, on_progress=on_chat_progress, check_cancel=check_cancel_chat)
                     log.info(f"[CHAT DEBUG] dl_chat completed")
                     
                     # Check if file was created
@@ -734,36 +854,245 @@ def create_app(
                         cp = Path(chat_result["temp_path"])
                         if cp.exists():
                             cp.unlink()
+                    # Also clean up temp audio file if it exists
+                    audio_path = transcript_status.get("audio_path")
+                    if audio_path:
+                        ap = Path(audio_path)
+                        if ap.exists():
+                            ap.unlink()
                 except Exception:
                     pass  # Best effort cleanup
 
+            # Track parallel transcription (transcript_status already initialized above)
+            transcript_result = {"status": "skipped"}
+            
+            def download_audio_for_transcript():
+                """Download audio track for early transcription start."""
+                nonlocal transcript_status
+                import logging
+                log = logging.getLogger("videopipeline.studio")
+                
+                # Check if transcription is enabled
+                speech_cfg = ctx.profile.get("analysis", {}).get("speech", {})
+                if not speech_cfg.get("enabled", True):
+                    log.info("[AUDIO] Transcription disabled, skipping audio download")
+                    transcript_status["status"] = "disabled"
+                    return None
+                
+                try:
+                    from ..ingest.ytdlp_runner import download_audio_only, _default_downloads_dir
+                    
+                    log.info("[AUDIO] Starting audio-only download for early transcription...")
+                    transcript_status["status"] = "downloading_audio"
+                    
+                    def on_audio_progress(frac: float, msg: str, extra: dict = None) -> None:
+                        # Check for cancellation
+                        check_cancel()
+                        
+                        # Store actual audio download progress (0-100%) separately
+                        transcript_status["audio_progress"] = frac
+                        # Overall transcript progress: audio download is 0-10%, transcription is 10-100%
+                        transcript_status["progress"] = frac * 0.1
+                        if extra:
+                            if extra.get("total_bytes"):
+                                transcript_status["audio_total_bytes"] = extra["total_bytes"]
+                            if extra.get("downloaded_bytes"):
+                                transcript_status["audio_downloaded_bytes"] = extra["downloaded_bytes"]
+                            if extra.get("speed"):
+                                transcript_status["audio_speed"] = extra["speed"]
+                    
+                    audio_path = download_audio_only(url, on_progress=on_audio_progress)
+                    
+                    if audio_path and audio_path.exists():
+                        log.info(f"[AUDIO] Audio downloaded: {audio_path}")
+                        transcript_status["audio_path"] = str(audio_path)
+                        transcript_status["status"] = "audio_ready"
+                        return audio_path
+                    else:
+                        log.warning("[AUDIO] Audio download returned no file")
+                        transcript_status["status"] = "audio_failed"
+                        return None
+                        
+                except Exception as e:
+                    log.warning(f"[AUDIO] Audio download failed: {e}")
+                    transcript_status["status"] = "audio_failed"
+                    return None
+            
+            def run_early_transcription(audio_path: Path):
+                """Run transcription on downloaded audio while video downloads."""
+                nonlocal transcript_result, transcript_status
+                import logging
+                log = logging.getLogger("videopipeline.studio")
+                
+                try:
+                    from ..analysis_transcript import TranscriptConfig, compute_transcript_analysis_from_audio
+                    
+                    speech_cfg = ctx.profile.get("analysis", {}).get("speech", {})
+                    transcript_config = TranscriptConfig(
+                        backend=str(speech_cfg.get("backend", "auto")),
+                        model_size=str(speech_cfg.get("model_size", "small.en")),
+                        language=speech_cfg.get("language"),
+                        sample_rate=int(speech_cfg.get("sample_rate", 16000)),
+                        device=str(speech_cfg.get("device", "cpu")),
+                        compute_type=str(speech_cfg.get("compute_type", "int8")),
+                        vad_filter=bool(speech_cfg.get("vad_filter", True)),
+                        word_timestamps=bool(speech_cfg.get("word_timestamps", True)),
+                        use_gpu=bool(speech_cfg.get("use_gpu", False)),
+                        threads=int(speech_cfg.get("threads", 0)),
+                        n_processors=int(speech_cfg.get("n_processors", 1)),
+                        strict=bool(speech_cfg.get("strict", False)),
+                    )
+                    
+                    log.info(f"[TRANSCRIPT] Starting early transcription from audio...")
+                    transcript_status["status"] = "transcribing"
+                    
+                    def on_transcript_progress(frac: float) -> None:
+                        # Check for cancellation
+                        check_cancel()
+                        
+                        # Transcript is 10-100% of the transcript phase
+                        transcript_status["progress"] = 0.1 + frac * 0.9
+                    
+                    result = compute_transcript_analysis_from_audio(
+                        audio_path,
+                        cfg=transcript_config,
+                        on_progress=on_transcript_progress,
+                    )
+                    
+                    transcript_status["status"] = "complete"
+                    transcript_status["progress"] = 1.0
+                    transcript_result = {"status": "success", "data": result}
+                    log.info(f"[TRANSCRIPT] Early transcription complete: {result.get('segment_count', 0)} segments")
+                    return result
+                    
+                except ImportError:
+                    # compute_transcript_analysis_from_audio doesn't exist yet
+                    log.info("[TRANSCRIPT] Early transcription not available, will run after video download")
+                    transcript_status["status"] = "deferred"
+                    return None
+                except Exception as e:
+                    log.warning(f"[TRANSCRIPT] Early transcription failed: {e}")
+                    transcript_status["status"] = "failed"
+                    transcript_result = {"status": "failed", "error": str(e)}
+                    return None
+
+            # Track early transcript result for saving after project is created
+            early_transcript_result = None
+            
             try:
-                # Run video and chat downloads in parallel
-                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                # Run video, chat, and audio downloads in parallel
+                # Audio finishes first -> start transcription while video continues
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                     video_future = executor.submit(download_video)
                     chat_future = executor.submit(download_chat)
+                    audio_future = executor.submit(download_audio_for_transcript)
                     
-                    # Wait for both to complete, checking for cancellation
+                    transcript_future = None
+                    audio_path_for_transcript = None
+                    
+                    # Wait for all to complete, checking for cancellation
+                    # and starting transcript when audio is ready
                     while True:
                         if job.cancel_requested:
                             # Job was cancelled - clean up and exit
                             cleanup_downloads()
                             return
                         
-                        # Check if futures are done
+                        # Check if audio is done and we haven't started transcript yet
+                        if audio_future and audio_future.done() and transcript_future is None:
+                            try:
+                                audio_path_for_transcript = audio_future.result()
+                                if audio_path_for_transcript:
+                                    log.info(f"[DOWNLOAD] Audio ready, starting early transcription...")
+                                    transcript_future = executor.submit(run_early_transcription, audio_path_for_transcript)
+                                else:
+                                    log.info(f"[DOWNLOAD] Audio download skipped or failed")
+                            except Exception as e:
+                                log.warning(f"[DOWNLOAD] Audio download error: {e}")
+                        
+                        # Check if all required futures are done
                         video_done = video_future.done()
                         chat_done = chat_future.done()
+                        transcript_done = transcript_future is None or transcript_future.done()
                         
-                        if video_done and chat_done:
+                        if video_done and chat_done and transcript_done:
                             break
+                        
+                        # Update UI with current transcript progress while waiting
+                        # This is important when video finishes before transcription
+                        if video_done and not transcript_done:
+                            ts = transcript_status.get("status", "pending")
+                            if ts == "transcribing":
+                                tp = transcript_status.get("progress", 0)
+                                # Build chat status for message
+                                chat_stat = current_chat_status.get("status", "pending")
+                                if chat_stat == "success":
+                                    chat_msg = "💬 Chat: ✓ done"
+                                elif chat_stat == "skipped":
+                                    chat_msg = ""  # Don't show for non-Twitch
+                                elif chat_stat == "downloading":
+                                    chat_msg = "💬 Chat: downloading..."
+                                elif chat_stat == "failed":
+                                    chat_msg = "💬 Chat: ✗ failed"
+                                else:
+                                    chat_msg = ""
+                                
+                                msg_parts = ["Download complete!"]
+                                if chat_msg:
+                                    msg_parts.append(chat_msg)
+                                msg_parts.append(f"🎙️ Transcribing: {int(tp * 100)}%")
+                                
+                                # Show transcript progress: video done (90%), transcript running
+                                # Keep overall progress at 90% until transcript finishes
+                                JOB_MANAGER._set(
+                                    job,
+                                    progress=0.90,
+                                    message=" | ".join(msg_parts),
+                                    result={
+                                        "video_status": "complete",
+                                        "video_progress": 1.0,
+                                        "chat_status": current_chat_status["status"],
+                                        "chat_progress": current_chat_status.get("progress", 0),
+                                        "chat_message": current_chat_status.get("message", ""),
+                                        "chat_messages_count": current_chat_status.get("messages_count", 0),
+                                        "transcript_status": "transcribing",
+                                        "transcript_progress": tp,
+                                    }
+                                )
                         
                         # Small sleep to avoid busy-waiting
                         import time
                         time.sleep(0.5)
                     
-                    # Get results (will raise if video download failed)
-                    video_future.result()
-                    chat_future.result()  # Chat failures are non-fatal
+                    # Get results (will raise if video download failed or cancelled)
+                    video_future.result()  # Raises CancelledError if cancelled
+                    
+                    # Chat failures are non-fatal, but propagate cancellation
+                    try:
+                        chat_future.result()
+                    except CancelledError:
+                        raise  # Re-raise cancellation
+                    except Exception:
+                        pass  # Chat failures are non-fatal
+                    
+                    # Get transcript result if available
+                    if transcript_future:
+                        try:
+                            early_transcript_result = transcript_future.result()
+                            if early_transcript_result:
+                                log.info(f"[DOWNLOAD] Early transcription completed successfully")
+                        except CancelledError:
+                            raise  # Re-raise cancellation
+                        except Exception as e:
+                            log.warning(f"[DOWNLOAD] Early transcription error: {e}")
+                    
+                    # Clean up temp audio file
+                    if audio_path_for_transcript and Path(audio_path_for_transcript).exists():
+                        try:
+                            Path(audio_path_for_transcript).unlink()
+                            log.info(f"[DOWNLOAD] Cleaned up temp audio file")
+                        except Exception:
+                            pass
 
                 # Check cancellation again after downloads complete
                 if job.cancel_requested:
@@ -803,6 +1132,8 @@ def create_app(
                                 "video_status": "complete",
                                 "chat_status": "importing",
                                 "chat_message": "Reading chat file...",
+                                "transcript_status": transcript_status.get("status", "pending"),
+                                "transcript_progress": transcript_status.get("progress", 0),
                             }
                         )
                         try:
@@ -817,6 +1148,8 @@ def create_app(
                                     "video_status": "complete",
                                     "chat_status": "importing",
                                     "chat_message": "Parsing messages...",
+                                    "transcript_status": transcript_status.get("status", "pending"),
+                                    "transcript_progress": transcript_status.get("progress", 0),
                                 }
                             )
                             
@@ -828,17 +1161,115 @@ def create_app(
                             chat_db = proj.chat_db_path
                             log.info(f"[CHAT DEBUG] chat_db_path: {chat_db}, exists: {chat_db.exists()}")
                             
+                            # Now compute chat features with LLM
+                            JOB_MANAGER._set(
+                                job,
+                                progress=0.97,
+                                message="Learning chat emotes with AI...",
+                                result={
+                                    "video_status": "complete",
+                                    "chat_status": "ai_learning",
+                                    "chat_message": "Learning channel-specific emotes...",
+                                    "transcript_status": transcript_status.get("status", "pending"),
+                                    "transcript_progress": transcript_status.get("progress", 0),
+                                }
+                            )
+                            
+                            try:
+                                from ..chat.features import compute_and_save_chat_features
+                                
+                                hop_s = float(ctx.profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
+                                smooth_s = float(ctx.profile.get("analysis", {}).get("highlights", {}).get("chat_smooth_seconds", 3.0))
+                                
+                                # Get LLM for laugh emote learning
+                                ai_cfg = ctx.profile.get("ai", {}).get("director", {})
+                                llm_complete_fn = None
+                                if ai_cfg.get("enabled", True):
+                                    try:
+                                        from pathlib import Path as P
+                                        from ..ai.llm_server import ensure_llm_server
+                                        from ..ai.llm_client import create_llm_client
+                                        
+                                        endpoint = str(ai_cfg.get("endpoint", "http://127.0.0.1:11435"))
+                                        if ai_cfg.get("auto_start", False):
+                                            server_path = P(ai_cfg.get("server_path", "C:/llama.cpp/llama-server.exe"))
+                                            model_path = P(ai_cfg.get("model_path", "C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf"))
+                                            auto_stop_s = ai_cfg.get("auto_stop_idle_s", 600.0)
+                                            startup_timeout_s = float(ai_cfg.get("startup_timeout_s", 120.0))
+                                            
+                                            log.info(f"[CHAT DEBUG] Auto-starting LLM server (timeout={startup_timeout_s}s)...")
+                                            
+                                            def on_llm_status(msg: str) -> None:
+                                                JOB_MANAGER._set(job, message=msg)
+                                            
+                                            started_endpoint = ensure_llm_server(
+                                                server_path=server_path,
+                                                model_path=model_path,
+                                                port=int(endpoint.split(":")[-1]),
+                                                auto_stop_after_idle_s=auto_stop_s,
+                                                startup_timeout_s=startup_timeout_s,
+                                                on_status=on_llm_status,
+                                            )
+                                            if started_endpoint:
+                                                endpoint = started_endpoint
+                                                log.info(f"[CHAT DEBUG] LLM server started at {endpoint}")
+                                            else:
+                                                log.warning(f"[CHAT DEBUG] LLM server failed to start within {startup_timeout_s}s")
+                                        
+                                        llm_client = create_llm_client(
+                                            endpoint=endpoint,
+                                            cache_dir=proj.analysis_dir,
+                                        )
+                                        if llm_client.is_available():
+                                            log.info(f"[CHAT DEBUG] LLM available for emote learning at {endpoint}")
+                                            def llm_complete_fn(prompt: str) -> str:
+                                                resp = llm_client.complete(prompt, json_mode=True)
+                                                return json.dumps(resp) if isinstance(resp, dict) else str(resp)
+                                        else:
+                                            log.warning(f"[CHAT DEBUG] LLM NOT available at {endpoint}")
+                                    except Exception as e:
+                                        log.warning(f"[CHAT DEBUG] LLM setup failed: {e}")
+                                
+                                def on_feature_status(msg: str) -> None:
+                                    JOB_MANAGER._set(job, message=msg)
+                                
+                                # Extract channel info from URL for global emote persistence
+                                from ..chat.emote_db import get_channel_for_project
+                                channel_info = get_channel_for_project(proj, source_url=url)
+                                channel_id = channel_info[0] if channel_info else None
+                                platform = channel_info[1] if channel_info else "twitch"
+                                
+                                compute_and_save_chat_features(
+                                    proj,
+                                    hop_s=hop_s,
+                                    smooth_s=smooth_s,
+                                    on_status=on_feature_status,
+                                    llm_complete=llm_complete_fn,
+                                    channel_id=channel_id,
+                                    platform=platform,
+                                )
+                                log.info(f"[CHAT DEBUG] Chat features computed")
+                            except Exception as e:
+                                log.warning(f"[CHAT DEBUG] Chat feature computation failed: {e}")
+                                # Non-fatal - features can be computed later during analysis
+                            
                             JOB_MANAGER._set(
                                 job,
                                 progress=0.99,
                                 message="Chat imported successfully",
                                 result={
                                     "video_status": "complete",
-                                    "chat_status": "importing",
+                                    "chat_status": "complete",
                                     "chat_message": "Done!",
+                                    "transcript_status": transcript_status.get("status", "pending"),
+                                    "transcript_progress": transcript_status.get("progress", 0),
                                 }
                             )
                             chat_result["imported"] = True
+                            
+                            # Record successful chat download in project
+                            from ..project import set_chat_config
+                            set_chat_config(proj, download_status="success")
                             
                             # Clean up temp file after successful import
                             try:
@@ -850,12 +1281,42 @@ def create_app(
                             import traceback
                             log.error(f"[CHAT DEBUG] Import exception: {e}\n{traceback.format_exc()}")
                             chat_result["import_error"] = str(e)
+                            # Record failed import status
+                            from ..project import set_chat_config
+                            set_chat_config(proj, download_status="failed", download_error=str(e))
                     else:
                         log.info(f"[CHAT DEBUG] Skipping import - condition not met")
+                        # Record the chat download status
+                        from ..project import set_chat_config
+                        chat_status = chat_result.get("status", "unknown")
+                        if chat_status == "failed":
+                            set_chat_config(proj, download_status="failed", download_error=chat_result.get("message", "Download failed"))
+                        elif chat_status == "skipped":
+                            set_chat_config(proj, download_status="skipped")
+                    
+                    # Save early transcript if we computed one during download
+                    if early_transcript_result:
+                        try:
+                            from ..analysis_transcript import save_transcript_to_project
+                            save_transcript_to_project(proj, early_transcript_result)
+                            log.info(f"[DOWNLOAD] Saved early transcript to project")
+                        except Exception as e:
+                            log.warning(f"[DOWNLOAD] Failed to save early transcript: {e}")
                     
                     result_dict["project"] = get_project_data(proj)
                     result_dict["auto_opened"] = True
                     result_dict["chat"] = chat_result
+                    
+                    # Include transcript status in result
+                    if early_transcript_result:
+                        result_dict["transcript"] = {
+                            "status": "complete",
+                            "segment_count": early_transcript_result.get("segment_count", 0),
+                        }
+                    elif transcript_status.get("status") == "failed":
+                        result_dict["transcript"] = {"status": "failed"}
+                    elif transcript_status.get("status") == "disabled":
+                        result_dict["transcript"] = {"status": "disabled"}
 
                 # Build final message
                 final_msg = "Download complete!"
@@ -876,6 +1337,11 @@ def create_app(
                     result=result_dict,
                 )
 
+            except CancelledError:
+                # Job was cancelled via callback - clean up
+                log.info("[DOWNLOAD] Job cancelled by user")
+                cleanup_downloads()
+                JOB_MANAGER._set(job, status="cancelled", message="Cancelled by user")
             except ImportError as e:
                 if not job.cancel_requested:
                     JOB_MANAGER._set(job, status="failed", message=str(e))
@@ -1139,7 +1605,11 @@ def create_app(
         # Get configurations from profile, allow overrides from body
         speech_cfg = {**analysis_cfg.get("speech", {}), **(body.get("speech") or {})}
         reaction_cfg = {**analysis_cfg.get("reaction_audio", {}), **(body.get("reaction_audio") or {})}
-        rerank_cfg_dict = {**analysis_cfg.get("rerank", {}), **(body.get("rerank") or {})}
+        # Support both "enrich" and legacy "rerank" config keys
+        enrich_cfg_dict = {
+            **analysis_cfg.get("enrich", analysis_cfg.get("rerank", {})),
+            **(body.get("enrich") or body.get("rerank") or {})
+        }
 
         job = JOB_MANAGER.create("analyze_speech")
 
@@ -1176,7 +1646,7 @@ def create_app(
                     JOB_MANAGER._set(job, progress=0.4, message="Extracting speech features...")
                     
                     # Get reaction phrases from config
-                    hook_cfg = rerank_cfg_dict.get("hook", {})
+                    hook_cfg = enrich_cfg_dict.get("hook", {})
                     phrases = hook_cfg.get("phrases", [])
                     
                     speech_feature_config = SpeechFeatureConfig(
@@ -1204,33 +1674,31 @@ def create_app(
                     
                     compute_reaction_audio_features(proj, cfg=reaction_audio_config, on_progress=on_reaction_progress)
 
-                # Step 4: Rerank candidates (if highlights exist)
+                # Step 4: Enrich candidates (if highlights exist)
                 proj_data = get_project_data(proj)
                 has_candidates = bool(proj_data.get("analysis", {}).get("highlights", {}).get("candidates"))
                 
-                if rerank_cfg_dict.get("enabled", True) and has_candidates:
-                    JOB_MANAGER._set(job, progress=0.8, message="Reranking candidates...")
+                if enrich_cfg_dict.get("enabled", True) and has_candidates:
+                    JOB_MANAGER._set(job, progress=0.8, message="Enriching candidates...")
                     
-                    # Build rerank config
-                    hook_cfg = rerank_cfg_dict.get("hook", {})
-                    quote_cfg = rerank_cfg_dict.get("quote", {})
-                    weights = rerank_cfg_dict.get("weights", {})
+                    # Build enrich config (hook/quote text extraction only - no score fusion)
+                    hook_cfg = enrich_cfg_dict.get("hook", {})
+                    quote_cfg = enrich_cfg_dict.get("quote", {})
                     
-                    rerank_config = RerankConfig(
+                    enrich_config = EnrichConfig(
                         enabled=True,
-                        weights=weights if weights else None,
                         hook_max_chars=int(hook_cfg.get("max_chars", 60)),
                         hook_window_seconds=float(hook_cfg.get("window_seconds", 4.0)),
                         quote_max_chars=int(quote_cfg.get("max_chars", 120)),
                         reaction_phrases=hook_cfg.get("phrases", []),
                     )
                     
-                    def on_rerank_progress(frac: float) -> None:
-                        JOB_MANAGER._set(job, progress=0.8 + 0.15 * frac, message="Reranking candidates...")
+                    def on_enrich_progress(frac: float) -> None:
+                        JOB_MANAGER._set(job, progress=0.8 + 0.15 * frac, message="Enriching candidates...")
                     
-                    result = compute_reranked_candidates(proj, cfg=rerank_config, on_progress=on_rerank_progress)
+                    result = enrich_candidates(proj, cfg=enrich_config, on_progress=on_enrich_progress)
                 else:
-                    result = {"message": "No candidates to rerank. Run highlights analysis first."}
+                    result = {"message": "No candidates to enrich. Run highlights analysis first."}
 
                 JOB_MANAGER._set(
                     job,
@@ -1300,21 +1768,52 @@ def create_app(
                 # Step 3: Chat boundaries (if chat available)
                 chat_boundaries_path = proj.analysis_dir / "chat_boundaries.json"
                 if proj.chat_features_path.exists() and not chat_boundaries_path.exists():
-                    JOB_MANAGER._set(job, progress=0.25, message="Detecting chat valleys/bursts...")
+                    JOB_MANAGER._set(job, progress=0.20, message="Detecting chat valleys/bursts...")
                     chat_boundary_cfg = ChatBoundaryConfig(
                         min_valley_gap_s=float(context_cfg.get("boundaries", {}).get("chat_valley_window_s", 5.0)),
                     )
                     compute_chat_boundaries_analysis(proj, cfg=chat_boundary_cfg)
 
+                # Step 3.5: Semantic chapters (if enabled, requires transcript)
+                chapters_cfg_dict = context_cfg.get("chapters", {})
+                chapters_enabled = bool(chapters_cfg_dict.get("enabled", True))
+                chapters_path = proj.chapters_path
+                if chapters_enabled and proj.transcript_path.exists() and not chapters_path.exists():
+                    JOB_MANAGER._set(job, progress=0.25, message="Detecting semantic chapters...")
+                    try:
+                        chapter_cfg = ChapterConfig(
+                            min_chapter_len_s=float(chapters_cfg_dict.get("min_chapter_len_s", 60.0)),
+                            max_chapter_len_s=float(chapters_cfg_dict.get("max_chapter_len_s", 900.0)),
+                            embedding_model=str(chapters_cfg_dict.get("embedding_model", "all-mpnet-base-v2")),
+                            changepoint_method=str(chapters_cfg_dict.get("changepoint_method", "pelt")),
+                            changepoint_penalty=float(chapters_cfg_dict.get("changepoint_penalty", 10.0)),
+                            snap_to_silence_window_s=float(chapters_cfg_dict.get("snap_to_silence_window_s", 10.0)),
+                            llm_labeling=bool(chapters_cfg_dict.get("llm_labeling", True)),
+                            llm_endpoint=str(ai_cfg.get("endpoint", "http://127.0.0.1:11435")),
+                            llm_model_name=str(ai_cfg.get("model_name", "local-gguf-vulkan")),
+                            llm_timeout_s=float(ai_cfg.get("timeout_s", 30.0)),
+                            max_chars_per_chapter=int(chapters_cfg_dict.get("max_chars_per_chapter", 6000)),
+                        )
+                        
+                        def on_chapters_progress(frac: float) -> None:
+                            JOB_MANAGER._set(job, progress=0.25 + 0.10 * frac, message="Detecting semantic chapters...")
+                        
+                        compute_chapters_analysis(proj, cfg=chapter_cfg, on_progress=on_chapters_progress)
+                    except Exception as e:
+                        # Chapters are optional - continue if they fail
+                        import logging
+                        logging.getLogger(__name__).warning(f"Semantic chapters failed (non-fatal): {e}")
+
                 # Step 4: Unified boundaries
                 boundaries_path = proj.analysis_dir / "boundaries.json"
-                JOB_MANAGER._set(job, progress=0.35, message="Building boundary graph...")
+                JOB_MANAGER._set(job, progress=0.38, message="Building boundary graph...")
                 boundary_prefs = context_cfg.get("boundaries", {})
                 boundary_cfg = BoundaryConfig(
                     prefer_silence=bool(boundary_prefs.get("prefer_silence", True)),
                     prefer_sentences=bool(boundary_prefs.get("prefer_sentences", True)),
                     prefer_scene_cuts=bool(boundary_prefs.get("prefer_scene_cuts", True)),
                     prefer_chat_valleys=bool(boundary_prefs.get("prefer_chat_valleys", True)),
+                    prefer_chapters=bool(boundary_prefs.get("prefer_chapters", True)),
                 )
                 compute_boundaries_analysis(proj, cfg=boundary_cfg)
 
@@ -1426,7 +1925,11 @@ def create_app(
         audio_events_cfg = {**analysis_cfg.get("audio_events", {}), **(body.get("audio_events") or {})}
         speech_cfg = {**analysis_cfg.get("speech", {}), **(body.get("speech") or {})}
         reaction_cfg = {**analysis_cfg.get("reaction_audio", {}), **(body.get("reaction_audio") or {})}
-        rerank_cfg_dict = {**analysis_cfg.get("rerank", {}), **(body.get("rerank") or {})}
+        # Support both "enrich" and legacy "rerank" config keys
+        enrich_cfg_dict = {
+            **analysis_cfg.get("enrich", analysis_cfg.get("rerank", {})),
+            **(body.get("enrich") or body.get("rerank") or {})
+        }
         context_cfg = {**context_cfg, **(body.get("context") or {})}
         ai_cfg = {**ai_cfg, **(body.get("ai") or {})}
 
@@ -1453,8 +1956,11 @@ def create_app(
         def runner() -> None:
             import time as _time
             import threading
+            import logging
             from ..analysis_motion import compute_motion_analysis
             from ..analysis_scenes import compute_scene_analysis
+            
+            log = logging.getLogger("videopipeline.studio")
 
             JOB_MANAGER._set(job, status="running", progress=0.0, message="Starting parallel analysis DAG...")
             
@@ -1606,61 +2112,206 @@ def create_app(
                 compute_transcript_analysis(proj, cfg=transcript_config, on_progress=transcript_progress)
                 return ("transcript", False)  # computed
 
-            def run_chat_features():
-                if proj.chat_features_path.exists():
-                    return ("chat", True)  # cached
-                chat_db_path = proj.analysis_dir / "chat.sqlite"
-                if chat_db_path.exists():
-                    from ..chat.features import compute_and_save_chat_features
-                    hop_s = float(audio_cfg.get("hop_seconds", 0.5))
-                    smooth_s = float(highlights_cfg.get("chat_smooth_seconds", 3.0))
+            def run_reaction_audio():
+                """Run reaction audio analysis (can run in parallel - no dependencies)."""
+                if not (include_speech and reaction_cfg.get("enabled", True)):
+                    return ("reaction_audio", True)  # disabled
+                if proj.reaction_audio_features_path.exists():
+                    return ("reaction_audio", True)  # cached
                     
-                    # Get LLM for laugh emote learning (with auto-start)
-                    ai_cfg = ctx.profile.get("ai", {}).get("director", {})
-                    llm_complete_fn = None
-                    if ai_cfg.get("enabled", True):
+                def reaction_progress(p: float) -> None:
+                    pct = int(p * 100)
+                    update_task_progress("reaction_audio", p, f"analyzing reactions {pct}%")
+                    
+                reaction_audio_config = ReactionAudioConfig(
+                    sample_rate=int(reaction_cfg.get("sample_rate", 16000)),
+                    hop_seconds=float(reaction_cfg.get("hop_seconds", 0.5)),
+                    smooth_seconds=float(reaction_cfg.get("smooth_seconds", 1.5)),
+                )
+                compute_reaction_audio_features(proj, cfg=reaction_audio_config, on_progress=reaction_progress)
+                return ("reaction_audio", False)  # computed
+
+            def run_chat_download_retry():
+                """Retry chat download if it previously failed."""
+                from ..project import get_chat_config, get_source_url, set_chat_config
+                
+                chat_db_path = proj.analysis_dir / "chat.sqlite"
+                
+                # If chat.sqlite already exists, nothing to retry
+                if chat_db_path.exists():
+                    return ("chat_retry", True)  # skip - already have chat
+                
+                # Check the project's chat download status
+                chat_cfg = get_chat_config(proj)
+                download_status = chat_cfg.get("download_status")
+                
+                # Only retry if the previous download failed
+                if download_status != "failed":
+                    return ("chat_retry", True)  # skip - wasn't failed
+                
+                # Get the source URL for retry
+                source_url = get_source_url(proj)
+                if not source_url or "twitch.tv/videos/" not in source_url.lower():
+                    return ("chat_retry", True)  # skip - not a Twitch VOD
+                
+                log.info(f"[chat] Previous download failed, retrying for: {source_url}")
+                update_task_progress("chat", 0.0, "Retrying chat download...")
+                
+                try:
+                    from ..chat.downloader import download_chat as dl_chat, import_chat_to_project, find_twitch_downloader_cli
+                    
+                    cli_path = find_twitch_downloader_cli()
+                    if not cli_path:
+                        log.warning("[chat] TwitchDownloaderCLI not found for retry")
+                        return ("chat_retry", True)  # skip
+                    
+                    # Download to temp path
+                    import tempfile
+                    import re
+                    match = re.search(r'twitch\.tv/videos/(\d+)', source_url)
+                    if not match:
+                        return ("chat_retry", True)
+                    
+                    video_id = match.group(1)
+                    chat_temp_path = Path(tempfile.gettempdir()) / f"chat_retry_{video_id}.json"
+                    
+                    def on_chat_progress(frac: float, msg: str) -> None:
+                        update_task_progress("chat", frac * 0.8, f"retry: {msg}")
+                    
+                    dl_chat(source_url, chat_temp_path, on_progress=on_chat_progress)
+                    
+                    # Import to project
+                    if chat_temp_path.exists():
+                        update_task_progress("chat", 0.85, "Importing chat...")
+                        import_chat_to_project(proj, chat_temp_path)
+                        
+                        # Clean up temp
                         try:
-                            from pathlib import Path as P
-                            from ..ai.llm_server import ensure_llm_server
-                            from ..ai.llm_client import create_llm_client
-                            
-                            # Auto-start server if configured
-                            endpoint = str(ai_cfg.get("endpoint", "http://127.0.0.1:11435"))
-                            if ai_cfg.get("auto_start", False):
-                                server_path = P(ai_cfg.get("server_path", "C:/llama.cpp/llama-server.exe"))
-                                model_path = P(ai_cfg.get("model_path", "C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf"))
-                                auto_stop_s = ai_cfg.get("auto_stop_idle_s", 600.0)
-                                started_endpoint = ensure_llm_server(
-                                    server_path=server_path,
-                                    model_path=model_path,
-                                    port=int(endpoint.split(":")[-1]),
-                                    auto_stop_after_idle_s=auto_stop_s,
-                                )
-                                if started_endpoint:
-                                    endpoint = started_endpoint
-                            
-                            llm_client = create_llm_client(
-                                endpoint=endpoint,
-                                cache_dir=proj.analysis_dir,
-                            )
-                            if llm_client.is_available():
-                                def llm_complete_fn(prompt: str) -> str:
-                                    resp = llm_client.complete(prompt, json_mode=True)
-                                    return json.dumps(resp) if isinstance(resp, dict) else str(resp)
+                            chat_temp_path.unlink()
                         except Exception:
                             pass
+                        
+                        # Update status to success
+                        set_chat_config(proj, download_status="success")
+                        log.info("[chat] Retry successful!")
+                        return ("chat_retry", False)  # computed (downloaded)
+                    else:
+                        log.warning("[chat] Retry produced no file")
+                        return ("chat_retry", True)  # skip
+                        
+                except Exception as e:
+                    log.warning(f"[chat] Retry failed: {e}")
+                    # Update error message but keep status as failed
+                    set_chat_config(proj, download_error=f"Retry failed: {e}")
+                    return ("chat_retry", True)  # skip - retry also failed
+
+            def run_chat_features():
+                chat_db_path = proj.analysis_dir / "chat.sqlite"
+                
+                # If chat.sqlite doesn't exist, try to retry download if previous attempt failed
+                if not chat_db_path.exists():
+                    retry_result = run_chat_download_retry()
+                    # Check again if retry succeeded
+                    if not chat_db_path.exists():
+                        return ("chat", "skipped")  # no chat data = skip (not cached)
+                
+                # Check if we should force re-learn (cached but only has seed tokens)
+                force_relearn = False
+                if proj.chat_features_path.exists():
+                    from ..chat.store import ChatStore
+                    try:
+                        store = ChatStore(chat_db_path)
+                        laugh_source = store.get_meta("laugh_tokens_source", "")
+                        store.close()
+                        # If we have features but they were only from seeds, and LLM is enabled, re-learn
+                        ai_cfg_check = ctx.profile.get("ai", {}).get("director", {})
+                        if laugh_source == "seed" and ai_cfg_check.get("enabled", True):
+                            log.info("[chat] Cached features used seeds only, will try LLM this time")
+                            force_relearn = True
+                        elif laugh_source.startswith("llm"):
+                            return ("chat", True)  # Already LLM-analyzed, skip
+                        elif laugh_source:
+                            return ("chat", True)  # Has some source, skip
+                    except Exception:
+                        pass
                     
-                    compute_and_save_chat_features(
-                        proj,
-                        hop_s=hop_s,
-                        smooth_s=smooth_s,
-                        llm_complete=llm_complete_fn,
-                    )
-                    return ("chat", False)  # computed
-                return ("chat", True)  # no chat data = skip
+                    if not force_relearn:
+                        return ("chat", True)  # cached
+                
+                from ..chat.features import compute_and_save_chat_features
+                hop_s = float(audio_cfg.get("hop_seconds", 0.5))
+                smooth_s = float(highlights_cfg.get("chat_smooth_seconds", 3.0))
+                
+                # Get LLM for laugh emote learning (with auto-start)
+                ai_cfg = ctx.profile.get("ai", {}).get("director", {})
+                llm_complete_fn = None
+                if ai_cfg.get("enabled", True):
+                    try:
+                        from pathlib import Path as P
+                        from ..ai.llm_server import ensure_llm_server
+                        from ..ai.llm_client import create_llm_client
+                        
+                        # Auto-start server if configured
+                        endpoint = str(ai_cfg.get("endpoint", "http://127.0.0.1:11435"))
+                        if ai_cfg.get("auto_start", False):
+                            server_path = P(ai_cfg.get("server_path", "C:/llama.cpp/llama-server.exe"))
+                            model_path = P(ai_cfg.get("model_path", "C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf"))
+                            auto_stop_s = ai_cfg.get("auto_stop_idle_s", 600.0)
+                            startup_timeout_s = float(ai_cfg.get("startup_timeout_s", 120.0))
+                            log.info(f"[chat] Auto-starting LLM server (timeout={startup_timeout_s}s): {server_path}")
+                            started_endpoint = ensure_llm_server(
+                                server_path=server_path,
+                                model_path=model_path,
+                                port=int(endpoint.split(":")[-1]),
+                                auto_stop_after_idle_s=auto_stop_s,
+                                startup_timeout_s=startup_timeout_s,
+                            )
+                            if started_endpoint:
+                                endpoint = started_endpoint
+                                log.info(f"[chat] LLM server started at {endpoint}")
+                            else:
+                                log.warning(f"[chat] LLM server failed to start within {startup_timeout_s}s")
+                        
+                        llm_client = create_llm_client(
+                            endpoint=endpoint,
+                            cache_dir=proj.analysis_dir,
+                        )
+                        if llm_client.is_available():
+                            log.info(f"[chat] LLM client available at {endpoint}")
+                            def llm_complete_fn(prompt: str) -> str:
+                                resp = llm_client.complete(prompt, json_mode=True)
+                                return json.dumps(resp) if isinstance(resp, dict) else str(resp)
+                        else:
+                            log.warning(f"[chat] LLM client NOT available at {endpoint}")
+                    except Exception as e:
+                        log.warning(f"[chat] Failed to create LLM client: {e}")
+                
+                # Get channel info from source URL for global emote persistence
+                from ..project import get_source_url
+                from ..chat.emote_db import get_channel_for_project
+                source_url = get_source_url(proj)
+                channel_info = get_channel_for_project(proj, source_url=source_url)
+                channel_id = channel_info[0] if channel_info else None
+                platform = channel_info[1] if channel_info else "twitch"
+                
+                compute_and_save_chat_features(
+                    proj,
+                    hop_s=hop_s,
+                    smooth_s=smooth_s,
+                    llm_complete=llm_complete_fn,
+                    force_relearn_laugh=force_relearn,
+                    channel_id=channel_id,
+                    platform=platform,
+                )
+                return ("chat", False)  # computed
 
             # Build stage 1 task list with display names
-            # Note: scenes is NOT included here - it depends on motion and runs after Stage 1
+            # Stage 1: Parallel input analysis (no dependencies)
+            #   - audio, motion, audio_events, chat, transcript, reaction_audio
+            # Stage 1.5 (after transcript): speech_features (depends on transcript)
+            # Stage 2: scenes (depends on motion)
+            # Stage 3: highlights (combines ALL signals including speech + reaction)
+            # Stage 4: rerank, chapters, boundaries, clip_variants, director
             stage1_tasks = [
                 (run_audio, "run_audio", "audio"),
                 (run_audio_events, "run_audio_events", "audio_events"),
@@ -1671,6 +2322,8 @@ def create_app(
                 stage1_tasks.append((run_motion, "run_motion", "motion"))
             if include_speech:
                 stage1_tasks.append((run_transcript, "run_transcript", "transcript"))
+                # reaction_audio has no dependencies - can run in parallel
+                stage1_tasks.append((run_reaction_audio, "run_reaction_audio", "reaction_audio"))
 
             total_tasks = len(stage1_tasks)
             task_names = [t[2] for t in stage1_tasks]
@@ -1708,7 +2361,16 @@ def create_app(
                         stage1_completed.append(display_name)
                         pending_tasks.discard(display_name)
                         
-                        if was_cached:
+                        # Handle different cache statuses:
+                        # - True: cached (have data from previous run)
+                        # - "skipped": no data available (e.g., chat download failed)
+                        # - False: computed fresh
+                        if was_cached == "skipped":
+                            stage1_cached.append(display_name)
+                            stage1_task_times[display_name] = "skipped"
+                            stage_times[display_name] = "skipped"
+                            msg = f"Stage 1: ○ {display_name} (skipped) ({len(stage1_completed)}/{total_tasks})"
+                        elif was_cached:
                             stage1_cached.append(display_name)
                             stage1_task_times[display_name] = "cached"
                             stage_times[display_name] = "cached"
@@ -1798,42 +2460,18 @@ def create_app(
                         errors.append(f"scenes: {e}")
                         stage_times["scenes"] = _time.time() - scenes_start
 
-            # Stage 2: Combine signals into highlight scores
-            if check_cancelled():
-                return
-                
-            highlights_start = _time.time()
-            current_stage = {"name": "highlights", "started_at": highlights_start}
-            JOB_MANAGER._set(job, progress=0.38, message="Stage 2: Computing highlight scores...", result=update_timing_result())
-            try:
-                compute_highlights_analysis(
-                    proj,
-                    audio_cfg=audio_cfg,
-                    motion_cfg=motion_cfg,
-                    scenes_cfg=scenes_cfg,
-                    highlights_cfg=highlights_cfg,
-                    audio_events_cfg=audio_events_cfg,
-                    include_chat=True,
-                    include_audio_events=bool(audio_events_cfg.get("enabled", True)),
-                )
-                completed_stages.append("highlights")
-                stage_times["highlights"] = _time.time() - highlights_start
-            except Exception as e:
-                errors.append(f"highlights: {e}")
-                stage_times["highlights"] = _time.time() - highlights_start
-
-            # Stage 3: Speech features + reranking (if speech enabled)
+            # Stage 1.6: Speech features (depends on transcript -> must run AFTER Stage 1)
+            # This runs before highlights so speech/lexical excitement can inform peak selection
             if check_cancelled():
                 return
                 
             if include_speech and speech_cfg.get("enabled", True):
-                # Speech features
                 if proj.transcript_path.exists() and not proj.speech_features_path.exists():
                     speech_feat_start = _time.time()
                     current_stage = {"name": "speech_features", "started_at": speech_feat_start}
-                    JOB_MANAGER._set(job, progress=0.45, message="Stage 3: Extracting speech features...", result=update_timing_result())
+                    JOB_MANAGER._set(job, progress=0.37, message="Stage 1.6: Extracting speech features...", result=update_timing_result())
                     try:
-                        hook_cfg = rerank_cfg_dict.get("hook", {})
+                        hook_cfg = enrich_cfg_dict.get("hook", {})
                         phrases = hook_cfg.get("phrases", [])
                         speech_feature_config = SpeechFeatureConfig(
                             hop_seconds=float(speech_cfg.get("hop_seconds", 0.5)),
@@ -1849,53 +2487,114 @@ def create_app(
                     completed_stages.append("speech_features")
                     stage_times["speech_features"] = "cached"
 
-                # Reaction audio
-                if reaction_cfg.get("enabled", True):
-                    if proj.reaction_audio_features_path.exists():
-                        completed_stages.append("reaction_audio")
-                        stage_times["reaction_audio"] = "cached"
+            # Stage 2: Combine signals into highlight scores (now includes speech + reaction!)
+            if check_cancelled():
+                return
+                
+            highlights_start = _time.time()
+            current_stage = {"name": "highlights", "started_at": highlights_start}
+            JOB_MANAGER._set(job, progress=0.40, message="Stage 2: Computing highlight scores (with speech+reaction)...", result=update_timing_result())
+            
+            # Set up LLM client for semantic scoring (optional enhancement)
+            llm_complete_fn_highlights = None
+            if ai_cfg.get("enabled", True) and highlights_cfg.get("llm_semantic_enabled", True):
+                try:
+                    from pathlib import Path as P
+                    from ..ai.llm_server import ensure_llm_server
+                    from ..ai.llm_client import create_llm_client
+                    
+                    endpoint = str(ai_cfg.get("endpoint", "http://127.0.0.1:11435"))
+                    if ai_cfg.get("auto_start", False):
+                        server_path = P(ai_cfg.get("server_path", "C:/llama.cpp/llama-server.exe"))
+                        model_path = P(ai_cfg.get("model_path", "C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf"))
+                        auto_stop_s = ai_cfg.get("auto_stop_idle_s", 600.0)
+                        startup_timeout_s = float(ai_cfg.get("startup_timeout_s", 120.0))
+                        started_endpoint = ensure_llm_server(
+                            server_path=server_path,
+                            model_path=model_path,
+                            port=int(endpoint.split(":")[-1]),
+                            auto_stop_after_idle_s=auto_stop_s,
+                            startup_timeout_s=startup_timeout_s,
+                        )
+                        if started_endpoint:
+                            endpoint = started_endpoint
+                    
+                    llm_client = create_llm_client(
+                        endpoint=endpoint,
+                        cache_dir=proj.analysis_dir,
+                    )
+                    if llm_client.is_available():
+                        log.info(f"[highlights] LLM semantic scoring enabled at {endpoint}")
+                        def llm_complete_fn_highlights(prompt: str) -> str:
+                            resp = llm_client.complete(prompt, json_mode=True)
+                            return json.dumps(resp) if isinstance(resp, dict) else str(resp)
                     else:
-                        reaction_start = _time.time()
-                        current_stage = {"name": "reaction_audio", "started_at": reaction_start}
-                        JOB_MANAGER._set(job, progress=0.55, message="Stage 3: Analyzing reaction audio...", result=update_timing_result())
-                        try:
-                            reaction_audio_config = ReactionAudioConfig(
-                                sample_rate=int(reaction_cfg.get("sample_rate", 16000)),
-                                hop_seconds=float(reaction_cfg.get("hop_seconds", 0.5)),
-                                smooth_seconds=float(reaction_cfg.get("smooth_seconds", 1.5)),
-                            )
-                            compute_reaction_audio_features(proj, cfg=reaction_audio_config)
-                            completed_stages.append("reaction_audio")
-                            stage_times["reaction_audio"] = _time.time() - reaction_start
-                        except Exception as e:
-                            errors.append(f"reaction_audio: {e}")
-                            stage_times["reaction_audio"] = _time.time() - reaction_start
+                        log.info("[highlights] LLM not available, skipping semantic scoring")
+                except Exception as e:
+                    log.warning(f"[highlights] Failed to create LLM client for semantic scoring: {e}")
+            
+            try:
+                def on_highlights_progress(p: float) -> None:
+                    # Map 0-1 progress to stage 2 range (0.40-0.65)
+                    scaled = 0.40 + p * 0.25
+                    if p < 0.25:
+                        msg = "Stage 2: Loading signals..."
+                    elif p < 0.65:
+                        msg = "Stage 2: Computing audio events (may take a while)..."
+                    elif p < 0.85:
+                        msg = "Stage 2: Fusing signals and picking candidates..."
+                    elif p < 0.92:
+                        msg = "Stage 2: LLM semantic scoring..."
+                    else:
+                        msg = "Stage 2: Finalizing highlights..."
+                    JOB_MANAGER._set(job, progress=scaled, message=msg, result=update_timing_result())
+                
+                compute_highlights_analysis(
+                    proj,
+                    audio_cfg=audio_cfg,
+                    motion_cfg=motion_cfg,
+                    scenes_cfg=scenes_cfg,
+                    highlights_cfg=highlights_cfg,
+                    audio_events_cfg=audio_events_cfg,
+                    include_chat=True,
+                    include_audio_events=bool(audio_events_cfg.get("enabled", True)),
+                    llm_complete=llm_complete_fn_highlights,
+                    on_progress=on_highlights_progress,
+                )
+                completed_stages.append("highlights")
+                stage_times["highlights"] = _time.time() - highlights_start
+            except Exception as e:
+                errors.append(f"highlights: {e}")
+                stage_times["highlights"] = _time.time() - highlights_start
 
-                # Rerank - always recompute since it depends on current highlights
+            # Stage 3: Enrichment (speech_features and reaction_audio now run in Stage 1/1.6)
+            if check_cancelled():
+                return
+                
+            if include_speech and speech_cfg.get("enabled", True):
+                # Enrich - always recompute since it depends on current highlights
                 proj_data = get_project_data(proj)
                 has_candidates = bool(proj_data.get("analysis", {}).get("highlights", {}).get("candidates"))
-                if rerank_cfg_dict.get("enabled", True) and has_candidates:
-                    rerank_start = _time.time()
-                    current_stage = {"name": "rerank", "started_at": rerank_start}
-                    JOB_MANAGER._set(job, progress=0.65, message="Stage 3: Reranking candidates...", result=update_timing_result())
+                if enrich_cfg_dict.get("enabled", True) and has_candidates:
+                    enrich_start = _time.time()
+                    current_stage = {"name": "enrich", "started_at": enrich_start}
+                    JOB_MANAGER._set(job, progress=0.65, message="Stage 3: Enriching candidates...", result=update_timing_result())
                     try:
-                        hook_cfg = rerank_cfg_dict.get("hook", {})
-                        quote_cfg = rerank_cfg_dict.get("quote", {})
-                        weights = rerank_cfg_dict.get("weights", {})
-                        rerank_config = RerankConfig(
+                        hook_cfg = enrich_cfg_dict.get("hook", {})
+                        quote_cfg = enrich_cfg_dict.get("quote", {})
+                        enrich_config = EnrichConfig(
                             enabled=True,
-                            weights=weights if weights else None,
                             hook_max_chars=int(hook_cfg.get("max_chars", 60)),
                             hook_window_seconds=float(hook_cfg.get("window_seconds", 4.0)),
                             quote_max_chars=int(quote_cfg.get("max_chars", 120)),
                             reaction_phrases=hook_cfg.get("phrases", []),
                         )
-                        compute_reranked_candidates(proj, cfg=rerank_config)
-                        completed_stages.append("rerank")
-                        stage_times["rerank"] = _time.time() - rerank_start
+                        enrich_candidates(proj, cfg=enrich_config)
+                        completed_stages.append("enrich")
+                        stage_times["enrich"] = _time.time() - enrich_start
                     except Exception as e:
-                        errors.append(f"rerank: {e}")
-                        stage_times["rerank"] = _time.time() - rerank_start
+                        errors.append(f"enrich: {e}")
+                        stage_times["enrich"] = _time.time() - enrich_start
 
             # Stage 4: Context + AI Director (optional)
             if check_cancelled():
@@ -1931,6 +2630,40 @@ def create_app(
                         )
                         compute_chat_boundaries_analysis(proj, cfg=chat_boundary_cfg)
 
+                    # Semantic chapters (if enabled and transcript available)
+                    chapters_cfg_dict = context_cfg.get("chapters", {})
+                    chapters_enabled = bool(chapters_cfg_dict.get("enabled", True))
+                    if chapters_enabled and proj.transcript_path.exists() and not proj.chapters_path.exists():
+                        chapters_start = _time.time()
+                        current_stage = {"name": "chapters", "started_at": chapters_start}
+                        JOB_MANAGER._set(job, progress=0.72, message="Stage 4: Detecting semantic chapters...", result=update_timing_result())
+                        try:
+                            chapter_cfg = ChapterConfig(
+                                min_chapter_len_s=float(chapters_cfg_dict.get("min_chapter_len_s", 60.0)),
+                                max_chapter_len_s=float(chapters_cfg_dict.get("max_chapter_len_s", 900.0)),
+                                embedding_model=str(chapters_cfg_dict.get("embedding_model", "all-mpnet-base-v2")),
+                                changepoint_method=str(chapters_cfg_dict.get("changepoint_method", "pelt")),
+                                changepoint_penalty=float(chapters_cfg_dict.get("changepoint_penalty", 10.0)),
+                                snap_to_silence_window_s=float(chapters_cfg_dict.get("snap_to_silence_window_s", 10.0)),
+                                llm_labeling=bool(chapters_cfg_dict.get("llm_labeling", True)),
+                                llm_endpoint=str(ai_cfg.get("endpoint", "http://127.0.0.1:11435")),
+                                llm_model_name=str(ai_cfg.get("model_name", "local-gguf-vulkan")),
+                                llm_timeout_s=float(ai_cfg.get("timeout_s", 30.0)),
+                                max_chars_per_chapter=int(chapters_cfg_dict.get("max_chars_per_chapter", 6000)),
+                            )
+                            compute_chapters_analysis(proj, cfg=chapter_cfg)
+                            completed_stages.append("chapters")
+                            stage_times["chapters"] = _time.time() - chapters_start
+                        except Exception as e:
+                            # Chapters are optional - continue if they fail
+                            import logging
+                            logging.getLogger(__name__).warning(f"Semantic chapters failed (non-fatal): {e}")
+                            errors.append(f"chapters: {e}")
+                            stage_times["chapters"] = _time.time() - chapters_start
+                    elif proj.chapters_path.exists():
+                        completed_stages.append("chapters")
+                        stage_times["chapters"] = "cached"
+
                     # Unified boundaries
                     boundary_prefs = context_cfg.get("boundaries", {})
                     boundary_cfg = BoundaryConfig(
@@ -1938,6 +2671,7 @@ def create_app(
                         prefer_sentences=bool(boundary_prefs.get("prefer_sentences", True)),
                         prefer_scene_cuts=bool(boundary_prefs.get("prefer_scene_cuts", True)),
                         prefer_chat_valleys=bool(boundary_prefs.get("prefer_chat_valleys", True)),
+                        prefer_chapters=bool(boundary_prefs.get("prefer_chapters", True)),
                     )
                     compute_boundaries_analysis(proj, cfg=boundary_cfg)
                     completed_stages.append("boundaries")
@@ -2270,6 +3004,7 @@ def create_app(
             - sync_offset_ms: Current sync offset
             - message_count: Number of chat messages
             - source_url: Source URL used for chat
+            - ai_status: AI analysis status (laugh tokens, etc.)
         """
         proj = ctx.require_project()
         from ..project import get_chat_config, get_source_url
@@ -2280,6 +3015,23 @@ def create_app(
         chat_available = proj.chat_db_path.exists()
         message_count = 0
         duration_ms = 0
+        ai_status = {"has_chat": False}
+        
+        # Check director status
+        director_path = proj.analysis_dir / "ai_director.json"
+        director_status = {"analyzed": False}
+        if director_path.exists():
+            try:
+                director_data = json.loads(director_path.read_text(encoding="utf-8"))
+                director_status = {
+                    "analyzed": True,
+                    "candidates_count": len(director_data.get("results", [])),
+                    "model": director_data.get("config", {}).get("model_name", "unknown"),
+                    "analyzed_at": director_data.get("created_at", ""),
+                    "llm_available": director_data.get("llm_available", False),
+                }
+            except Exception:
+                pass
 
         if chat_available:
             try:
@@ -2288,9 +3040,45 @@ def create_app(
                 meta = store.get_all_meta()
                 message_count = meta.message_count
                 duration_ms = meta.duration_ms
+                
+                # Get AI analysis status
+                laugh_tokens_json = store.get_meta("laugh_tokens_json", "[]")
+                laugh_tokens = json.loads(laugh_tokens_json) if laugh_tokens_json else []
+                laugh_source = store.get_meta("laugh_tokens_source", "")
+                laugh_updated = store.get_meta("laugh_tokens_updated_at", "")
+                llm_learned_json = store.get_meta("laugh_tokens_llm_learned", "[]")
+                llm_learned = json.loads(llm_learned_json) if llm_learned_json else []
+                
+                # Get additional stats from project.json if available
+                proj_data = get_project_data(proj)
+                chat_analysis = proj_data.get("analysis", {}).get("chat", {})
+                newly_learned_count = chat_analysis.get("newly_learned_count", 0)
+                newly_learned_tokens = chat_analysis.get("newly_learned_tokens", [])
+                loaded_from_global = chat_analysis.get("loaded_from_global", 0)
+                
+                ai_status = {
+                    "has_chat": message_count > 0,
+                    "laugh_tokens": laugh_tokens,
+                    "laugh_tokens_count": len(laugh_tokens),
+                    "llm_learned_tokens": llm_learned,
+                    "llm_learned_count": len(llm_learned),
+                    "newly_learned_count": newly_learned_count,
+                    "newly_learned_tokens": newly_learned_tokens,
+                    "loaded_from_global": loaded_from_global,
+                    "laugh_source": laugh_source,
+                    "laugh_updated_at": laugh_updated,
+                    "ai_analyzed": laugh_source.startswith("llm") if laugh_source else False,
+                    # Add reason why LLM wasn't used
+                    "llm_skip_reason": "" if laugh_source.startswith("llm") else (
+                        "Not yet analyzed" if not laugh_source else
+                        "LLM not available during analysis" if laugh_source == "seed" else
+                        f"Source: {laugh_source}"
+                    ),
+                }
+                
                 store.close()
-            except Exception:
-                pass
+            except Exception as e:
+                ai_status = {"has_chat": False, "error": str(e)}
 
         return JSONResponse({
             "available": chat_available,
@@ -2299,7 +3087,35 @@ def create_app(
             "message_count": message_count,
             "duration_ms": duration_ms,
             "source_url": source_url,
+            "ai_status": ai_status,
+            "director_status": director_status,
         })
+
+    @app.post("/api/chat/relearn_ai")
+    def api_chat_relearn_ai():
+        """Re-learn chat emotes with AI (LLM).
+        
+        This clears the cached laugh tokens and re-analyzes the chat
+        using the LLM to learn channel-specific emotes.
+        """
+        proj = ctx.require_project()
+        
+        if not proj.chat_db_path.exists():
+            raise HTTPException(status_code=400, detail="No chat data available")
+        
+        # Clear the chat features to force re-analysis
+        if proj.chat_features_path.exists():
+            proj.chat_features_path.unlink()
+        
+        # Clear cached laugh tokens from the store
+        from ..chat.store import ChatStore
+        store = ChatStore(proj.chat_db_path)
+        store.set_meta("laugh_tokens_json", "[]")
+        store.set_meta("laugh_tokens_source", "")
+        store.set_meta("laugh_tokens_llm_learned", "[]")
+        store.close()
+        
+        return JSONResponse({"ok": True, "message": "Cleared chat AI cache. Run Analyze (Full) to re-learn with AI."})
 
     @app.post("/api/chat/set_source_url")
     def api_chat_set_source_url(body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
@@ -2368,15 +3184,24 @@ def create_app(
 
             def on_progress(frac: float, msg: str) -> None:
                 JOB_MANAGER._set(job, progress=frac * 0.5, message=msg)
+            
+            def check_cancel() -> bool:
+                return job.cancel_requested
 
             try:
-                from ..chat.downloader import download_chat, ChatDownloadError
+                from ..chat.downloader import download_chat, ChatDownloadError, ChatDownloadCancelled
                 from ..chat.normalize import load_and_normalize
                 from ..chat.store import ChatStore, ChatMeta
                 from ..chat.features import compute_and_save_chat_features
 
                 # Download chat
                 JOB_MANAGER._set(job, progress=0.05, message="Downloading chat replay...")
+                result = download_chat(source_url, proj.chat_raw_path, on_progress=on_progress, check_cancel=check_cancel)
+                
+                # Check if cancelled after download
+                if job.cancel_requested:
+                    JOB_MANAGER._set(job, status="cancelled", message="Download cancelled")
+                    return
                 result = download_chat(source_url, proj.chat_raw_path, on_progress=on_progress)
 
                 # Load and normalize
@@ -2447,10 +3272,15 @@ def create_app(
                             temperature=float(ai_cfg.get("temperature", 0.2)),
                         )
                         if llm_client.is_available():
+                            log.info(f"[chat download] LLM available at {endpoint}")
+                            JOB_MANAGER._set(job, message="LLM ready for emote learning...")
                             def llm_complete_fn(prompt: str) -> str:
                                 resp = llm_client.complete(prompt, json_mode=True)
                                 return json.dumps(resp) if isinstance(resp, dict) else str(resp)
-                    except Exception:
+                        else:
+                            log.warning(f"[chat download] LLM NOT available at {endpoint}")
+                    except Exception as e:
+                        log.warning(f"[chat download] LLM setup failed: {e}")
                         pass  # LLM not available, will use seed tokens only
 
                 def on_feature_progress(frac: float) -> None:
@@ -2459,6 +3289,12 @@ def create_app(
                 def on_feature_status(msg: str) -> None:
                     JOB_MANAGER._set(job, message=msg)
 
+                # Extract channel info from source URL for global emote persistence
+                from ..chat.emote_db import get_channel_for_project
+                channel_info = get_channel_for_project(proj, source_url=source_url)
+                channel_id = channel_info[0] if channel_info else None
+                platform = channel_info[1] if channel_info else "twitch"
+
                 compute_and_save_chat_features(
                     proj,
                     hop_s=hop_s,
@@ -2466,6 +3302,8 @@ def create_app(
                     on_progress=on_feature_progress,
                     on_status=on_feature_status,
                     llm_complete=llm_complete_fn,
+                    channel_id=channel_id,
+                    platform=platform,
                 )
 
                 # Update project config
@@ -2483,6 +3321,8 @@ def create_app(
                     },
                 )
 
+            except ChatDownloadCancelled:
+                JOB_MANAGER._set(job, status="cancelled", message="Chat download cancelled")
             except ChatDownloadError as e:
                 JOB_MANAGER._set(job, status="failed", message=str(e))
             except Exception as e:

@@ -36,10 +36,11 @@ analysis:
   speech:
     enabled: true
     # Backend selection:
-    #   - auto: prefers whisper.cpp, falls back to faster-whisper
-    #   - whispercpp: fast CPU (uses all cores), GPU with Vulkan build
-    #   - faster_whisper: CUDA GPU support, good CPU with VAD
-    backend: auto
+    #   - openai_whisper: GPU support for AMD (ROCm) and NVIDIA (CUDA) - RECOMMENDED
+    #   - faster_whisper: CUDA GPU only, fastest on NVIDIA
+    #   - whispercpp: fast CPU, GPU with custom Vulkan build
+    #   - auto: selects best available (prefers openai_whisper with GPU)
+    backend: openai_whisper
     
     # Strict mode: if true, don't fall back to other backends
     # Useful for A/B testing performance between backends
@@ -52,12 +53,12 @@ analysis:
     model_size: small.en  # small.en is ~2x faster than small with same quality for English
     
     language: en  # Set explicitly for faster processing (null = auto-detect)
-    device: cpu  # cpu or cuda (faster-whisper only)
-    compute_type: int8  # int8 (CPU), float16 (GPU)
-    use_gpu: false  # Request GPU acceleration if available
+    device: cuda  # cpu or cuda
+    compute_type: float16  # int8 (CPU), float16 (GPU)
+    use_gpu: true  # GPU acceleration (AMD ROCm or NVIDIA CUDA)
     
     # Performance tuning:
-    threads: 0  # 0 = use all CPU cores (recommended)
+    threads: 0  # 0 = use all CPU cores (recommended for CPU fallback)
     n_processors: 1  # Parallel decoders for long files (whisper.cpp, try 2-4 for >30min)
     
     # VAD (Voice Activity Detection) - CRITICAL for speed:
@@ -81,18 +82,16 @@ analysis:
     hop_seconds: 0.5
     smooth_seconds: 2.0
     sample_rate: 16000
+    backend: pytorch  # Use PyTorch VGGish with ROCm GPU acceleration
     events:
       laughter: 1.0
       cheering: 0.7
       applause: 0.5
       screaming: 0.8
       shouting: 0.6
-  rerank:
+  # Enrichment: extract hook/quote text for candidates (score fusion is in highlights)
+  enrich:
     enabled: true
-    weights:
-      highlight: 0.55
-      reaction: 0.25
-      speech: 0.20
     hook:
       max_chars: 60
       window_seconds: 4.0
@@ -132,7 +131,7 @@ export:
   height: 1920
   fps: 30
   crf: 20
-  preset: veryfast
+  preset: medium  # Better quality encoding (adds ~10-30s per clip vs veryfast)
   normalize_audio: false
 
 overlay:
@@ -153,8 +152,8 @@ layout:
 
 captions:
   enabled: false
-  model_size: small
-  language: null
+  model_size: medium.en  # Better accuracy for English, handles background noise well
+  language: en
   device: cpu
   compute_type: int8
 
@@ -181,7 +180,19 @@ context:
     prefer_sentences: true
     prefer_scene_cuts: true
     prefer_chat_valleys: true
+    prefer_chapters: true
     chat_valley_window_s: 12.0
+
+  chapters:
+    enabled: true
+    min_chapter_len_s: 60.0
+    max_chapter_len_s: 900.0
+    embedding_model: "all-mpnet-base-v2"  # Higher quality embeddings for accurate topic detection
+    changepoint_method: "pelt"
+    changepoint_penalty: 10.0
+    snap_to_silence_window_s: 10.0
+    llm_labeling: true
+    max_chars_per_chapter: 6000
 
 ai:
   director:
@@ -198,6 +209,9 @@ ai:
     server_path: "C:/llama.cpp/llama-server.exe"
     model_path: "C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf"
     auto_start: true
+    # Startup timeout for LLM server (seconds). Large models (7B+) need 60-120s to load.
+    # Increase this if you see "LLM not available" errors during download.
+    startup_timeout_s: 120
     # Auto-stop server after idle (seconds). Frees VRAM for gaming.
     # Set to null to disable auto-stop. Default: 600 (10 minutes)
     auto_stop_idle_s: 600

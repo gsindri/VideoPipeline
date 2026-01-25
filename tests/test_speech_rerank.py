@@ -1,4 +1,4 @@
-"""Tests for speech analysis and candidate reranking."""
+"""Tests for speech analysis and candidate enrichment."""
 import numpy as np
 import pytest
 
@@ -15,13 +15,13 @@ from videopipeline.analysis_transcript import (
     TranscriptSegment,
     TranscriptWord,
 )
-from videopipeline.rerank_candidates import (
-    RerankConfig,
+from videopipeline.enrich_candidates import (
+    EnrichConfig,
+    RerankConfig,  # Legacy alias
     extract_hook_text,
     extract_quote_text,
     _is_punchy,
     _has_payoff_word,
-    _get_feature_value_in_range,
 )
 
 
@@ -189,22 +189,21 @@ def test_extract_hook_text():
     assert "NO WAY" in hook or "insane" in hook.lower()
 
 
-def test_extract_hook_text_fallback():
-    """Test hook extraction fallback to first words."""
+def test_extract_hook_text_no_punchy():
+    """Test hook extraction returns None when no punchy text found."""
     segments = [
         TranscriptSegment(start=0.0, end=3.0, text="This is a normal sentence without excitement."),
     ]
     transcript = FullTranscript(segments=segments, duration_seconds=5.0)
-    cfg = RerankConfig(
+    cfg = EnrichConfig(
         hook_max_chars=30,
         hook_window_seconds=4.0,
         reaction_phrases=["no way"],
     )
     
     hook = extract_hook_text(transcript, 0.0, 4.0, cfg)
-    # Should fallback to first few words
-    assert hook is not None
-    assert len(hook) <= 60
+    # No fallback to non-punchy text - better to have no hook than a boring one
+    assert hook is None
 
 
 def test_extract_hook_text_empty():
@@ -258,61 +257,26 @@ def test_extract_quote_text_empty():
 
 
 # ============================================================================
-# Rerank weighting tests
+# EnrichConfig tests
 # ============================================================================
 
 
-def test_get_feature_value_in_range_max():
-    """Test getting max feature value in range."""
-    feature = np.array([1.0, 2.0, 5.0, 3.0, 1.0])
-    hop_s = 1.0
-    
-    value = _get_feature_value_in_range(feature, hop_s, 1.5, 3.5, "max")
-    assert value == 5.0
-
-
-def test_get_feature_value_in_range_mean():
-    """Test getting mean feature value in range."""
-    feature = np.array([1.0, 2.0, 4.0, 2.0, 1.0])
-    hop_s = 1.0
-    
-    value = _get_feature_value_in_range(feature, hop_s, 1.0, 4.0, "mean")
-    assert value == pytest.approx(8.0 / 3.0, rel=0.01)  # (2+4+2)/3
-
-
-def test_get_feature_value_in_range_edge_cases():
-    """Test feature value extraction edge cases."""
-    feature = np.array([1.0, 2.0, 3.0])
-    hop_s = 1.0
-    
-    # Range outside array
-    value = _get_feature_value_in_range(feature, hop_s, 5.0, 6.0, "max")
-    assert value == 3.0  # Clamps to last element
-    
-    # Empty array
-    empty = np.array([])
-    value = _get_feature_value_in_range(empty, hop_s, 0.0, 1.0, "max")
-    assert value == 0.0
-
-
-def test_rerank_config_defaults():
-    """Test RerankConfig has sensible defaults."""
-    cfg = RerankConfig()
+def test_enrich_config_defaults():
+    """Test EnrichConfig has sensible defaults."""
+    cfg = EnrichConfig()
     
     assert cfg.enabled is True
-    assert cfg.weights["highlight"] == 0.55
-    assert cfg.weights["reaction"] == 0.25
-    assert cfg.weights["speech"] == 0.20
     assert cfg.hook_max_chars == 60
     assert cfg.hook_window_seconds == 4.0
     assert cfg.quote_max_chars == 120
+    assert len(cfg.reaction_phrases) > 0
 
 
-def test_rerank_weights_sum():
-    """Test that default rerank weights sum to 1."""
+def test_rerank_config_alias():
+    """Test RerankConfig is an alias for EnrichConfig (backward compatibility)."""
     cfg = RerankConfig()
-    total = sum(cfg.weights.values())
-    assert total == pytest.approx(1.0, rel=0.01)
+    assert isinstance(cfg, EnrichConfig)
+    assert cfg.enabled is True
 
 
 # ============================================================================

@@ -54,8 +54,13 @@ def fingerprint_file(
     return h.hexdigest()
 
 
+def get_outputs_dir() -> Path:
+    """Get the outputs directory (parent of projects/)."""
+    return Path("outputs")
+
+
 def default_projects_root() -> Path:
-    return Path("outputs") / "projects"
+    return get_outputs_dir() / "projects"
 
 
 def project_dir_for_video(video_path: Path, projects_root: Optional[Path] = None) -> Path:
@@ -115,6 +120,10 @@ class Project:
     @property
     def scenes_path(self) -> Path:
         return self.analysis_dir / "scenes.json"
+
+    @property
+    def chapters_path(self) -> Path:
+        return self.analysis_dir / "chapters.json"
 
     @property
     def chat_raw_path(self) -> Path:
@@ -343,6 +352,8 @@ def set_chat_config(
     enabled: Optional[bool] = None,
     sync_offset_ms: Optional[int] = None,
     source_url: Optional[str] = None,
+    download_status: Optional[str] = None,
+    download_error: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Update chat configuration.
 
@@ -351,6 +362,8 @@ def set_chat_config(
         enabled: Whether chat is enabled
         sync_offset_ms: Chat sync offset in milliseconds
         source_url: Source URL used for chat download
+        download_status: Status of chat download: 'success', 'failed', 'skipped', or None
+        download_error: Error message if download failed
     """
     def _upd(d: Dict[str, Any]) -> None:
         d.setdefault("chat", {"enabled": False, "sync_offset_ms": 0})
@@ -360,5 +373,12 @@ def set_chat_config(
             d["chat"]["sync_offset_ms"] = int(sync_offset_ms)
         if source_url is not None:
             d["chat"]["source_url"] = source_url
+        if download_status is not None:
+            d["chat"]["download_status"] = download_status
+        if download_error is not None:
+            d["chat"]["download_error"] = download_error
+        elif download_status == "success":
+            # Clear error on success
+            d["chat"].pop("download_error", None)
 
     return update_project(proj, _upd)

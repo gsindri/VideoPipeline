@@ -20,6 +20,174 @@ let publishJobs = new Map();
 
 const jobs = new Map();
 
+// =========================================================================
+// UI UPDATE THROTTLING (Issue 1: Prevent flickering)
+// =========================================================================
+
+// Throttle renderHomeJobs to max ~8 Hz to prevent flickering
+let homeJobsRenderPending = false;
+let homeJobsLastRender = 0;
+const HOME_JOBS_RENDER_INTERVAL = 125; // ms (8 Hz)
+
+function throttledRenderHomeJobs() {
+  const now = Date.now();
+  if (now - homeJobsLastRender >= HOME_JOBS_RENDER_INTERVAL) {
+    homeJobsLastRender = now;
+    _doRenderHomeJobs();
+  } else if (!homeJobsRenderPending) {
+    homeJobsRenderPending = true;
+    setTimeout(() => {
+      homeJobsRenderPending = false;
+      homeJobsLastRender = Date.now();
+      _doRenderHomeJobs();
+    }, HOME_JOBS_RENDER_INTERVAL - (now - homeJobsLastRender));
+  }
+}
+
+// =========================================================================
+// COLLAPSIBLE PANELS & UI PREFERENCES
+// =========================================================================
+
+// Load collapsed panels from localStorage
+function getCollapsedPanels() {
+  try {
+    return JSON.parse(localStorage.getItem('vp_collapsed_panels') || '[]');
+  } catch { return []; }
+}
+
+function saveCollapsedPanels(panels) {
+  localStorage.setItem('vp_collapsed_panels', JSON.stringify(panels));
+}
+
+function togglePanelCollapse(panel) {
+  const panelId = panel.dataset.panel;
+  if (!panelId) return;
+  
+  const collapsed = getCollapsedPanels();
+  const isCollapsed = panel.classList.toggle('collapsed');
+  
+  if (isCollapsed) {
+    if (!collapsed.includes(panelId)) collapsed.push(panelId);
+  } else {
+    const idx = collapsed.indexOf(panelId);
+    if (idx > -1) collapsed.splice(idx, 1);
+  }
+  saveCollapsedPanels(collapsed);
+}
+
+function initCollapsiblePanels() {
+  const collapsed = getCollapsedPanels();
+  
+  document.querySelectorAll('.panel[data-panel]').forEach(panel => {
+    const panelId = panel.dataset.panel;
+    const h2 = panel.querySelector('h2');
+    
+    // Restore collapsed state
+    if (collapsed.includes(panelId)) {
+      panel.classList.add('collapsed');
+    }
+    
+    // Click on h2 toggles collapse
+    if (h2) {
+      h2.addEventListener('click', (e) => {
+        // Don't collapse if clicking on a button/input inside h2
+        if (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT') return;
+        togglePanelCollapse(panel);
+      });
+    }
+  });
+}
+
+// Analysis button visibility preferences
+function getVisibleAnalysisButtons() {
+  try {
+    return JSON.parse(localStorage.getItem('vp_visible_analysis_btns') || '{}');
+  } catch { return {}; }
+}
+
+function saveVisibleAnalysisButtons(btns) {
+  localStorage.setItem('vp_visible_analysis_btns', JSON.stringify(btns));
+}
+
+function updateAnalysisButtonVisibility() {
+  const prefs = getVisibleAnalysisButtons();
+  
+  const mapping = {
+    'showBtnHighlights': 'btnAnalyzeHighlights',
+    'showBtnAudio': 'btnAnalyzeAudio',
+    'showBtnAudioEvents': 'btnAnalyzeAudioEvents',
+    'showBtnSpeech': 'btnAnalyzeSpeech',
+    'showBtnContext': 'btnAnalyzeContext',
+    'showBtnReset': 'btnResetAnalysis',
+  };
+  
+  for (const [checkboxId, btnId] of Object.entries(mapping)) {
+    const checkbox = $(`#${checkboxId}`);
+    const btn = $(`#${btnId}`);
+    if (checkbox && btn) {
+      const visible = !!prefs[checkboxId];
+      checkbox.checked = visible;
+      btn.classList.toggle('visible', visible);
+    }
+  }
+}
+
+function initAnalysisButtonToggles() {
+  const dropdown = $('#analysisToolsDropdown');
+  const toggleBtn = $('#btnAnalysisTools');
+  
+  if (!dropdown || !toggleBtn) return;
+  
+  // Toggle dropdown
+  toggleBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    dropdown.style.display = dropdown.style.display === 'none' ? 'block' : 'none';
+  });
+  
+  // Close dropdown when clicking outside
+  document.addEventListener('click', () => {
+    dropdown.style.display = 'none';
+  });
+  
+  // Prevent dropdown from closing when clicking inside
+  dropdown.addEventListener('click', (e) => {
+    e.stopPropagation();
+  });
+  
+  // Wire up checkboxes
+  const mapping = {
+    'showBtnHighlights': 'btnAnalyzeHighlights',
+    'showBtnAudio': 'btnAnalyzeAudio',
+    'showBtnAudioEvents': 'btnAnalyzeAudioEvents',
+    'showBtnSpeech': 'btnAnalyzeSpeech',
+    'showBtnContext': 'btnAnalyzeContext',
+    'showBtnReset': 'btnResetAnalysis',
+  };
+  
+  for (const [checkboxId, btnId] of Object.entries(mapping)) {
+    const checkbox = $(`#${checkboxId}`);
+    if (checkbox) {
+      checkbox.addEventListener('change', () => {
+        const prefs = getVisibleAnalysisButtons();
+        prefs[checkboxId] = checkbox.checked;
+        saveVisibleAnalysisButtons(prefs);
+        
+        const btn = $(`#${btnId}`);
+        if (btn) {
+          btn.classList.toggle('visible', checkbox.checked);
+        }
+      });
+    }
+  }
+  
+  // Load initial state
+  updateAnalysisButtonVisibility();
+}
+
+// =========================================================================
+// UTILITY FUNCTIONS
+// =========================================================================
+
 function fmtTime(sec) {
   sec = Math.max(0, Number(sec) || 0);
   const h = Math.floor(sec / 3600);
@@ -556,7 +724,7 @@ async function startUrlDownload(url) {
 
     // Watch job progress
     watchHomeJob(res.job_id);
-    renderHomeJobs();
+    throttledRenderHomeJobs();
 
   } catch (e) {
     alert(`Failed to start download: ${e.message}`);
@@ -571,7 +739,7 @@ function watchHomeJob(jobId) {
       if (payload.type === 'job_update' || payload.type === 'job_created') {
         const j = payload.job;
         homeJobs.set(j.id, j);
-        renderHomeJobs();
+        throttledRenderHomeJobs();
 
         // If download succeeded and auto-opened, switch to Studio
         if (j.kind === 'download_url' && j.status === 'succeeded' && j.result?.auto_opened) {
@@ -602,7 +770,12 @@ async function cancelJob(jobId) {
   }
 }
 
+// Alias for initial render (non-throttled)
 function renderHomeJobs() {
+  _doRenderHomeJobs();
+}
+
+function _doRenderHomeJobs() {
   const container = $('#homeJobs');
   if (!container) return;
 
@@ -611,87 +784,341 @@ function renderHomeJobs() {
     return;
   }
 
-  container.innerHTML = '';
+  // Build job cards - update in place if possible to prevent flicker
   const sorted = Array.from(homeJobs.values()).sort((a, b) =>
     a.created_at < b.created_at ? 1 : -1
   );
 
+  // Track existing cards by job ID
+  const existingCards = new Map();
+  container.querySelectorAll('.item[data-job-id]').forEach(el => {
+    existingCards.set(el.dataset.jobId, el);
+  });
+
+  // Remove cards for jobs that no longer exist
+  existingCards.forEach((el, id) => {
+    if (!homeJobs.has(id)) {
+      el.remove();
+    }
+  });
+
   for (const job of sorted) {
-    const el = document.createElement('div');
-    el.className = 'item';
-    const pct = Math.round((job.progress || 0) * 100);
-
-    let statusClass = '';
-    if (job.status === 'running') statusClass = 'status-badge running';
-    else if (job.status === 'succeeded') statusClass = 'status-badge succeeded';
-    else if (job.status === 'failed') statusClass = 'status-badge failed';
-    else if (job.status === 'cancelled') statusClass = 'status-badge canceled';
-    else statusClass = 'status-badge queued';
-
-    let resultInfo = '';
-    if (job.status === 'succeeded' && job.result?.video_path) {
-      const filename = job.result.video_path.split(/[/\\]/).pop();
-      resultInfo = `<div class="small" style="margin-top:4px">Downloaded: ${filename}</div>`;
-      
-      // Show chat status
-      const chat = job.result?.chat;
-      if (chat) {
-        if (chat.imported) {
-          resultInfo += `<div class="small" style="color:#22c55e;margin-top:2px">✓ Chat imported</div>`;
-        } else if (chat.import_error) {
-          resultInfo += `<div class="small" style="color:#f59e0b;margin-top:2px">⚠ Chat import failed: ${chat.import_error}</div>`;
-        } else if (chat.status === 'failed') {
-          resultInfo += `<div class="small" style="color:#f59e0b;margin-top:2px">⚠ Chat download failed: ${chat.message}</div>`;
-        } else if (chat.status === 'skipped') {
-          resultInfo += `<div class="small" style="color:#888;margin-top:2px">○ ${chat.message}</div>`;
-        }
-      }
+    let el = existingCards.get(job.id);
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'item';
+      el.dataset.jobId = job.id;
+      container.appendChild(el);
     }
     
-    // Show chat status while running
-    let chatStatusInfo = '';
-    if (job.status === 'running' && job.result?.chat_status) {
-      const cs = job.result.chat_status;
-      const chatMsg = job.result.chat_message || '';
-      const chatPct = job.result.chat_progress;
-      if (cs === 'downloading') {
-        // Show detailed chat progress if available
-        let chatDetail = chatMsg || 'Downloading...';
-        if (chatPct !== undefined && chatPct > 0) {
-          const chatPctDisplay = Math.round(chatPct * 100);
-          chatStatusInfo = `<div class="small" style="color:#6366f1;margin-top:2px">📥 Chat: ${chatDetail}</div>`;
-        } else {
-          chatStatusInfo = `<div class="small" style="color:#6366f1;margin-top:2px">📥 Chat: ${chatDetail}</div>`;
+    updateJobCard(el, job);
+  }
+}
+
+function updateJobCard(el, job) {
+  const pct = Math.round((job.progress || 0) * 100);
+  const jobId = job.id;
+
+  let statusClass = '';
+  if (job.status === 'running') statusClass = 'status-badge running';
+  else if (job.status === 'succeeded') statusClass = 'status-badge succeeded';
+  else if (job.status === 'failed') statusClass = 'status-badge failed';
+  else if (job.status === 'cancelled') statusClass = 'status-badge canceled';
+  else statusClass = 'status-badge queued';
+
+  // Check if we need to create the initial structure or just update values
+  const existingMeta = el.querySelector('.meta');
+  
+  if (!existingMeta) {
+    // First render - create the full structure with data attributes for updates
+    let resultInfo = '';
+    if (job.status === 'succeeded' && job.result?.video_path) {
+        const filename = job.result.video_path.split(/[/\\]/).pop();
+        resultInfo = `<div class="small" style="margin-top:4px">Downloaded: ${filename}</div>`;
+        
+        // Show chat status
+        const chat = job.result?.chat;
+        if (chat) {
+          if (chat.imported) {
+            resultInfo += `<div class="small" style="color:#22c55e;margin-top:2px">✓ Chat imported</div>`;
+          } else if (chat.import_error) {
+            resultInfo += `<div class="small" style="color:#f59e0b;margin-top:2px">⚠ Chat import failed: ${chat.import_error}</div>`;
+          } else if (chat.status === 'failed') {
+            resultInfo += `<div class="small" style="color:#f59e0b;margin-top:2px">⚠ Chat download failed: ${chat.message}</div>`;
+          } else if (chat.status === 'skipped') {
+            resultInfo += `<div class="small" style="color:#888;margin-top:2px">○ ${chat.message}</div>`;
+          }
         }
-      } else if (cs === 'importing') {
-        chatStatusInfo = `<div class="small" style="color:#a855f7;margin-top:2px">⚙️ Importing chat: ${chatMsg || 'Processing...'}</div>`;
-      } else if (cs === 'pending') {
-        chatStatusInfo = `<div class="small" style="color:#888;margin-top:2px">○ Chat: pending</div>`;
-      }
+        
+        // Show transcript status
+        const transcript = job.result?.transcript;
+        if (transcript) {
+          if (transcript.status === 'complete') {
+            resultInfo += `<div class="small" style="color:#22c55e;margin-top:2px">✓ Transcript ready (${transcript.segment_count} segments)</div>`;
+          } else if (transcript.status === 'failed') {
+            resultInfo += `<div class="small" style="color:#f59e0b;margin-top:2px">⚠ Early transcript failed (will run during analysis)</div>`;
+          }
+        }
     }
 
     let errorInfo = '';
     if (job.status === 'failed') {
-      errorInfo = `<div class="small" style="color:var(--danger);margin-top:4px">${job.message}</div>`;
+      errorInfo = `<div class="small error-info" style="color:var(--danger);margin-top:4px">${job.message}</div>`;
     }
 
     el.innerHTML = `
       <div class="title">
-        <span class="${statusClass}">${job.status}</span>
+        <span class="${statusClass}" data-role="status">${job.status}</span>
         ${job.kind === 'download_url' ? 'URL Download' : job.kind}
-        ${job.status === 'running' ? `<button class="btn btn-small btn-danger" style="margin-left:auto;padding:2px 8px;font-size:11px" onclick="cancelJob('${job.id}')">Cancel</button>` : ''}
+        ${job.status === 'running' ? `<button class="btn btn-small btn-danger" style="margin-left:auto;padding:2px 8px;font-size:11px" onclick="cancelJob('${jobId}')">Cancel</button>` : ''}
       </div>
-      <div class="meta">${job.message || ''}</div>
-      ${chatStatusInfo}
-      ${job.status === 'running' ? `
-        <div class="progress" style="margin-top:8px"><div style="width:${pct}%"></div></div>
-        <div class="small" style="margin-top:4px">${pct}%</div>
-      ` : ''}
-      ${resultInfo}
+      <div class="meta" data-role="meta">${job.message || ''}</div>
+      <div class="parallel-tasks" data-role="tasks" style="min-height:80px;margin-top:8px"></div>
+      <div class="progress-section" data-role="progress-section" style="margin-top:8px">
+        <div class="progress"><div data-role="progress-bar" style="width:${pct}%;transition:width 0.2s"></div></div>
+        <div class="small" data-role="progress-pct" style="margin-top:4px">${pct}%</div>
+      </div>
+      <div class="result-info" data-role="result">${resultInfo}</div>
       ${errorInfo}
     `;
+    
+    // Hide progress section if not running
+    if (job.status !== 'running') {
+      const progressSection = el.querySelector('[data-role="progress-section"]');
+      if (progressSection) progressSection.style.display = 'none';
+    }
+  } else {
+    // Update existing elements in place (no innerHTML replacement to prevent flicker)
+    
+    // Update meta text
+    const metaEl = el.querySelector('[data-role="meta"]');
+    if (metaEl && metaEl.textContent !== (job.message || '')) {
+      metaEl.textContent = job.message || '';
+    }
+    
+    // Update progress bar and percentage
+    const progressBar = el.querySelector('[data-role="progress-bar"]');
+    const progressPct = el.querySelector('[data-role="progress-pct"]');
+    const progressSection = el.querySelector('[data-role="progress-section"]');
+    
+    if (job.status === 'running') {
+      if (progressSection) progressSection.style.display = '';
+      if (progressBar) progressBar.style.width = `${pct}%`;
+      if (progressPct && progressPct.textContent !== `${pct}%`) {
+        progressPct.textContent = `${pct}%`;
+      }
+    } else {
+      if (progressSection) progressSection.style.display = 'none';
+    }
+    
+    // Update status badge
+    const statusEl = el.querySelector('[data-role="status"]');
+    if (statusEl) {
+      statusEl.className = statusClass;
+      if (statusEl.textContent !== job.status) {
+        statusEl.textContent = job.status;
+      }
+    }
+  }
+  
+  // Always update parallel tasks section for running jobs (use innerHTML here but scoped to tasks div)
+  if (job.status === 'running') {
+    const tasksEl = el.querySelector('[data-role="tasks"]');
+    if (tasksEl) {
+      updateParallelTasks(tasksEl, job);
+    }
+  }
+}
 
-    container.appendChild(el);
+// Update parallel task rows (chat + transcript) in-place to prevent flickering
+function updateParallelTasks(tasksEl, job) {
+  const cs = job.result?.chat_status;
+  const chatPct = job.result?.chat_progress;
+  const chatMsgCount = job.result?.chat_messages_count || 0;
+  const chatMsg = job.result?.chat_message || '';
+  
+  const ts = job.result?.transcript_status;
+  const transPct = job.result?.transcript_progress || 0;
+  const audioPct = job.result?.audio_progress || 0;
+  const audioTotal = job.result?.audio_total_bytes;
+  const audioSpeed = job.result?.audio_speed;
+  
+  // Get or create chat row
+  let chatRow = tasksEl.querySelector('[data-task="chat"]');
+  if (!chatRow) {
+    chatRow = document.createElement('div');
+    chatRow.className = 'task-row';
+    chatRow.dataset.task = 'chat';
+    chatRow.style.cssText = 'padding:6px 8px;border-radius:6px;margin-bottom:6px';
+    chatRow.innerHTML = `
+      <div class="small" style="display:flex;align-items:center;gap:6px">
+        <span data-role="icon">💬</span>
+        <span style="flex:1" data-role="label">Chat</span>
+        <span data-role="pct"></span>
+      </div>
+      <div class="progress" style="margin-top:4px;height:3px"><div data-role="bar" style="width:0%;transition:width 0.2s"></div></div>
+      <div class="small" data-role="detail" style="margin-top:2px;color:#888;font-size:10px"></div>
+    `;
+    tasksEl.appendChild(chatRow);
+  }
+  
+  // Get or create transcript row
+  let transRow = tasksEl.querySelector('[data-task="transcript"]');
+  if (!transRow) {
+    transRow = document.createElement('div');
+    transRow.className = 'task-row';
+    transRow.dataset.task = 'transcript';
+    transRow.style.cssText = 'padding:6px 8px;border-radius:6px;margin-bottom:6px';
+    transRow.innerHTML = `
+      <div class="small" style="display:flex;align-items:center;gap:6px">
+        <span data-role="icon">🎙️</span>
+        <span style="flex:1" data-role="label">Transcript</span>
+        <span data-role="pct"></span>
+      </div>
+      <div class="progress" style="margin-top:4px;height:3px"><div data-role="bar" style="width:0%;transition:width 0.2s"></div></div>
+      <div class="small" data-role="detail" style="margin-top:2px;color:#888;font-size:10px"></div>
+    `;
+    tasksEl.appendChild(transRow);
+  }
+  
+  // Update chat row based on state
+  const chatIcon = chatRow.querySelector('[data-role="icon"]');
+  const chatLabel = chatRow.querySelector('[data-role="label"]');
+  const chatPctEl = chatRow.querySelector('[data-role="pct"]');
+  const chatBar = chatRow.querySelector('[data-role="bar"]');
+  const chatDetail = chatRow.querySelector('[data-role="detail"]');
+  const chatProgress = chatRow.querySelector('.progress');
+  
+  if (cs === 'downloading') {
+    chatRow.style.background = 'rgba(99,102,241,0.1)';
+    chatRow.querySelector('.small').style.color = '#6366f1';
+    chatIcon.textContent = '💬';
+    chatLabel.textContent = 'Chat';
+    const chatPctDisplay = chatPct !== undefined ? Math.round(chatPct * 100) : 0;
+    chatPctEl.textContent = `${chatPctDisplay}%`;
+    chatBar.style.width = `${chatPctDisplay}%`;
+    chatBar.style.background = '#6366f1';
+    chatProgress.style.display = '';
+    chatDetail.style.display = '';
+    chatDetail.textContent = chatMsgCount > 0 ? `${chatMsgCount.toLocaleString()} messages` : (chatMsg || 'Starting...');
+  } else if (cs === 'importing' || cs === 'ai_learning') {
+    chatRow.style.background = 'rgba(168,85,247,0.1)';
+    chatRow.querySelector('.small').style.color = '#a855f7';
+    chatIcon.textContent = '⚙️';
+    chatLabel.textContent = cs === 'ai_learning' ? 'Learning emotes...' : 'Importing...';
+    chatPctEl.textContent = '';
+    chatProgress.style.display = 'none';
+    chatDetail.style.display = 'none';
+  } else if (cs === 'complete' || cs === 'success') {
+    chatRow.style.background = 'rgba(34,197,94,0.1)';
+    chatRow.querySelector('.small').style.color = '#22c55e';
+    chatIcon.textContent = '✓';
+    chatLabel.textContent = 'Chat ready';
+    chatPctEl.textContent = '';
+    chatProgress.style.display = 'none';
+    chatDetail.style.display = 'none';
+  } else if (cs === 'failed') {
+    chatRow.style.background = 'rgba(239,68,68,0.1)';
+    chatRow.querySelector('.small').style.color = '#ef4444';
+    chatIcon.textContent = '⚠️';
+    chatLabel.textContent = 'Chat failed';
+    chatPctEl.textContent = '';
+    chatProgress.style.display = 'none';
+    chatDetail.style.display = 'none';
+  } else {
+    // Pending or unknown state
+    chatRow.style.background = 'rgba(100,100,100,0.1)';
+    chatRow.querySelector('.small').style.color = '#888';
+    chatIcon.textContent = '💬';
+    chatLabel.textContent = 'Chat waiting...';
+    chatPctEl.textContent = '';
+    chatProgress.style.display = 'none';
+    chatDetail.style.display = 'none';
+  }
+  
+  // Update transcript row based on state
+  const transIcon = transRow.querySelector('[data-role="icon"]');
+  const transLabel = transRow.querySelector('[data-role="label"]');
+  const transPctEl = transRow.querySelector('[data-role="pct"]');
+  const transBar = transRow.querySelector('[data-role="bar"]');
+  const transDetail = transRow.querySelector('[data-role="detail"]');
+  const transProgress = transRow.querySelector('.progress');
+  
+  if (ts === 'downloading_audio' || ts === 'audio_ready') {
+    transRow.style.background = 'rgba(34,197,94,0.1)';
+    transRow.querySelector('.small').style.color = '#22c55e';
+    const isReady = ts === 'audio_ready';
+    transIcon.textContent = '🎙️';
+    transLabel.textContent = isReady ? 'Preparing transcript...' : 'Audio';
+    const audioPctDisplay = Math.round(audioPct * 100);
+    transPctEl.textContent = isReady ? '' : `${audioPctDisplay}%`;
+    transBar.style.width = isReady ? '100%' : `${audioPctDisplay}%`;
+    transBar.style.background = '#22c55e';
+    transProgress.style.display = '';
+    // Audio detail
+    let audioDetail = '';
+    if (audioTotal && !isReady) {
+      const sizeMB = (audioTotal / 1024 / 1024).toFixed(1);
+      audioDetail = `${sizeMB} MB`;
+    }
+    if (audioSpeed && !isReady) {
+      const speedMBs = (audioSpeed / 1024 / 1024).toFixed(1);
+      audioDetail += audioDetail ? ` @ ${speedMBs} MB/s` : `${speedMBs} MB/s`;
+    }
+    transDetail.style.display = audioDetail ? '' : 'none';
+    transDetail.textContent = audioDetail;
+  } else if (ts === 'transcribing') {
+    transRow.style.background = 'rgba(34,197,94,0.1)';
+    transRow.querySelector('.small').style.color = '#22c55e';
+    transIcon.textContent = '🎙️';
+    transLabel.textContent = 'Transcribing';
+    const transPctDisplay = Math.round(transPct * 100);
+    transPctEl.textContent = `${transPctDisplay}%`;
+    transBar.style.width = `${transPctDisplay}%`;
+    transBar.style.background = '#22c55e';
+    transProgress.style.display = '';
+    transDetail.style.display = 'none';
+  } else if (ts === 'complete') {
+    transRow.style.background = 'rgba(34,197,94,0.1)';
+    transRow.querySelector('.small').style.color = '#22c55e';
+    transIcon.textContent = '✓';
+    transLabel.textContent = 'Transcript ready';
+    transPctEl.textContent = '';
+    transProgress.style.display = 'none';
+    transDetail.style.display = 'none';
+  } else if (ts === 'failed' || ts === 'audio_failed') {
+    transRow.style.background = 'rgba(239,68,68,0.1)';
+    transRow.querySelector('.small').style.color = '#ef4444';
+    transIcon.textContent = '⚠️';
+    transLabel.textContent = 'Transcript failed';
+    transPctEl.textContent = '';
+    transProgress.style.display = 'none';
+    transDetail.style.display = 'none';
+  } else if (ts === 'disabled') {
+    transRow.style.background = 'rgba(100,100,100,0.1)';
+    transRow.querySelector('.small').style.color = '#888';
+    transIcon.textContent = '🎙️';
+    transLabel.textContent = 'Transcript disabled';
+    transPctEl.textContent = '';
+    transProgress.style.display = 'none';
+    transDetail.style.display = 'none';
+  } else if (ts === 'deferred') {
+    transRow.style.background = 'rgba(100,100,100,0.1)';
+    transRow.querySelector('.small').style.color = '#888';
+    transIcon.textContent = '🎙️';
+    transLabel.textContent = 'Transcript deferred';
+    transPctEl.textContent = '';
+    transProgress.style.display = 'none';
+    transDetail.style.display = 'none';
+  } else {
+    // Pending or unknown state
+    transRow.style.background = 'rgba(100,100,100,0.1)';
+    transRow.querySelector('.small').style.color = '#888';
+    transIcon.textContent = '🎙️';
+    transLabel.textContent = 'Transcript waiting...';
+    transPctEl.textContent = '';
+    transProgress.style.display = 'none';
+    transDetail.style.display = 'none';
   }
 }
 
@@ -717,6 +1144,346 @@ function renderProjectInfo() {
   $('#projectInfo').textContent = `Project ${project.project_id} • ${fmtTime(v.duration_seconds)} • ${v.path}`;
 }
 
+// =========================================================================
+// ANALYSIS PIPELINE STATUS (Issue 2: Unified status panel)
+// =========================================================================
+
+function renderPipelineStatus() {
+  const container = $('#pipelineStatus');
+  if (!container || !project) return;
+
+  const analysis = project.analysis || {};
+  
+  // Helper to format elapsed time for pipeline stages
+  const formatPipelineTime = (seconds) => {
+    if (seconds == null) return '';
+    if (seconds < 60) return `${seconds.toFixed(1)}s`;
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.round(seconds % 60);
+    return `${mins}m ${secs}s`;
+  };
+
+  // Helper: treat either generated_at or created_at as "complete"
+  const hasRun = (obj) => !!(obj && (obj.generated_at || obj.created_at));
+  
+  // Define all pipeline stages with their detection logic
+  // Order reflects actual dependency/execution order in analyze_full:
+  //   Stage 1 (parallel): transcript, audio, motion, audio_events, chat, reaction_audio
+  //   Stage 1.5: scenes (depends on motion)
+  //   Stage 1.6: speech_features (depends on transcript)
+  //   Stage 2: highlights (combines ALL signals incl. speech + reaction, with optional LLM semantic scoring)
+  //   Stage 3: enrich (adds hook_text and quote_text to candidates)
+  //   Stage 4: chapters, boundaries, clip_variants, director
+  const stages = [
+    // === Stage 1: Parallel input analysis ===
+    {
+      id: 'transcript',
+      name: 'Transcription',
+      icon: '🎙️',
+      check: () => {
+        const t = analysis.transcript;
+        if (t?.segment_count > 0) {
+          const backend = t.backend_used || 'auto';
+          const gpu = t.gpu_used ? ' (GPU)' : '';
+          const lang = t.detected_language ? ` [${t.detected_language}]` : '';
+          const elapsed = t.elapsed_seconds;
+          const timeStr = elapsed ? ` • ${formatPipelineTime(elapsed)}` : '';
+          return { state: 'done', detail: `${t.segment_count} segments • ${backend}${gpu}${lang}${timeStr}` };
+        }
+        return { state: 'pending', detail: 'Not yet run' };
+      }
+    },
+    {
+      id: 'audio',
+      name: 'Audio RMS',
+      icon: '🔊',
+      check: () => {
+        const a = analysis.audio;
+        if (hasRun(a)) {
+          const peakCount = a.candidates?.length || 0;
+          const timeStr = a.elapsed_seconds ? ` • ${formatPipelineTime(a.elapsed_seconds)}` : '';
+          return { state: 'done', detail: `${peakCount} peaks found${timeStr}` };
+        }
+        return { state: 'pending', detail: 'Not yet run' };
+      }
+    },
+    {
+      id: 'motion',
+      name: 'Motion Analysis',
+      icon: '🎬',
+      check: () => {
+        const m = analysis.motion;
+        if (hasRun(m)) {
+          const timeStr = m.elapsed_seconds ? ` • ${formatPipelineTime(m.elapsed_seconds)}` : '';
+          return { state: 'done', detail: `Analyzed${timeStr}` };
+        }
+        const motionMode = $('#motionWeightMode')?.value || 'off';
+        if (motionMode === 'off') {
+          return { state: 'skipped', detail: 'Disabled (Motion=Off)' };
+        }
+        return { state: 'pending', detail: 'Not yet run' };
+      }
+    },
+    {
+      id: 'audio_events',
+      name: 'Audio Events',
+      icon: '🎉',
+      check: () => {
+        const ae = analysis.audio_events;
+        if (hasRun(ae)) {
+          const candidateCount = ae.candidates?.length || 0;
+          const timeStr = ae.elapsed_seconds ? ` • ${formatPipelineTime(ae.elapsed_seconds)}` : '';
+          return { state: 'done', detail: `${candidateCount} candidates${timeStr}` };
+        }
+        return { state: 'pending', detail: 'Not yet run' };
+      }
+    },
+    {
+      id: 'chat_features',
+      name: 'Chat Features',
+      icon: '💬',
+      check: () => {
+        const cf = analysis.chat;
+        if (hasRun(cf)) {
+          const source = cf.laugh_source || 'unknown';
+          const isLLM = source.startsWith('llm');
+          const tokenCount = cf.laugh_tokens_count || 0;
+          const llmCount = cf.llm_learned_count || 0;
+          const timeStr = cf.elapsed_seconds ? ` • ${formatPipelineTime(cf.elapsed_seconds)}` : '';
+          if (isLLM) {
+            return { state: 'done', detail: `LLM: ${tokenCount} emotes (${llmCount} AI-learned)${timeStr}` };
+          } else {
+            return { state: 'partial', detail: `Seeds only: ${tokenCount} emotes (LLM not used)${timeStr}` };
+          }
+        }
+        // Check if chat is available (try multiple sources)
+        const hasChat = project.chat_ai_status?.has_chat || chatStatus?.available || project.chat?.available;
+        if (!hasChat) {
+          return { state: 'skipped', detail: 'No chat data' };
+        }
+        return { state: 'pending', detail: 'Not yet run' };
+      }
+    },
+    // === Stage 2: Signal fusion (with optional LLM semantic scoring) ===
+    {
+      id: 'highlights',
+      name: 'Highlight Fusion',
+      icon: '⭐',
+      check: () => {
+        const h = analysis.highlights;
+        if (hasRun(h)) {
+          const count = h.candidates?.length || 0;
+          const llmUsed = h.signals_used?.llm_semantic ? ' + LLM' : '';
+          const speechUsed = h.signals_used?.speech ? ' + speech' : '';
+          const reactionUsed = h.signals_used?.reaction ? ' + reaction' : '';
+          const extras = speechUsed + reactionUsed + llmUsed;
+          const timeStr = h.elapsed_seconds ? ` • ${formatPipelineTime(h.elapsed_seconds)}` : '';
+          return { state: 'done', detail: `${count} candidates${extras}${timeStr}` };
+        }
+        return { state: 'pending', detail: 'Not yet run' };
+      }
+    },
+    // === Stage 3: Enrichment (hook/quote text) ===
+    {
+      id: 'speech_features',
+      name: 'Speech Features',
+      icon: '🗣️',
+      check: () => {
+        // Backend stores speech features in analysis.speech (with created_at)
+        const sf = analysis.speech;
+        if (hasRun(sf)) {
+          const timeStr = sf.elapsed_seconds ? ` • ${formatPipelineTime(sf.elapsed_seconds)}` : '';
+          return { state: 'done', detail: `Extracted from transcript${timeStr}` };
+        }
+        if (!analysis.transcript?.segment_count) {
+          return { state: 'skipped', detail: 'Requires transcript' };
+        }
+        return { state: 'pending', detail: 'Not yet run' };
+      }
+    },
+    {
+      id: 'reaction_audio',
+      name: 'Reaction Audio',
+      icon: '🎭',
+      check: () => {
+        const ra = analysis.reaction_audio;
+        if (hasRun(ra)) {
+          const timeStr = ra.elapsed_seconds ? ` • ${formatPipelineTime(ra.elapsed_seconds)}` : '';
+          return { state: 'done', detail: `Acoustic reaction cues${timeStr}` };
+        }
+        return { state: 'pending', detail: 'Not yet run' };
+      }
+    },
+    {
+      id: 'enrich',
+      name: 'Enrich Candidates',
+      icon: '📝',
+      check: () => {
+        const h = analysis.highlights;
+        // Backend sets enriched_at when enrichment completes
+        if (h?.enriched_at) {
+          const timeStr = h.enrich_elapsed_seconds ? ` • ${formatPipelineTime(h.enrich_elapsed_seconds)}` : '';
+          return { state: 'done', detail: `Hook & quote text extracted${timeStr}` };
+        }
+        // Check dependencies
+        if (!hasRun(analysis.highlights)) {
+          return { state: 'skipped', detail: 'Requires highlights' };
+        }
+        if (!hasRun(analysis.transcript)) {
+          return { state: 'skipped', detail: 'Requires transcript' };
+        }
+        return { state: 'pending', detail: 'Not yet run' };
+      }
+    },
+    // === Stage 4: Context analysis & AI ===
+    {
+      id: 'chapters',
+      name: 'Semantic Chapters',
+      icon: '📖',
+      check: () => {
+        const ch = analysis.chapters;
+        if (hasRun(ch)) {
+          const count = ch.chapter_count || 0;
+          const timeStr = ch.elapsed_seconds ? ` • ${formatPipelineTime(ch.elapsed_seconds)}` : '';
+          return { state: 'done', detail: `${count} chapters detected${timeStr}` };
+        }
+        // Check if chapters are enabled in profile
+        const chaptersEnabled = profile?.context?.chapters?.enabled !== false;
+        if (!chaptersEnabled) {
+          return { state: 'skipped', detail: 'Disabled in profile' };
+        }
+        if (!analysis.transcript?.segment_count) {
+          return { state: 'skipped', detail: 'Requires transcript' };
+        }
+        return { state: 'pending', detail: 'Not yet run' };
+      }
+    },
+    {
+      id: 'boundaries',
+      name: 'Context Boundaries',
+      icon: '📍',
+      check: () => {
+        const b = analysis.boundaries;
+        if (hasRun(b)) {
+          const timeStr = b.elapsed_seconds ? ` • ${formatPipelineTime(b.elapsed_seconds)}` : '';
+          return { state: 'done', detail: `Scene boundaries computed${timeStr}` };
+        }
+        return { state: 'pending', detail: 'Not yet run' };
+      }
+    },
+    {
+      id: 'clip_variants',
+      name: 'Clip Variants',
+      icon: '🎞️',
+      check: () => {
+        const cv = analysis.clip_variants;
+        if (hasRun(cv)) {
+          const count = cv.variants_count || 0;
+          const timeStr = cv.elapsed_seconds ? ` • ${formatPipelineTime(cv.elapsed_seconds)}` : '';
+          return { state: 'done', detail: `${count} variants generated${timeStr}` };
+        }
+        if (!hasRun(analysis.boundaries)) {
+          return { state: 'skipped', detail: 'Requires boundaries' };
+        }
+        return { state: 'pending', detail: 'Not yet run' };
+      }
+    },
+    {
+      id: 'director',
+      name: 'AI Director',
+      icon: '🤖',
+      check: () => {
+        const d = analysis.ai_director;
+        if (hasRun(d)) {
+          const count = d.candidate_count || 0;
+          const llm = d.llm_available ? 'LLM' : 'heuristic';
+          const timeStr = d.elapsed_seconds ? ` • ${formatPipelineTime(d.elapsed_seconds)}` : '';
+          return { state: 'done', detail: `${count} clips analyzed • ${llm}${timeStr}` };
+        }
+        // Check if AI is disabled
+        const aiEnabled = profile?.ai?.director?.enabled !== false;
+        if (!aiEnabled) {
+          return { state: 'skipped', detail: 'Disabled in profile (ai.director.enabled=false)' };
+        }
+        if (!hasRun(analysis.clip_variants)) {
+          return { state: 'skipped', detail: 'Requires clip variants' };
+        }
+        return { state: 'pending', detail: 'Not yet run' };
+      }
+    }
+  ];
+
+  // Count states
+  let doneCount = 0, pendingCount = 0, skippedCount = 0, partialCount = 0;
+  
+  // Build HTML
+  let html = '<div style="display:grid;gap:6px">';
+  
+  for (const stage of stages) {
+    const result = stage.check();
+    
+    let stateIcon, stateColor, bgColor;
+    switch (result.state) {
+      case 'done':
+        stateIcon = '✓';
+        stateColor = '#22c55e';
+        bgColor = 'rgba(34,197,94,0.1)';
+        doneCount++;
+        break;
+      case 'partial':
+        stateIcon = '⚠';
+        stateColor = '#eab308';
+        bgColor = 'rgba(234,179,8,0.1)';
+        partialCount++;
+        break;
+      case 'skipped':
+        stateIcon = '○';
+        stateColor = '#666';
+        bgColor = 'rgba(100,100,100,0.1)';
+        skippedCount++;
+        break;
+      case 'running':
+        stateIcon = '⏳';
+        stateColor = '#3b82f6';
+        bgColor = 'rgba(59,130,246,0.1)';
+        break;
+      case 'failed':
+        stateIcon = '✗';
+        stateColor = '#ef4444';
+        bgColor = 'rgba(239,68,68,0.1)';
+        break;
+      default:
+        stateIcon = '·';
+        stateColor = '#555';
+        bgColor = 'transparent';
+        pendingCount++;
+    }
+    
+    html += `
+      <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:${bgColor};border-radius:6px;border-left:3px solid ${stateColor}">
+        <span style="font-size:14px">${stage.icon}</span>
+        <span style="flex:1;color:${stateColor};font-weight:500">${stage.name}</span>
+        <span style="color:${stateColor};font-size:11px">${stateIcon}</span>
+      </div>
+      <div style="margin-left:32px;margin-top:-4px;margin-bottom:4px;color:#888;font-size:10px">${result.detail}</div>
+    `;
+  }
+  
+  html += '</div>';
+  
+  // Summary line
+  const total = stages.length;
+  const summaryColor = doneCount === total ? '#22c55e' : (doneCount > 0 ? '#eab308' : '#666');
+  html = `
+    <div style="margin-bottom:12px;padding:8px;background:#1a1a2e;border-radius:6px;display:flex;justify-content:space-between;align-items:center">
+      <span style="color:${summaryColor};font-weight:600">Pipeline: ${doneCount}/${total} complete</span>
+      <span style="color:#888;font-size:11px">${skippedCount} skipped • ${partialCount} partial • ${pendingCount} pending</span>
+    </div>
+  ` + html;
+  
+  container.innerHTML = html;
+}
+
 function renderCandidates() {
   const container = $('#candidates');
   container.innerHTML = '';
@@ -739,9 +1506,13 @@ function renderCandidates() {
       const motion = Number(c.breakdown.motion).toFixed(2);
       const chat = Number(c.breakdown.chat).toFixed(2);
       const audioEvents = Number(c.breakdown.audio_events || 0).toFixed(2);
+      const speech = Number(c.breakdown.speech || 0).toFixed(2);
+      const reaction = Number(c.breakdown.reaction || 0).toFixed(2);
       breakdown = ` • audio ${audio} / motion ${motion}`;
       if (Number(c.breakdown.chat) !== 0) breakdown += ` / chat ${chat}`;
       if (Number(c.breakdown.audio_events || 0) !== 0) breakdown += ` / events ${audioEvents}`;
+      if (Number(c.breakdown.speech || 0) !== 0) breakdown += ` / speech ${speech}`;
+      if (Number(c.breakdown.reaction || 0) !== 0) breakdown += ` / reaction ${reaction}`;
     }
     
     // Get AI metadata if available
@@ -766,8 +1537,12 @@ function renderCandidates() {
       `;
     }
     
+    // Warning badge if boundary graph wasn't used (may start mid-sentence)
+    const boundaryWarning = c.used_boundary_graph === false ? 
+      '<span class="badge" style="background:#854d0e;color:#fef08a;margin-left:6px" title="May start mid-sentence (no boundary data)">⚠ rough cut</span>' : '';
+    
     el.innerHTML = `
-      <div class="title">#${c.rank} • score ${c.score.toFixed(2)} <span class="badge">peak ${fmtTime(c.peak_time_s)}</span></div>
+      <div class="title">#${c.rank} • score ${c.score.toFixed(2)} <span class="badge">peak ${fmtTime(c.peak_time_s)}</span>${boundaryWarning}</div>
       <div class="meta">Clip: ${fmtTime(c.start_s)} → ${fmtTime(c.end_s)} (${(c.end_s - c.start_s).toFixed(1)}s)${breakdown}</div>
       ${aiHtml}
       <div class="actions">
@@ -924,9 +1699,10 @@ function renderJobs() {
     return;
   }
 
-  // Helper to format seconds nicely, or handle "cached" marker
+  // Helper to format seconds nicely, or handle "cached"/"skipped" markers
   const formatTime = (seconds) => {
     if (seconds === "cached") return 'cached';
+    if (seconds === "skipped") return 'skipped';
     if (seconds == null) return '';
     if (typeof seconds !== 'number') return String(seconds);
     if (seconds < 60) return `${seconds.toFixed(1)}s`;
@@ -973,11 +1749,14 @@ function renderJobs() {
         // Build a clearer display
         let tasksHtml = '<div style="margin-top:6px;font-size:11px;line-height:1.6">';
         
-        // Completed tasks - distinguish cached from computed
+        // Completed tasks - distinguish cached/skipped from computed
         for (const t of completed) {
           const time = taskTimes[t];
           const isCached = time === "cached";
-          if (isCached) {
+          const isSkipped = time === "skipped";
+          if (isSkipped) {
+            tasksHtml += `<div style="color:#888">○ ${t} <span style="font-style:italic">(skipped - no data)</span></div>`;
+          } else if (isCached) {
             tasksHtml += `<div style="color:#888">✓ ${t} <span style="font-style:italic">(cached)</span></div>`;
           } else {
             const timeStr = time != null ? formatTime(time) : '';
@@ -1028,30 +1807,46 @@ function renderJobs() {
         // Final result with stage timing
         const candidateCount = r.candidates_count || 0;
         const errorCount = (r.errors || []).length;
+        
+        // Summary line
         detailHtml = `<div class="meta" style="margin-top:4px;font-size:11px">`;
-        detailHtml += `Stages: ${r.completed_stages.join(', ')}`;
-        if (candidateCount > 0) detailHtml += ` | <strong>${candidateCount} candidates</strong>`;
+        if (candidateCount > 0) detailHtml += `<strong>${candidateCount} candidates</strong>`;
         if (errorCount > 0) detailHtml += ` | <span style="color:#f59e0b">${errorCount} errors</span>`;
         detailHtml += `</div>`;
         
-        // Add stage timing breakdown - separate cached from computed
+        // Add stage timing breakdown as a detailed list
         if (Object.keys(stageTimes).length > 0) {
-          const computedParts = [];
+          const computedStages = [];
           const cachedStages = [];
+          const skippedStages = [];
           for (const [stage, time] of Object.entries(stageTimes)) {
-            if (time === "cached") {
+            if (time === "skipped") {
+              skippedStages.push(stage);
+            } else if (time === "cached") {
               cachedStages.push(stage);
             } else {
-              computedParts.push(`${stage}: ${formatTime(time)}`);
+              computedStages.push({ stage, time });
             }
           }
-          let timingHtml = '';
-          if (computedParts.length > 0) {
-            timingHtml += `<div class="meta" style="margin-top:2px;font-size:10px;color:#22c55e">⏱ ${computedParts.join(' | ')}</div>`;
+          
+          let timingHtml = '<div style="margin-top:6px;font-size:11px;line-height:1.6">';
+          
+          // Show computed stages with times
+          for (const { stage, time } of computedStages) {
+            timingHtml += `<div style="color:#22c55e">✓ ${stage} <span style="color:#888">${formatTime(time)}</span></div>`;
           }
-          if (cachedStages.length > 0) {
-            timingHtml += `<div class="meta" style="margin-top:2px;font-size:10px;color:#888">📦 Cached: ${cachedStages.join(', ')}</div>`;
+          
+          // Show cached stages
+          for (const stage of cachedStages) {
+            timingHtml += `<div style="color:#888">✓ ${stage} <span style="font-style:italic">(cached)</span></div>`;
           }
+          
+          // Show skipped stages
+          for (const stage of skippedStages) {
+            timingHtml += `<div style="color:#888">○ ${stage} <span style="font-style:italic">(skipped - no data)</span></div>`;
+          }
+          
+          timingHtml += '</div>';
           detailHtml += timingHtml;
         }
         
@@ -1062,9 +1857,11 @@ function renderJobs() {
         // In-progress after Stage 1 - sequential stages
         let tasksHtml = '<div style="margin-top:6px;font-size:11px;line-height:1.6">';
         
-        // Show completed stages - distinguish cached from computed
+        // Show completed stages - distinguish cached/skipped from computed
         for (const [stage, time] of Object.entries(stageTimes)) {
-          if (time === "cached") {
+          if (time === "skipped") {
+            tasksHtml += `<div style="color:#888">○ ${stage} <span style="font-style:italic">(skipped - no data)</span></div>`;
+          } else if (time === "cached") {
             tasksHtml += `<div style="color:#888">✓ ${stage} <span style="font-style:italic">(cached)</span></div>`;
           } else {
             tasksHtml += `<div style="color:#22c55e">✓ ${stage} <span style="color:#888">${formatTime(time)}</span></div>`;
@@ -1168,7 +1965,7 @@ function stopJobsTimer() {
 
 function watchJob(jobId) {
   const es = new EventSource(`/api/jobs/${jobId}/events`);
-  es.onmessage = (ev) => {
+  es.onmessage = async (ev) => {
     try {
       const payload = JSON.parse(ev.data);
       if (payload.type === 'job_update' || payload.type === 'job_created') {
@@ -1181,9 +1978,11 @@ function watchJob(jobId) {
           startJobsTimer();
         }
         
-        if ((j.kind === 'analyze_audio' || j.kind === 'analyze_highlights' || j.kind === 'analyze_speech' || j.kind === 'analyze_context_titles' || j.kind === 'analyze_full') && j.status === 'succeeded') {
-          // refresh project and timeline to show reranked candidates
+        if ((j.kind === 'analyze_audio' || j.kind === 'analyze_highlights' || j.kind === 'analyze_speech' || j.kind === 'analyze_context_titles' || j.kind === 'analyze_full') && (j.status === 'succeeded' || j.status === 'failed')) {
+          // refresh project and timeline to show enriched candidates (even on partial failure)
           refreshProject();
+          // refresh chat status to update AI Director status
+          loadChatStatus();
         }
         if (j.kind === 'export' && j.status === 'succeeded') {
           // refresh project to show exports list eventually
@@ -1191,6 +1990,7 @@ function watchJob(jobId) {
         }
         if ((j.kind === 'download_chat' || j.kind === 'download_url') && j.status === 'succeeded') {
           // refresh chat status after download completes
+          await refreshProject();  // refresh project first to get updated chat_ai_status
           loadChatStatus();
           // Also refresh videos list in home view if visible
           if ($('#recentVideos')) {
@@ -1289,9 +2089,12 @@ async function refreshProject() {
     console.warn('Failed to refresh project:', e);
   }
   renderProjectInfo();
+  renderPipelineStatus();
   renderCandidates();
   renderSelections();
   await refreshTimeline();
+  // Also refresh chat UI to show AI analysis status
+  updateChatUI();
 }
 
 function updateFacecamStatus() {
@@ -1566,6 +2369,7 @@ function wireUI() {
       alert(`Analysis reset complete!\n\nDeleted ${res.deleted_files.length} files.`);
       refreshProject();
       refreshTimeline();
+      loadChatStatus();  // Refresh AI Analysis Status panel (director, chat emotes)
     } catch (e) {
       alert(`Failed to reset analysis: ${e.message}`);
     }
@@ -2109,8 +2913,93 @@ function updateChatUI() {
 
   if (!panel) return;
 
+  // Build AI status indicator (from chatStatus.ai_status, not project)
+  let aiStatusHtml = '';
+  const aiStatus = chatStatus?.ai_status;
+  const directorStatus = chatStatus?.director_status;
+  
+  if (aiStatus?.has_chat || directorStatus?.analyzed) {
+    aiStatusHtml = '<div id="aiStatusPanel" style="margin-top:12px;padding:10px;background:#1a1a2e;border-radius:8px;border:1px solid #333">';
+    aiStatusHtml += '<div style="font-weight:600;color:#e0e0e0;margin-bottom:8px;font-size:13px">🤖 AI Analysis Status</div>';
+    
+    // Chat Emotes section
+    if (aiStatus?.has_chat) {
+      if (aiStatus.ai_analyzed) {
+        const llmCount = aiStatus.llm_learned_count || 0;
+        const tokenCount = aiStatus.laugh_tokens_count || 0;
+        const newlyLearnedCount = aiStatus.newly_learned_count || 0;
+        const loadedFromGlobal = aiStatus.loaded_from_global || 0;
+        const newlyLearnedTokens = aiStatus.newly_learned_tokens || [];
+        const llmLearned = aiStatus.llm_learned_tokens || [];
+        
+        // Show newly learned tokens if any, otherwise show all LLM-learned
+        const displayTokens = newlyLearnedTokens.length > 0 ? newlyLearnedTokens : llmLearned;
+        const tokenDisplay = displayTokens.slice(0, 6).join(', ');
+        const tokenMore = displayTokens.length > 6 ? ` +${displayTokens.length - 6}` : '';
+        
+        // Build description based on what happened
+        let description = `${tokenCount} emotes`;
+        if (loadedFromGlobal > 0 && newlyLearnedCount === 0) {
+          description += ` (${loadedFromGlobal} from channel history)`;
+        } else if (newlyLearnedCount > 0) {
+          description += ` (${newlyLearnedCount} NEW this session)`;
+        } else if (llmCount > 0) {
+          description += ` (${llmCount} AI-discovered)`;
+        }
+        
+        // Color code: green if new tokens learned, blue if using cached
+        const hasNew = newlyLearnedCount > 0;
+        const borderColor = hasNew ? '#22c55e' : '#3b82f6';
+        const bgColor = hasNew ? 'rgba(34,197,94,0.1)' : 'rgba(59,130,246,0.1)';
+        const textColor = hasNew ? '#22c55e' : '#3b82f6';
+        const tokenColor = hasNew ? '#a855f7' : '#60a5fa';
+        
+        aiStatusHtml += `
+          <div style="padding:8px;background:${bgColor};border-radius:6px;border-left:3px solid ${borderColor};margin-bottom:8px">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <div>
+                <div style="color:${textColor};font-weight:500;font-size:12px">✓ Chat Emotes (LLM)</div>
+                <div style="color:#aaa;font-size:11px;margin-top:2px">${description}</div>
+                ${displayTokens.length > 0 ? `<div style="color:${tokenColor};font-size:10px;margin-top:4px">${tokenDisplay}${tokenMore}</div>` : ''}
+              </div>
+              <button id="btnRelearnAI" style="padding:4px 8px;font-size:11px;background:#333;border:1px solid #555;color:#aaa;border-radius:4px;cursor:pointer">Re-learn</button>
+            </div>
+          </div>`;
+      } else {
+        const skipReason = aiStatus.llm_skip_reason || 'LLM not used';
+        aiStatusHtml += `
+          <div style="padding:8px;background:rgba(234,179,8,0.1);border-radius:6px;border-left:3px solid #eab308;margin-bottom:8px">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <div>
+                <div style="color:#eab308;font-weight:500;font-size:12px">⚠ Chat Emotes (Seeds Only)</div>
+                <div style="color:#888;font-size:11px;margin-top:2px">${skipReason}</div>
+              </div>
+              <button id="btnRelearnAI" style="padding:4px 8px;font-size:11px;background:#4a3f00;border:1px solid #eab308;color:#eab308;border-radius:4px;cursor:pointer">Learn with AI</button>
+            </div>
+          </div>`;
+      }
+    }
+    
+    // Director section
+    if (directorStatus?.analyzed) {
+      aiStatusHtml += `
+        <div style="padding:8px;background:rgba(59,130,246,0.1);border-radius:6px;border-left:3px solid #3b82f6">
+          <div style="color:#3b82f6;font-weight:500;font-size:12px">✓ AI Director</div>
+          <div style="color:#aaa;font-size:11px;margin-top:2px">${directorStatus.candidates_count} clips analyzed • ${directorStatus.model}</div>
+        </div>`;
+    } else {
+      aiStatusHtml += `
+        <div style="padding:8px;background:rgba(100,100,100,0.1);border-radius:6px;border-left:3px solid #666">
+          <div style="color:#888;font-weight:500;font-size:12px">○ AI Director</div>
+          <div style="color:#666;font-size:11px;margin-top:2px">Run Analyze (Full) to generate AI clip metadata</div>
+        </div>`;
+    }
+    
+    aiStatusHtml += '</div>';
+  }
+
   if (!chatStatus || !chatStatus.available) {
-    statusEl.textContent = 'No chat replay available.';
+    statusEl.innerHTML = 'No chat replay available.' + aiStatusHtml;
     statusEl.className = 'small';
     if (messagesEl) messagesEl.innerHTML = '';
     if (offsetControls) offsetControls.style.display = 'none';
@@ -2121,11 +3010,15 @@ function updateChatUI() {
     if (sourceUrlInput && chatStatus?.source_url) {
       sourceUrlInput.value = chatStatus.source_url;
     }
+    // Wire up re-learn button if present
+    wireRelearnButton();
     return;
   }
 
-  statusEl.textContent = `Chat: ${chatStatus.message_count.toLocaleString()} messages`;
+  statusEl.innerHTML = `Chat: ${chatStatus.message_count.toLocaleString()} messages` + aiStatusHtml;
   statusEl.className = 'small success';
+  // Wire up re-learn button
+  wireRelearnButton();
   if (offsetControls) offsetControls.style.display = 'flex';
   if (offsetInput) offsetInput.value = chatStatus.sync_offset_ms || 0;
   if (sourceUrlInput && chatStatus.source_url) {
@@ -2262,9 +3155,35 @@ async function clearChat() {
     stopChatSync();
     updateChatUI();
     $('#chatMessages').innerHTML = '';
+    await loadChatStatus();  // Refresh AI Analysis Status panel
   } catch (e) {
     alert(`Failed to clear chat: ${e.message}`);
   }
+}
+
+function wireRelearnButton() {
+  const btn = $('#btnRelearnAI');
+  if (!btn) return;
+  
+  btn.onclick = async () => {
+    if (!confirm('This will clear the cached emote data and require re-analysis with Analyze (Full) to learn channel-specific emotes using AI.\n\nContinue?')) {
+      return;
+    }
+    
+    btn.disabled = true;
+    btn.textContent = 'Clearing...';
+    
+    try {
+      await apiJson('POST', '/api/chat/relearn_ai', {});
+      await loadChatStatus();
+      alert('Chat AI cache cleared. Run "Analyze (Full)" to re-learn emotes with AI.');
+    } catch (e) {
+      alert(`Failed to clear AI cache: ${e.message}`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Re-learn';
+    }
+  };
 }
 
 async function setChatOffset() {
@@ -2332,6 +3251,10 @@ async function main() {
     profile = await apiGet('/api/profile');
   } catch (_) {}
 
+  // Initialize collapsible panels
+  initCollapsiblePanels();
+  initAnalysisButtonToggles();
+
   // Wire up home UI first
   wireHomeUI();
   wireTabUI();
@@ -2355,6 +3278,7 @@ async function main() {
 
 async function initStudioView() {
   renderProjectInfo();
+  renderPipelineStatus();
   renderCandidates();
   renderSelections();
   renderJobs();
@@ -2408,20 +3332,38 @@ async function updateWhisperBackendOptions() {
     const select = $('#whisperBackend');
     if (!select) return;
     
-    // Update option labels with availability
+    // Update option labels with availability (unavailable shown with ✗)
     for (const opt of select.options) {
-      if (opt.value === 'whispercpp') {
+      if (opt.value === 'openai_whisper') {
+        const available = backends.openai_whisper;
+        const gpu = backends.openai_whisper_gpu;
+        if (!available) {
+          opt.textContent = 'openai-whisper ✗';
+          opt.disabled = true;
+        } else {
+          opt.textContent = gpu ? 'openai-whisper (GPU)' : 'openai-whisper';
+          opt.disabled = false;
+        }
+      } else if (opt.value === 'whispercpp') {
         const available = backends.whispercpp;
         const gpu = backends.whispercpp_gpu;
-        opt.textContent = `whisper.cpp${available ? (gpu ? ' (GPU)' : ' ✓') : ' ✗'}`;
-        opt.disabled = !available;
+        if (!available) {
+          opt.textContent = 'whisper.cpp ✗';
+          opt.disabled = true;
+        } else {
+          opt.textContent = gpu ? 'whisper.cpp (GPU)' : 'whisper.cpp';
+          opt.disabled = false;
+        }
       } else if (opt.value === 'faster_whisper') {
         const available = backends.faster_whisper;
         const gpu = backends.faster_whisper_gpu;
-        opt.textContent = `faster-whisper${available ? (gpu ? ' (CUDA)' : ' ✓') : ' ✗'}`;
-        opt.disabled = !available;
-      } else if (opt.value === 'auto') {
-        opt.textContent = `Auto (${info.transcription?.recommended || 'best available'})`;
+        if (!available) {
+          opt.textContent = 'faster-whisper ✗';
+          opt.disabled = true;
+        } else {
+          opt.textContent = gpu ? 'faster-whisper (CUDA)' : 'faster-whisper';
+          opt.disabled = false;
+        }
       }
     }
   } catch (e) {
