@@ -2202,13 +2202,15 @@ async function startAnalyzeFullJob() {
   $('#analysisStatus').textContent = 'Starting full parallel analysis (DAG)...';
   const motionMode = $('#motionWeightMode')?.value || 'low';
   const whisperBackend = $('#whisperBackend')?.value || 'auto';
+  const whisperVerbose = $('#whisperVerbose')?.checked || false;
   const res = await apiJson('POST', '/api/analyze/full', {
     highlights: {
       motion_weight_mode: motionMode
     },
     speech: {
       backend: whisperBackend,
-      strict: whisperBackend !== 'auto'  // Strict mode when explicitly choosing a backend
+      strict: whisperBackend !== 'auto',  // Strict mode when explicitly choosing a backend
+      verbose: whisperVerbose
     }
   });
   const jobId = res.job_id;
@@ -2219,10 +2221,12 @@ async function startAnalyzeFullJob() {
 async function startAnalyzeSpeechJob() {
   $('#analysisStatus').textContent = 'Starting speech analysis (Whisper transcription)...';
   const whisperBackend = $('#whisperBackend')?.value || 'auto';
+  const whisperVerbose = $('#whisperVerbose')?.checked || false;
   const res = await apiJson('POST', '/api/analyze/speech', {
     speech: {
       backend: whisperBackend,
-      strict: whisperBackend !== 'auto'  // Strict mode when explicitly choosing a backend
+      strict: whisperBackend !== 'auto',  // Strict mode when explicitly choosing a backend
+      verbose: whisperVerbose
     }
   });
   const jobId = res.job_id;
@@ -3323,6 +3327,111 @@ async function initStudioView() {
   
   // Update whisper backend dropdown with availability info
   updateWhisperBackendOptions();
+  
+  // GPU memory status
+  updateGpuMemoryStatus();
+  const btnClearGpu = $('#btnClearGpuMemory');
+  if (btnClearGpu) {
+    btnClearGpu.onclick = clearGpuMemory;
+  }
+}
+
+async function updateGpuMemoryStatus() {
+  const statusEl = $('#gpuMemoryStatus');
+  if (!statusEl) return;
+  
+  try {
+    // Fetch both GPU and LLM status in parallel
+    const [gpuData, llmData] = await Promise.all([
+      apiGet('/api/system/gpu'),
+      apiGet('/api/system/llm').catch(() => null)
+    ]);
+    
+    let lines = [];
+    
+    // GPU info
+    if (!gpuData.available) {
+      lines.push('No GPU available');
+    } else {
+      const mem = gpuData.memory;
+      if (mem) {
+        const allocated = mem.allocated_gb.toFixed(2);
+        const reserved = mem.reserved_gb.toFixed(2);
+        lines.push(`${gpuData.device_name}`);
+        lines.push(`PyTorch: ${allocated} GB allocated`);
+      } else {
+        lines.push(gpuData.device_name || 'GPU available');
+      }
+    }
+    
+    // LLM server info
+    if (llmData && llmData.running) {
+      const model = llmData.model || 'unknown';
+      const mem = llmData.memory_mb ? ` (~${(llmData.memory_mb / 1024).toFixed(1)} GB)` : '';
+      lines.push(`LLM: ${model}${mem}`);
+    }
+    
+    statusEl.innerHTML = lines.join('<br>');
+    
+    // Color based on memory usage
+    const hasHighUsage = (gpuData.memory?.reserved_gb > 1) || (llmData?.running);
+    statusEl.style.color = hasHighUsage ? '#fbbf24' : '#4ade80';
+  } catch (e) {
+    statusEl.textContent = 'Error checking GPU';
+    statusEl.style.color = '#ef4444';
+  }
+}
+
+async function clearGpuMemory() {
+  const btn = $('#btnClearGpuMemory');
+  if (!btn) return;
+  
+  const origText = btn.textContent;
+  btn.textContent = 'Clearing...';
+  btn.disabled = true;
+  
+  let messages = [];
+  
+  try {
+    // First, stop the LLM server if running
+    try {
+      const llmResult = await apiJson('POST', '/api/system/llm/stop');
+      if (llmResult.was_running && llmResult.success) {
+        messages.push('LLM stopped');
+        // Give it a moment to release memory
+        await new Promise(r => setTimeout(r, 500));
+      }
+    } catch (e) {
+      // LLM stop failed, continue anyway
+    }
+    
+    // Then clear PyTorch GPU cache
+    const data = await apiJson('POST', '/api/system/gpu/clear');
+    if (data.success) {
+      const freed = data.freed_gb || 0;
+      if (freed > 0.01) {
+        messages.push(`${freed.toFixed(2)} GB freed`);
+      }
+    }
+    
+    if (messages.length > 0) {
+      btn.textContent = `✓ ${messages.join(', ')}`;
+    } else {
+      btn.textContent = '✓ Cleared';
+    }
+    
+    setTimeout(() => {
+      btn.textContent = origText;
+      btn.disabled = false;
+      updateGpuMemoryStatus();
+    }, 2500);
+  } catch (e) {
+    btn.textContent = 'Error';
+    setTimeout(() => {
+      btn.textContent = origText;
+      btn.disabled = false;
+    }, 2000);
+  }
 }
 
 async function updateWhisperBackendOptions() {

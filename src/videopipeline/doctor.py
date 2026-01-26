@@ -3,17 +3,10 @@ from __future__ import annotations
 import importlib.util
 import shutil
 import subprocess
-import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-
-def _subprocess_flags() -> dict[str, Any]:
-    """Return subprocess flags to hide console window on Windows."""
-    if sys.platform == "win32":
-        # CREATE_NO_WINDOW = 0x08000000
-        return {"creationflags": 0x08000000}
-    return {}
+from .utils import subprocess_flags as _subprocess_flags
 
 
 @dataclass(frozen=True)

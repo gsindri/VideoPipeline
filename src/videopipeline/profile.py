@@ -144,6 +144,25 @@ def default_profile() -> Dict[str, Any]:
                 "border_px": 6,
             }
         },
+        "ai": {
+            "director": {
+                "enabled": True,
+                "engine": "llama_cpp_server",
+                "endpoint": "http://127.0.0.1:11435",
+                "model_name": "local-gguf",
+                "timeout_s": 30,
+                "max_tokens": 256,
+                "temperature": 0.2,
+                "platform": "shorts",
+                "fallback_to_rules": True,
+                # Auto-start server config
+                "server_path": "C:/llama.cpp/llama-server.exe",
+                "model_path": "C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf",
+                "auto_start": True,
+                "startup_timeout_s": 120,
+                "auto_stop_idle_s": 600,
+            }
+        },
     }
 
 

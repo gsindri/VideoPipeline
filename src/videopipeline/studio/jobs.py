@@ -6,9 +6,9 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from ..exporter import ExportSpec, HookTextSpec, LayoutPipSpec, run_ffmpeg_export
 from ..layouts import get_facecam_rect
@@ -16,10 +16,22 @@ from ..metadata import build_metadata, derive_hook_text, write_metadata
 from ..project import Project, get_project_data, record_export
 from ..subtitles import SubtitleSegment, write_ass
 from ..transcribe import TranscribeConfig, WhisperNotInstalledError, load_transcript_json, save_transcript_json, transcribe_segment
+from ..utils import utc_iso as _utc_iso, PreventSleep
 
 
-def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def with_prevent_sleep(reason: str = "VideoPipeline job") -> Callable:
+    """Decorator to wrap a function with sleep prevention.
+    
+    Use this on job runner functions to prevent Windows from sleeping
+    during long operations like analysis or export.
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with PreventSleep(reason):
+                return func(*args, **kwargs)
+        return wrapper
+    return decorator
 
 
 @dataclass
@@ -136,6 +148,7 @@ class JobManager:
     ) -> Job:
         job = self.create("export")
 
+        @with_prevent_sleep("Exporting video")
         def runner() -> None:
             self._set(job, status="running", progress=0.0, message="starting")
             try:
@@ -284,6 +297,7 @@ class JobManager:
     ) -> Job:
         job = self.create("export_batch")
 
+        @with_prevent_sleep("Exporting batch")
         def runner() -> None:
             total = max(1, len(selections))
             self._set(job, status="running", progress=0.0, message=f"exporting 0/{total}")

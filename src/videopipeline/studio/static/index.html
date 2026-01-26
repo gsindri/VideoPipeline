@@ -156,6 +156,9 @@
                 <option value="auto">auto</option>
               </select>
             </label>
+            <label title="Print transcript to server console as it's transcribed (useful for monitoring progress)">
+              <input type="checkbox" id="whisperVerbose" /> Verbose
+            </label>
             <div class="dropdown" style="position:relative">
               <button id="btnAnalysisTools" title="Show/hide individual analysis tools">🔧 Tools ▾</button>
               <div id="analysisToolsDropdown" class="dropdown-menu" style="display:none;position:absolute;top:100%;left:0;background:#1a1d24;border:1px solid var(--border);border-radius:6px;padding:8px;z-index:100;min-width:180px;margin-top:4px">
@@ -177,6 +180,10 @@
                 <label class="dropdown-item" style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;font-size:12px">
                   <input type="checkbox" id="showBtnReset" /> Reset Analysis
                 </label>
+                <hr style="border:0;border-top:1px solid var(--border);margin:8px 0">
+                <div style="font-size:11px;color:#888;margin-bottom:4px">GPU Memory</div>
+                <div id="gpuMemoryStatus" style="font-size:11px;color:#888;margin-bottom:6px">Loading...</div>
+                <button id="btnClearGpuMemory" style="width:100%;font-size:11px;padding:4px 8px">🧹 Clear GPU Memory</button>
               </div>
             </div>
             <button class="primary analysis-btn-optional" id="btnAnalyzeHighlights">Analyze highlights</button>

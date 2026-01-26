@@ -2,20 +2,13 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator
 
 import numpy as np
 
-
-def _subprocess_flags() -> dict[str, Any]:
-    """Return subprocess flags to hide console window on Windows."""
-    if sys.platform == "win32":
-        # CREATE_NO_WINDOW = 0x08000000
-        return {"creationflags": 0x08000000}
-    return {}
+from .utils import subprocess_flags as _subprocess_flags
 
 
 def _require_cmd(cmd: str) -> str:

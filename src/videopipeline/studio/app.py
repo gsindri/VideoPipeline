@@ -25,13 +25,14 @@ from ..analysis_chat_boundaries import ChatBoundaryConfig, compute_chat_boundari
 from ..analysis_boundaries import BoundaryConfig, compute_boundaries_analysis
 from ..clip_variants import VariantGeneratorConfig, VariantDurationConfig, compute_clip_variants, load_clip_variants
 from ..ai.director import DirectorConfig, compute_director_analysis
+from ..ai.helpers import get_llm_complete_fn
 from ..layouts import RectNorm
 from ..project import create_or_load_project, get_project_data, load_npz, set_layout_facecam, Project, utc_now_iso
 from ..profile import load_profile
 from ..publisher.accounts import AccountStore
 from ..publisher.jobs import PublishJobStore
 from ..publisher.queue import PublishWorker
-from .jobs import JOB_MANAGER
+from .jobs import JOB_MANAGER, with_prevent_sleep
 from .range import ranged_file_response
 from .home import list_recent_projects, windows_open_video_dialog, check_video_exists
 from .publisher_api import create_publisher_router
@@ -146,6 +147,188 @@ def create_app(
                 "gpu_available": backends.get("openai_whisper_gpu") or backends.get("faster_whisper_gpu") or backends.get("whispercpp_gpu"),
             },
         })
+
+    @app.get("/api/system/gpu")
+    def api_system_gpu() -> JSONResponse:
+        """Get GPU memory status and optionally clear cache."""
+        import gc
+        
+        result: Dict[str, Any] = {
+            "available": False,
+            "device_name": None,
+            "memory": None,
+        }
+        
+        try:
+            import torch
+            if torch.cuda.is_available():
+                result["available"] = True
+                result["device_name"] = torch.cuda.get_device_name(0)
+                result["device_count"] = torch.cuda.device_count()
+                
+                # Memory stats in GB
+                allocated = torch.cuda.memory_allocated(0) / 1024**3
+                reserved = torch.cuda.memory_reserved(0) / 1024**3
+                max_allocated = torch.cuda.max_memory_allocated(0) / 1024**3
+                
+                result["memory"] = {
+                    "allocated_gb": round(allocated, 3),
+                    "reserved_gb": round(reserved, 3),
+                    "max_allocated_gb": round(max_allocated, 3),
+                }
+        except ImportError:
+            result["error"] = "PyTorch not installed"
+        except Exception as e:
+            result["error"] = str(e)
+        
+        return JSONResponse(result)
+
+    @app.post("/api/system/gpu/clear")
+    def api_system_gpu_clear() -> JSONResponse:
+        """Force clear GPU memory cache."""
+        import gc
+        
+        result: Dict[str, Any] = {
+            "success": False,
+            "before": None,
+            "after": None,
+        }
+        
+        try:
+            import torch
+            if torch.cuda.is_available():
+                # Get memory before
+                before_allocated = torch.cuda.memory_allocated(0) / 1024**3
+                before_reserved = torch.cuda.memory_reserved(0) / 1024**3
+                result["before"] = {
+                    "allocated_gb": round(before_allocated, 3),
+                    "reserved_gb": round(before_reserved, 3),
+                }
+                
+                # Force Python garbage collection first
+                gc.collect()
+                
+                # Clear CUDA/ROCm cache
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                
+                # Reset peak memory stats
+                torch.cuda.reset_peak_memory_stats()
+                
+                # Get memory after
+                after_allocated = torch.cuda.memory_allocated(0) / 1024**3
+                after_reserved = torch.cuda.memory_reserved(0) / 1024**3
+                result["after"] = {
+                    "allocated_gb": round(after_allocated, 3),
+                    "reserved_gb": round(after_reserved, 3),
+                }
+                
+                result["success"] = True
+                result["freed_gb"] = round(before_reserved - after_reserved, 3)
+            else:
+                result["error"] = "No GPU available"
+        except ImportError:
+            result["error"] = "PyTorch not installed"
+        except Exception as e:
+            result["error"] = str(e)
+        
+        return JSONResponse(result)
+
+    @app.get("/api/system/llm")
+    def api_system_llm() -> JSONResponse:
+        """Get LLM server status."""
+        import subprocess
+        import urllib.request
+        
+        result: Dict[str, Any] = {
+            "running": False,
+            "endpoint": None,
+            "model": None,
+        }
+        
+        # Get configured endpoint from profile
+        ai_cfg = ctx.profile.get("ai", {}).get("director", {})
+        endpoint = ai_cfg.get("endpoint", "http://127.0.0.1:11435")
+        result["endpoint"] = endpoint
+        
+        # Check if server is running
+        try:
+            req = urllib.request.Request(f"{endpoint}/health", method="GET")
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                if resp.status == 200:
+                    result["running"] = True
+                    
+                    # Try to get model info
+                    try:
+                        import json
+                        req2 = urllib.request.Request(f"{endpoint}/v1/models")
+                        with urllib.request.urlopen(req2, timeout=2.0) as resp2:
+                            data = json.loads(resp2.read().decode('utf-8'))
+                            if data.get("data"):
+                                result["model"] = data["data"][0].get("id", "unknown")
+                    except:
+                        pass
+        except:
+            pass
+        
+        # Check process info
+        try:
+            proc = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq llama-server.exe", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=5
+            )
+            if "llama-server.exe" in proc.stdout:
+                # Parse PID and memory from CSV output
+                import csv
+                import io
+                reader = csv.reader(io.StringIO(proc.stdout.strip()))
+                for row in reader:
+                    if len(row) >= 5 and row[0] == '"llama-server.exe"':
+                        result["pid"] = int(row[1].strip('"'))
+                        mem_str = row[4].strip('"').replace(',', '').replace(' K', '')
+                        result["memory_mb"] = int(mem_str) // 1024
+                        break
+        except:
+            pass
+        
+        return JSONResponse(result)
+
+    @app.post("/api/system/llm/stop")
+    def api_system_llm_stop() -> JSONResponse:
+        """Stop the LLM server to free GPU memory."""
+        import subprocess
+        
+        result: Dict[str, Any] = {
+            "success": False,
+            "was_running": False,
+        }
+        
+        # Check if it was running first
+        try:
+            import urllib.request
+            ai_cfg = ctx.profile.get("ai", {}).get("director", {})
+            endpoint = ai_cfg.get("endpoint", "http://127.0.0.1:11435")
+            req = urllib.request.Request(f"{endpoint}/health", method="GET")
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                result["was_running"] = resp.status == 200
+        except:
+            pass
+        
+        # Kill the process
+        try:
+            proc = subprocess.run(
+                ["taskkill", "/F", "/IM", "llama-server.exe"],
+                capture_output=True, text=True, timeout=10
+            )
+            result["success"] = proc.returncode == 0 or "not found" in proc.stderr.lower()
+            if proc.returncode == 0:
+                result["message"] = "LLM server stopped"
+            else:
+                result["message"] = proc.stderr.strip() or "No server to stop"
+        except Exception as e:
+            result["error"] = str(e)
+        
+        return JSONResponse(result)
 
     @app.get("/api/profile")
     def api_profile() -> JSONResponse:
@@ -637,6 +820,7 @@ def create_app(
 
         job = JOB_MANAGER.create("download_url")
 
+        @with_prevent_sleep("Downloading video")
         def runner() -> None:
             import concurrent.futures
             import logging
@@ -1183,52 +1367,11 @@ def create_app(
                                 
                                 # Get LLM for laugh emote learning
                                 ai_cfg = ctx.profile.get("ai", {}).get("director", {})
-                                llm_complete_fn = None
-                                if ai_cfg.get("enabled", True):
-                                    try:
-                                        from pathlib import Path as P
-                                        from ..ai.llm_server import ensure_llm_server
-                                        from ..ai.llm_client import create_llm_client
-                                        
-                                        endpoint = str(ai_cfg.get("endpoint", "http://127.0.0.1:11435"))
-                                        if ai_cfg.get("auto_start", False):
-                                            server_path = P(ai_cfg.get("server_path", "C:/llama.cpp/llama-server.exe"))
-                                            model_path = P(ai_cfg.get("model_path", "C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf"))
-                                            auto_stop_s = ai_cfg.get("auto_stop_idle_s", 600.0)
-                                            startup_timeout_s = float(ai_cfg.get("startup_timeout_s", 120.0))
-                                            
-                                            log.info(f"[CHAT DEBUG] Auto-starting LLM server (timeout={startup_timeout_s}s)...")
-                                            
-                                            def on_llm_status(msg: str) -> None:
-                                                JOB_MANAGER._set(job, message=msg)
-                                            
-                                            started_endpoint = ensure_llm_server(
-                                                server_path=server_path,
-                                                model_path=model_path,
-                                                port=int(endpoint.split(":")[-1]),
-                                                auto_stop_after_idle_s=auto_stop_s,
-                                                startup_timeout_s=startup_timeout_s,
-                                                on_status=on_llm_status,
-                                            )
-                                            if started_endpoint:
-                                                endpoint = started_endpoint
-                                                log.info(f"[CHAT DEBUG] LLM server started at {endpoint}")
-                                            else:
-                                                log.warning(f"[CHAT DEBUG] LLM server failed to start within {startup_timeout_s}s")
-                                        
-                                        llm_client = create_llm_client(
-                                            endpoint=endpoint,
-                                            cache_dir=proj.analysis_dir,
-                                        )
-                                        if llm_client.is_available():
-                                            log.info(f"[CHAT DEBUG] LLM available for emote learning at {endpoint}")
-                                            def llm_complete_fn(prompt: str) -> str:
-                                                resp = llm_client.complete(prompt, json_mode=True)
-                                                return json.dumps(resp) if isinstance(resp, dict) else str(resp)
-                                        else:
-                                            log.warning(f"[CHAT DEBUG] LLM NOT available at {endpoint}")
-                                    except Exception as e:
-                                        log.warning(f"[CHAT DEBUG] LLM setup failed: {e}")
+                                
+                                def on_llm_status(msg: str) -> None:
+                                    JOB_MANAGER._set(job, message=msg)
+                                
+                                llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir, on_status=on_llm_status)
                                 
                                 def on_feature_status(msg: str) -> None:
                                     JOB_MANAGER._set(job, message=msg)
@@ -1953,6 +2096,7 @@ def create_app(
 
         job = JOB_MANAGER.create("analyze_full")
 
+        @with_prevent_sleep("Full analysis running")
         def runner() -> None:
             import time as _time
             import threading
@@ -2243,48 +2387,7 @@ def create_app(
                 smooth_s = float(highlights_cfg.get("chat_smooth_seconds", 3.0))
                 
                 # Get LLM for laugh emote learning (with auto-start)
-                ai_cfg = ctx.profile.get("ai", {}).get("director", {})
-                llm_complete_fn = None
-                if ai_cfg.get("enabled", True):
-                    try:
-                        from pathlib import Path as P
-                        from ..ai.llm_server import ensure_llm_server
-                        from ..ai.llm_client import create_llm_client
-                        
-                        # Auto-start server if configured
-                        endpoint = str(ai_cfg.get("endpoint", "http://127.0.0.1:11435"))
-                        if ai_cfg.get("auto_start", False):
-                            server_path = P(ai_cfg.get("server_path", "C:/llama.cpp/llama-server.exe"))
-                            model_path = P(ai_cfg.get("model_path", "C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf"))
-                            auto_stop_s = ai_cfg.get("auto_stop_idle_s", 600.0)
-                            startup_timeout_s = float(ai_cfg.get("startup_timeout_s", 120.0))
-                            log.info(f"[chat] Auto-starting LLM server (timeout={startup_timeout_s}s): {server_path}")
-                            started_endpoint = ensure_llm_server(
-                                server_path=server_path,
-                                model_path=model_path,
-                                port=int(endpoint.split(":")[-1]),
-                                auto_stop_after_idle_s=auto_stop_s,
-                                startup_timeout_s=startup_timeout_s,
-                            )
-                            if started_endpoint:
-                                endpoint = started_endpoint
-                                log.info(f"[chat] LLM server started at {endpoint}")
-                            else:
-                                log.warning(f"[chat] LLM server failed to start within {startup_timeout_s}s")
-                        
-                        llm_client = create_llm_client(
-                            endpoint=endpoint,
-                            cache_dir=proj.analysis_dir,
-                        )
-                        if llm_client.is_available():
-                            log.info(f"[chat] LLM client available at {endpoint}")
-                            def llm_complete_fn(prompt: str) -> str:
-                                resp = llm_client.complete(prompt, json_mode=True)
-                                return json.dumps(resp) if isinstance(resp, dict) else str(resp)
-                        else:
-                            log.warning(f"[chat] LLM client NOT available at {endpoint}")
-                    except Exception as e:
-                        log.warning(f"[chat] Failed to create LLM client: {e}")
+                llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
                 
                 # Get channel info from source URL for global emote persistence
                 from ..project import get_source_url
@@ -2498,40 +2601,7 @@ def create_app(
             # Set up LLM client for semantic scoring (optional enhancement)
             llm_complete_fn_highlights = None
             if ai_cfg.get("enabled", True) and highlights_cfg.get("llm_semantic_enabled", True):
-                try:
-                    from pathlib import Path as P
-                    from ..ai.llm_server import ensure_llm_server
-                    from ..ai.llm_client import create_llm_client
-                    
-                    endpoint = str(ai_cfg.get("endpoint", "http://127.0.0.1:11435"))
-                    if ai_cfg.get("auto_start", False):
-                        server_path = P(ai_cfg.get("server_path", "C:/llama.cpp/llama-server.exe"))
-                        model_path = P(ai_cfg.get("model_path", "C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf"))
-                        auto_stop_s = ai_cfg.get("auto_stop_idle_s", 600.0)
-                        startup_timeout_s = float(ai_cfg.get("startup_timeout_s", 120.0))
-                        started_endpoint = ensure_llm_server(
-                            server_path=server_path,
-                            model_path=model_path,
-                            port=int(endpoint.split(":")[-1]),
-                            auto_stop_after_idle_s=auto_stop_s,
-                            startup_timeout_s=startup_timeout_s,
-                        )
-                        if started_endpoint:
-                            endpoint = started_endpoint
-                    
-                    llm_client = create_llm_client(
-                        endpoint=endpoint,
-                        cache_dir=proj.analysis_dir,
-                    )
-                    if llm_client.is_available():
-                        log.info(f"[highlights] LLM semantic scoring enabled at {endpoint}")
-                        def llm_complete_fn_highlights(prompt: str) -> str:
-                            resp = llm_client.complete(prompt, json_mode=True)
-                            return json.dumps(resp) if isinstance(resp, dict) else str(resp)
-                    else:
-                        log.info("[highlights] LLM not available, skipping semantic scoring")
-                except Exception as e:
-                    log.warning(f"[highlights] Failed to create LLM client for semantic scoring: {e}")
+                llm_complete_fn_highlights = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
             
             try:
                 def on_highlights_progress(p: float) -> None:
@@ -3237,51 +3307,11 @@ def create_app(
                 
                 # Get LLM config for laugh emote learning (with auto-start)
                 ai_cfg = ctx.profile.get("ai", {}).get("director", {})
-                llm_complete_fn = None
-                if ai_cfg.get("enabled", True):
-                    try:
-                        from pathlib import Path as P
-                        from ..ai.llm_server import ensure_llm_server
-                        from ..ai.llm_client import create_llm_client
-                        
-                        # Auto-start server if configured
-                        endpoint = str(ai_cfg.get("endpoint", "http://127.0.0.1:11435"))
-                        if ai_cfg.get("auto_start", False):
-                            server_path = P(ai_cfg.get("server_path", "C:/llama.cpp/llama-server.exe"))
-                            model_path = P(ai_cfg.get("model_path", "C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf"))
-                            auto_stop_s = ai_cfg.get("auto_stop_idle_s", 600.0)
-                            
-                            def on_server_status(msg: str) -> None:
-                                JOB_MANAGER._set(job, message=msg)
-                            
-                            started_endpoint = ensure_llm_server(
-                                server_path=server_path,
-                                model_path=model_path,
-                                port=int(endpoint.split(":")[-1]),
-                                auto_stop_after_idle_s=auto_stop_s,
-                                on_status=on_server_status,
-                            )
-                            if started_endpoint:
-                                endpoint = started_endpoint
-                        
-                        llm_client = create_llm_client(
-                            endpoint=endpoint,
-                            cache_dir=proj.analysis_dir,
-                            timeout_s=float(ai_cfg.get("timeout_s", 30)),
-                            max_tokens=int(ai_cfg.get("max_tokens", 256)),
-                            temperature=float(ai_cfg.get("temperature", 0.2)),
-                        )
-                        if llm_client.is_available():
-                            log.info(f"[chat download] LLM available at {endpoint}")
-                            JOB_MANAGER._set(job, message="LLM ready for emote learning...")
-                            def llm_complete_fn(prompt: str) -> str:
-                                resp = llm_client.complete(prompt, json_mode=True)
-                                return json.dumps(resp) if isinstance(resp, dict) else str(resp)
-                        else:
-                            log.warning(f"[chat download] LLM NOT available at {endpoint}")
-                    except Exception as e:
-                        log.warning(f"[chat download] LLM setup failed: {e}")
-                        pass  # LLM not available, will use seed tokens only
+                
+                def on_server_status(msg: str) -> None:
+                    JOB_MANAGER._set(job, message=msg)
+                
+                llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir, on_status=on_server_status)
 
                 def on_feature_progress(frac: float) -> None:
                     JOB_MANAGER._set(job, progress=0.7 + 0.25 * frac)

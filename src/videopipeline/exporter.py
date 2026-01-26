@@ -1,22 +1,16 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .ffmpeg import _require_cmd, ffprobe_video_stream_info
 from .layouts import RectNorm
-
-
-def _subprocess_flags() -> dict[str, Any]:
-    """Return subprocess flags to hide console window on Windows."""
-    if sys.platform == "win32":
-        # CREATE_NO_WINDOW = 0x08000000
-        return {"creationflags": 0x08000000}
-    return {}
+from .utils import subprocess_flags as _subprocess_flags
 
 
 @dataclass(frozen=True)
@@ -72,6 +66,69 @@ def _escape_path_for_ffmpeg_filter(p: Path) -> str:
     s = s.replace('\\', '\\\\')
     s = s.replace(':', '\\:')
     return s
+
+
+def measure_loudness(
+    video_path: Path,
+    start_s: float,
+    end_s: float,
+    *,
+    on_progress: Optional[Callable[[float, str], None]] = None,
+) -> Optional[dict[str, float]]:
+    """Measure audio loudness using ffmpeg loudnorm filter (first pass).
+    
+    Returns dict with measured values for second pass, or None on failure.
+    """
+    _require_cmd("ffmpeg")
+    duration = end_s - start_s
+    
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-y",
+        "-ss", f"{start_s:.3f}",
+        "-i", str(video_path),
+        "-t", f"{duration:.3f}",
+        "-af", "loudnorm=I=-16:LRA=11:TP=-1.5:print_format=json",
+        "-f", "null",
+        "-",
+    ]
+    
+    if on_progress:
+        on_progress(0.0, "measuring loudness")
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            **_subprocess_flags(),
+        )
+        # loudnorm outputs JSON to stderr
+        stderr = result.stderr
+        
+        # Find JSON block in output (it's embedded in other ffmpeg output)
+        json_match = re.search(r'\{[^{}]*"input_i"[^{}]*\}', stderr, re.DOTALL)
+        if not json_match:
+            return None
+        
+        data = json.loads(json_match.group())
+        
+        # Extract the values we need for second pass
+        measured = {
+            "input_i": float(data.get("input_i", -24)),
+            "input_tp": float(data.get("input_tp", -2)),
+            "input_lra": float(data.get("input_lra", 7)),
+            "input_thresh": float(data.get("input_thresh", -34)),
+            "target_offset": float(data.get("target_offset", 0)),
+        }
+        
+        if on_progress:
+            on_progress(1.0, "loudness measured")
+        
+        return measured
+    except Exception:
+        return None
 
 
 def filtergraph_for_template(
@@ -279,9 +336,23 @@ def build_ffmpeg_command(spec: ExportSpec) -> list[str]:
 
     cmd += ["-r", str(spec.fps)]
 
-    # Audio normalization (optional)
+    # Audio normalization (optional) - supports two-pass with measured values
     if spec.normalize_audio:
-        cmd += ["-af", "loudnorm=I=-16:LRA=11:TP=-1.5"]
+        if hasattr(spec, '_loudness_measured') and spec._loudness_measured:
+            m = spec._loudness_measured
+            cmd += [
+                "-af",
+                f"loudnorm=I=-16:LRA=11:TP=-1.5:"
+                f"measured_I={m['input_i']}:"
+                f"measured_LRA={m['input_lra']}:"
+                f"measured_TP={m['input_tp']}:"
+                f"measured_thresh={m['input_thresh']}:"
+                f"offset={m['target_offset']}:"
+                f"linear=true"
+            ]
+        else:
+            # Fallback to single-pass
+            cmd += ["-af", "loudnorm=I=-16:LRA=11:TP=-1.5"]
 
     # Encoding
     cmd += [
@@ -315,13 +386,39 @@ def run_ffmpeg_export(
     spec: ExportSpec,
     *,
     on_progress: Optional[Callable[[float, str], None]] = None,
+    two_pass_loudnorm: bool = True,
 ) -> None:
-    """Run ffmpeg export, optionally reporting progress (0..1)."""
-    cmd = build_ffmpeg_command(spec)
+    """Run ffmpeg export, optionally reporting progress (0..1).
+    
+    Args:
+        spec: Export specification
+        on_progress: Callback for progress updates (fraction, status)
+        two_pass_loudnorm: If True and normalize_audio is enabled, use two-pass
+            loudness normalization for more accurate results. Adds ~30-50% time.
+    """
     duration = max(0.01, float(spec.end_s - spec.start_s))
+    
+    # Two-pass loudness normalization: measure first, then encode with measured values
+    if spec.normalize_audio and two_pass_loudnorm:
+        if on_progress:
+            on_progress(0.0, "measuring loudness (pass 1/2)")
+        
+        measured = measure_loudness(
+            spec.video_path,
+            spec.start_s,
+            spec.end_s,
+        )
+        
+        if measured:
+            # Attach measured values to spec for build_ffmpeg_command
+            # Using object.__setattr__ since ExportSpec is frozen
+            object.__setattr__(spec, '_loudness_measured', measured)
+    
+    cmd = build_ffmpeg_command(spec)
 
     if on_progress:
-        on_progress(0.0, "starting")
+        status = "encoding (pass 2/2)" if (spec.normalize_audio and two_pass_loudnorm) else "encoding"
+        on_progress(0.0, status)
 
     proc = subprocess.Popen(
         cmd,

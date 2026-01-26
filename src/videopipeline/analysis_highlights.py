@@ -277,6 +277,16 @@ def shape_clip_bounds_with_boundaries(
         prefer_before=True,
     )
     
+    # If no start candidates, try expanding the search window significantly
+    if not start_candidates:
+        start_candidates = find_start_boundary_candidates(
+            boundary_graph,
+            target_s=peak_time - clip_cfg.min_pre_seconds,
+            max_before_s=clip_cfg.max_pre_seconds * 2,  # Double the window
+            max_after_s=clip_cfg.min_pre_seconds * 2,
+            prefer_before=True,
+        )
+    
     # Get ranked candidates for end boundaries
     end_candidates = find_end_boundary_candidates(
         boundary_graph,
@@ -285,6 +295,16 @@ def shape_clip_bounds_with_boundaries(
         max_after_s=clip_cfg.max_post_seconds - clip_cfg.min_post_seconds,
         prefer_after=True,
     )
+    
+    # If no end candidates, try expanding the search window significantly
+    if not end_candidates:
+        end_candidates = find_end_boundary_candidates(
+            boundary_graph,
+            target_s=peak_time + clip_cfg.min_post_seconds,
+            max_before_s=clip_cfg.min_post_seconds * 2,
+            max_after_s=clip_cfg.max_post_seconds * 2,  # Double the window
+            prefer_after=True,
+        )
     
     if not start_candidates or not end_candidates:
         return None
@@ -299,6 +319,32 @@ def shape_clip_bounds_with_boundaries(
             
             if clip_duration >= clip_cfg.min_seconds and clip_duration <= clip_cfg.max_seconds:
                 # Found a valid combination
+                start_s = max(0.0, min(duration_s, start_s))
+                end_s = max(0.0, min(duration_s, end_s))
+                
+                if end_s > start_s:
+                    return {
+                        "start_s": float(start_s),
+                        "end_s": float(end_s),
+                        "used_boundary_graph": True,
+                    }
+    
+    # Relaxed pass: try any valid duration from expanded candidate set
+    # Sort by proximity to ideal timing (start before peak, end after peak)
+    all_starts = start_candidates[:20]
+    all_ends = end_candidates[:20]
+    
+    for start_bp in all_starts:
+        for end_bp in all_ends:
+            start_s = start_bp.time_s
+            end_s = end_bp.time_s
+            clip_duration = end_s - start_s
+            
+            # More relaxed duration check (allow 75% to 150% of target range)
+            min_dur = clip_cfg.min_seconds * 0.75
+            max_dur = clip_cfg.max_seconds * 1.5
+            
+            if clip_duration >= min_dur and clip_duration <= max_dur:
                 start_s = max(0.0, min(duration_s, start_s))
                 end_s = max(0.0, min(duration_s, end_s))
                 

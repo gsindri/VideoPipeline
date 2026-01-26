@@ -9,12 +9,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .state import publisher_db_path
+from ..utils import utc_iso as _utc_iso
 
 _UNSET = object()
-
-
-def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _parse_iso(value: str) -> datetime:
