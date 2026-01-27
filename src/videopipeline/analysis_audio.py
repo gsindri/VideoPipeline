@@ -120,7 +120,7 @@ def save_audio_rms_to_project(
     def _upd(d: Dict[str, Any]) -> None:
         d.setdefault("analysis", {})
         d["analysis"]["audio"] = {
-            "video": str(proj.video_path),
+            "video": str(proj.audio_source),  # May be audio file during early analysis
             "duration_seconds": audio_data["duration_seconds"],
             "method": "audio_rms_db_peaks",
             "config": {
@@ -188,7 +188,7 @@ def compute_audio_analysis(
         return start, end
 
     start_time = _time.time()
-    video_path = Path(proj.video_path)
+    video_path = Path(proj.audio_source)  # Use audio_source for fallback during early analysis
     duration_s = ffprobe_duration_seconds(video_path)
 
     # Use shared RMS timeline computation

@@ -153,6 +153,32 @@ class Project:
     def exports_dir(self) -> Path:
         return self.project_dir / "exports"
 
+    @property
+    def audio_source(self) -> Path:
+        """Get the path to use for audio extraction.
+        
+        Returns video_path if it exists, otherwise falls back to early_audio_path
+        stored in project.json (for early analysis during download).
+        """
+        # If video exists, use it
+        if self.video_path.exists():
+            return self.video_path
+        
+        # Check for early audio path in project.json
+        if self.project_json_path.exists():
+            try:
+                data = load_json(self.project_json_path)
+                early_audio = data.get("video", {}).get("early_audio_path")
+                if early_audio:
+                    early_path = Path(early_audio)
+                    if early_path.exists():
+                        return early_path
+            except Exception:
+                pass
+        
+        # Fall back to video_path (may not exist, but callers will handle)
+        return self.video_path
+
 
 def create_or_load_project(video_path: Path, projects_root: Optional[Path] = None) -> Project:
     video_path = Path(video_path).expanduser().resolve()
@@ -181,6 +207,103 @@ def create_or_load_project(video_path: Path, projects_root: Optional[Path] = Non
         save_json(proj.project_json_path, initial)
 
     return proj
+
+
+def create_project_early(
+    content_id: str,
+    *,
+    source_url: Optional[str] = None,
+    audio_path: Optional[Path] = None,
+    duration_seconds: Optional[float] = None,
+    projects_root: Optional[Path] = None,
+) -> Project:
+    """Create a project early, before video download completes.
+    
+    This allows running audio-based analysis (transcript, silence, etc.)
+    while the video is still downloading.
+    
+    Args:
+        content_id: Unique identifier for the content (e.g., video ID from URL)
+        source_url: Original URL being downloaded
+        audio_path: Path to downloaded audio file (optional, for duration detection)
+        duration_seconds: Known duration (optional, from metadata)
+        projects_root: Custom projects directory
+        
+    Returns:
+        Project with placeholder video path
+    """
+    import hashlib
+    
+    projects_root = projects_root or default_projects_root()
+    
+    # Create project ID from content_id hash
+    pid = hashlib.sha256(content_id.encode()).hexdigest()
+    pdir = projects_root / pid
+    pdir.mkdir(parents=True, exist_ok=True)
+    
+    # Placeholder video path (will be updated when video downloads)
+    placeholder_video = pdir / "video_pending"
+    
+    proj = Project(project_dir=pdir, video_path=placeholder_video)
+    
+    if not proj.project_json_path.exists():
+        # Try to get duration from audio if available
+        if duration_seconds is None and audio_path and audio_path.exists():
+            try:
+                duration_seconds = ffprobe_duration_seconds(audio_path)
+            except Exception:
+                pass
+        
+        initial = {
+            "project_id": pdir.name,
+            "created_at": utc_now_iso(),
+            "source_url": source_url,
+            "video": {
+                "path": None,  # Not yet known
+                "status": "downloading",
+                "duration_seconds": duration_seconds,
+                "early_audio_path": str(audio_path) if audio_path else None,
+            },
+            "analysis": {},
+            "layout": {},
+            "selections": [],
+            "exports": [],
+        }
+        save_json(proj.project_json_path, initial)
+    
+    return proj
+
+
+def set_project_video(proj: Project, video_path: Path) -> None:
+    """Update a project with the final video path after download completes.
+    
+    Args:
+        proj: Project to update
+        video_path: Path to downloaded video file
+    """
+    video_path = Path(video_path).expanduser().resolve()
+    
+    # Update the project's video_path
+    proj.video_path = video_path
+    
+    # Get video info
+    try:
+        duration_s = ffprobe_duration_seconds(video_path)
+    except Exception:
+        duration_s = None
+    
+    st = video_path.stat()
+    
+    def _upd(d: Dict[str, Any]) -> None:
+        d["video"] = {
+            "path": str(video_path),
+            "status": "ready",
+            "size_bytes": st.st_size,
+            "mtime_ns": getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)),
+            "duration_seconds": duration_s or d.get("video", {}).get("duration_seconds"),
+        }
+    
+    update_project(proj, _upd)
 
 
 def update_project(proj: Project, updater) -> Dict[str, Any]:

@@ -1194,105 +1194,141 @@ def create_app(
                     transcript_status["status"] = "failed"
                     transcript_result = {"status": "failed", "error": str(e)}
                     return None
-
-            # Track early audio analysis results
-            early_audio_rms_result = None
-            early_audio_events_result = None
-            # Note: audio_rms_status and audio_events_status are initialized earlier (before on_video_progress)
             
-            def run_early_audio_rms(audio_path: Path):
-                """Run audio RMS analysis on downloaded audio while video downloads."""
-                nonlocal early_audio_rms_result, audio_rms_status
+            # Track early project for DAG-based analysis
+            early_proj = None
+            early_dag_result = None
+            early_dag_status = {"status": "pending", "progress": 0, "message": ""}
+            
+            def run_early_dag_analysis(audio_path: Path, chat_temp_path: Optional[Path] = None):
+                """Create project early and run pre_download DAG bundle."""
+                nonlocal early_proj, early_dag_result, early_dag_status, audio_rms_status, audio_events_status, transcript_status
                 import logging
+                import shutil
                 log = logging.getLogger("videopipeline.studio")
                 
                 try:
-                    from ..analysis_audio import compute_audio_rms_from_file
+                    from ..project import create_project_early, set_source_url
+                    from ..analysis import run_analysis, BUNDLE_PRE_DOWNLOAD
                     
-                    audio_cfg = ctx.profile.get("analysis", {}).get("audio", {})
+                    # Extract content ID from URL
+                    import re
+                    content_id = url  # Fallback to full URL
+                    # Try to extract video ID for cleaner project ID
+                    twitch_match = re.search(r'twitch\.tv/videos/(\d+)', url)
+                    youtube_match = re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]+)', url)
+                    if twitch_match:
+                        content_id = f"twitch_{twitch_match.group(1)}"
+                    elif youtube_match:
+                        content_id = f"youtube_{youtube_match.group(1)}"
                     
-                    log.info(f"[AUDIO_RMS] Starting early audio RMS analysis...")
-                    audio_rms_status["status"] = "analyzing"
+                    log.info(f"[DAG] Creating early project for content_id: {content_id}")
+                    early_dag_status["status"] = "creating_project"
+                    early_dag_status["message"] = "Creating project..."
                     
-                    def on_rms_progress(frac: float) -> None:
+                    # Create project early
+                    early_proj = create_project_early(
+                        content_id,
+                        source_url=url,
+                        audio_path=audio_path,
+                    )
+                    set_source_url(early_proj, url)
+                    
+                    log.info(f"[DAG] Early project created at: {early_proj.project_dir}")
+                    
+                    # Copy audio to project for analysis
+                    project_audio_path = early_proj.analysis_dir / "audio_source.m4a"
+                    early_proj.analysis_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(audio_path, project_audio_path)
+                    log.info(f"[DAG] Copied audio to project: {project_audio_path}")
+                    
+                    # Import chat if available
+                    if chat_temp_path and chat_temp_path.exists():
+                        try:
+                            from ..chat.downloader import import_chat_to_project
+                            import_chat_to_project(early_proj, chat_temp_path)
+                            log.info(f"[DAG] Imported chat to early project")
+                        except Exception as e:
+                            log.warning(f"[DAG] Chat import failed: {e}")
+                    
+                    # Build config from profile
+                    analysis_cfg = ctx.profile.get("analysis", {})
+                    dag_config = {
+                        "audio": analysis_cfg.get("audio", {}),
+                        "silence": analysis_cfg.get("silence", {}),
+                        "speech": analysis_cfg.get("speech", {}),
+                        "sentences": analysis_cfg.get("sentences", {}),
+                        "speech_features": analysis_cfg.get("speech_features", {}),
+                        "highlights": analysis_cfg.get("highlights", {}),
+                        "audio_events": analysis_cfg.get("audio_events", {}),
+                        "include_chat": True,
+                        "include_audio_events": bool(analysis_cfg.get("audio_events", {}).get("enabled", True)),
+                    }
+                    
+                    # Add verbose transcript setting
+                    if whisper_verbose:
+                        dag_config["speech"]["verbose"] = True
+                    
+                    log.info(f"[DAG] Starting pre_download bundle analysis...")
+                    early_dag_status["status"] = "analyzing"
+                    
+                    def on_dag_progress(frac: float, msg: str) -> None:
                         check_cancel()
-                        audio_rms_status["progress"] = frac
+                        early_dag_status["progress"] = frac
+                        early_dag_status["message"] = msg
+                        
+                        # Update sub-status based on what DAG is doing
+                        if "transcript" in msg.lower():
+                            transcript_status["status"] = "transcribing"
+                            transcript_status["progress"] = frac
+                        elif "audio_features" in msg.lower():
+                            audio_rms_status["status"] = "analyzing"
+                            audio_rms_status["progress"] = frac
+                        elif "audio_events" in msg.lower():
+                            audio_events_status["status"] = "analyzing"
+                            audio_events_status["progress"] = frac
                     
-                    result = compute_audio_rms_from_file(
-                        audio_path,
-                        sample_rate=int(audio_cfg.get("sample_rate", 16000)),
-                        hop_s=float(audio_cfg.get("hop_seconds", 0.5)),
-                        smooth_s=float(audio_cfg.get("smooth_seconds", 2.0)),
-                        on_progress=on_rms_progress,
+                    result = run_analysis(
+                        early_proj,
+                        bundle="pre_download",
+                        config=dag_config,
+                        on_progress=on_dag_progress,
                     )
                     
+                    early_dag_status["status"] = "complete"
+                    early_dag_status["progress"] = 1.0
+                    early_dag_result = result
+                    
+                    # Update sub-statuses
+                    transcript_status["status"] = "complete"
+                    transcript_status["progress"] = 1.0
                     audio_rms_status["status"] = "complete"
                     audio_rms_status["progress"] = 1.0
-                    early_audio_rms_result = result
-                    log.info(f"[AUDIO_RMS] Early audio RMS complete: {result.get('duration_seconds', 0):.1f}s analyzed in {result.get('elapsed_seconds', 0):.1f}s")
+                    if analysis_cfg.get("audio_events", {}).get("enabled", True):
+                        audio_events_status["status"] = "complete"
+                        audio_events_status["progress"] = 1.0
+                    
+                    log.info(f"[DAG] Pre-download analysis complete: {len(result.tasks_run)} tasks in {result.total_elapsed_seconds:.1f}s")
                     return result
                     
                 except Exception as e:
-                    log.warning(f"[AUDIO_RMS] Early audio RMS failed: {e}")
-                    audio_rms_status["status"] = "failed"
-                    return None
-            
-            def run_early_audio_events(audio_path: Path):
-                """Run audio event detection on downloaded audio while video downloads."""
-                nonlocal early_audio_events_result, audio_events_status
-                import logging
-                log = logging.getLogger("videopipeline.studio")
-                
-                try:
-                    from ..analysis_audio_events import AudioEventsConfig, compute_audio_events_from_file
-                    
-                    events_cfg = ctx.profile.get("analysis", {}).get("audio_events", {})
-                    if not events_cfg.get("enabled", True):
-                        log.info("[AUDIO_EVENTS] Audio events disabled, skipping")
-                        audio_events_status["status"] = "disabled"
-                        return None
-                    
-                    log.info(f"[AUDIO_EVENTS] Starting early audio event detection...")
-                    audio_events_status["status"] = "analyzing"
-                    
-                    cfg = AudioEventsConfig.from_dict(events_cfg)
-                    
-                    def on_events_progress(frac: float) -> None:
-                        check_cancel()
-                        audio_events_status["progress"] = frac
-                    
-                    result = compute_audio_events_from_file(
-                        audio_path,
-                        cfg=cfg,
-                        on_progress=on_events_progress,
-                    )
-                    
-                    audio_events_status["status"] = "complete"
-                    audio_events_status["progress"] = 1.0
-                    early_audio_events_result = result
-                    log.info(f"[AUDIO_EVENTS] Early audio events complete: {result.get('duration_seconds', 0):.1f}s analyzed in {result.get('elapsed_seconds', 0):.1f}s")
-                    return result
-                    
-                except Exception as e:
-                    log.warning(f"[AUDIO_EVENTS] Early audio events failed: {e}")
-                    audio_events_status["status"] = "failed"
+                    import traceback
+                    log.error(f"[DAG] Early analysis failed: {e}\n{traceback.format_exc()}")
+                    early_dag_status["status"] = "failed"
+                    early_dag_status["message"] = str(e)
                     return None
 
-            # Track early transcript result for saving after project is created
-            early_transcript_result = None
-            
             try:
                 # Run video, chat, and audio downloads in parallel
-                # Audio finishes first -> start transcription + audio analysis while video continues
+                # Audio finishes first -> start DAG analysis while video continues
                 with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
                     video_future = executor.submit(download_video)
                     chat_future = executor.submit(download_chat)
                     audio_future = executor.submit(download_audio_for_transcript)
                     
-                    transcript_future = None
-                    audio_rms_future = None
-                    audio_events_future = None
+                    dag_future = None
                     audio_path_for_transcript = None
+                    chat_temp_for_dag = None
                     
                     # Wait for all to complete, checking for cancellation
                     # and starting analysis tasks when audio is ready
@@ -1302,16 +1338,31 @@ def create_app(
                             cleanup_downloads()
                             return
                         
-                        # Check if audio is done and we haven't started analysis yet
-                        if audio_future and audio_future.done() and transcript_future is None:
+                        # Check if audio and chat are done and we haven't started DAG yet
+                        audio_done = audio_future and audio_future.done()
+                        chat_done_early = chat_future and chat_future.done()
+                        
+                        if audio_done and dag_future is None:
                             try:
                                 audio_path_for_transcript = audio_future.result()
+                                
+                                # Get chat temp path if available
+                                if chat_done_early:
+                                    try:
+                                        chat_result_early = chat_future.result()
+                                        if chat_result_early and chat_result_early.get("status") == "success":
+                                            chat_temp_for_dag = Path(chat_result_early.get("temp_path", ""))
+                                    except Exception:
+                                        pass
+                                
                                 if audio_path_for_transcript:
-                                    log.info(f"[DOWNLOAD] Audio ready, starting early transcription + audio analysis...")
-                                    # Start all three analysis tasks in parallel
-                                    transcript_future = executor.submit(run_early_transcription, audio_path_for_transcript)
-                                    audio_rms_future = executor.submit(run_early_audio_rms, audio_path_for_transcript)
-                                    audio_events_future = executor.submit(run_early_audio_events, audio_path_for_transcript)
+                                    log.info(f"[DOWNLOAD] Audio ready, starting DAG analysis...")
+                                    # Use the new DAG-based early analysis
+                                    dag_future = executor.submit(
+                                        run_early_dag_analysis,
+                                        audio_path_for_transcript,
+                                        chat_temp_for_dag if chat_temp_for_dag and chat_temp_for_dag.exists() else None,
+                                    )
                                 else:
                                     log.info(f"[DOWNLOAD] Audio download skipped or failed")
                             except Exception as e:
@@ -1320,16 +1371,14 @@ def create_app(
                         # Check if all required futures are done
                         video_done = video_future.done()
                         chat_done = chat_future.done()
-                        transcript_done = transcript_future is None or transcript_future.done()
-                        audio_rms_done = audio_rms_future is None or audio_rms_future.done()
-                        audio_events_done = audio_events_future is None or audio_events_future.done()
+                        dag_done = dag_future is None or dag_future.done()
                         
-                        if video_done and chat_done and transcript_done and audio_rms_done and audio_events_done:
+                        if video_done and chat_done and dag_done:
                             break
                         
                         # Update UI with current analysis progress while waiting
                         # This is important when video finishes before analysis tasks
-                        if video_done and (not transcript_done or not audio_rms_done or not audio_events_done):
+                        if video_done and not dag_done:
                             # Build status parts
                             msg_parts = ["Download complete!"]
                             
@@ -1342,31 +1391,16 @@ def create_app(
                             elif chat_stat == "failed":
                                 msg_parts.append("💬 ✗")
                             
-                            # Transcript status
-                            ts = transcript_status.get("status", "pending")
-                            if ts == "transcribing":
-                                tp = transcript_status.get("progress", 0)
-                                msg_parts.append(f"🎙️ {int(tp * 100)}%")
-                            elif ts == "complete":
-                                msg_parts.append("🎙️ ✓")
-                            elif ts == "failed":
-                                msg_parts.append("🎙️ ✗")
-                            
-                            # Audio RMS status
-                            rms_stat = audio_rms_status.get("status", "pending")
-                            if rms_stat == "analyzing":
-                                rp = audio_rms_status.get("progress", 0)
-                                msg_parts.append(f"📊 {int(rp * 100)}%")
-                            elif rms_stat == "complete":
-                                msg_parts.append("📊 ✓")
-                            
-                            # Audio events status
-                            events_stat = audio_events_status.get("status", "pending")
-                            if events_stat == "analyzing":
-                                ep = audio_events_status.get("progress", 0)
-                                msg_parts.append(f"🎭 {int(ep * 100)}%")
-                            elif events_stat == "complete":
-                                msg_parts.append("🎭 ✓")
+                            # DAG analysis status
+                            dag_stat = early_dag_status.get("status", "pending")
+                            if dag_stat == "analyzing":
+                                dp = early_dag_status.get("progress", 0)
+                                dm = early_dag_status.get("message", "analyzing")
+                                msg_parts.append(f"🔬 {int(dp * 100)}% {dm}")
+                            elif dag_stat == "complete":
+                                msg_parts.append("🔬 ✓")
+                            elif dag_stat == "failed":
+                                msg_parts.append("🔬 ✗")
                             
                             # Keep overall progress at 90% until all analysis tasks finish
                             JOB_MANAGER._set(
@@ -1378,12 +1412,13 @@ def create_app(
                                     "video_progress": 1.0,
                                     "chat_status": current_chat_status["status"],
                                     "chat_progress": current_chat_status.get("progress", 0),
-                                        "chat_message": current_chat_status.get("message", ""),
-                                        "chat_messages_count": current_chat_status.get("messages_count", 0),
-                                        "transcript_status": "transcribing",
-                                        "transcript_progress": tp,
-                                    }
-                                )
+                                    "chat_message": current_chat_status.get("message", ""),
+                                    "chat_messages_count": current_chat_status.get("messages_count", 0),
+                                    "dag_status": early_dag_status.get("status", "pending"),
+                                    "dag_progress": early_dag_status.get("progress", 0),
+                                    "dag_message": early_dag_status.get("message", ""),
+                                }
+                            )
                         
                         # Small sleep to avoid busy-waiting
                         import time
@@ -1400,40 +1435,18 @@ def create_app(
                     except Exception:
                         pass  # Chat failures are non-fatal
                     
-                    # Get transcript result if available
-                    if transcript_future:
+                    # Get DAG analysis result if available
+                    if dag_future:
                         try:
-                            early_transcript_result = transcript_future.result()
-                            if early_transcript_result:
-                                log.info(f"[DOWNLOAD] Early transcription completed successfully")
+                            early_dag_result = dag_future.result()
+                            if early_dag_result:
+                                log.info(f"[DOWNLOAD] Early DAG analysis completed successfully")
                         except CancelledError:
                             raise  # Re-raise cancellation
                         except Exception as e:
-                            log.warning(f"[DOWNLOAD] Early transcription error: {e}")
+                            log.warning(f"[DOWNLOAD] Early DAG analysis error: {e}")
                     
-                    # Get audio RMS result if available
-                    if audio_rms_future:
-                        try:
-                            early_audio_rms_result = audio_rms_future.result()
-                            if early_audio_rms_result:
-                                log.info(f"[DOWNLOAD] Early audio RMS completed successfully")
-                        except CancelledError:
-                            raise
-                        except Exception as e:
-                            log.warning(f"[DOWNLOAD] Early audio RMS error: {e}")
-                    
-                    # Get audio events result if available
-                    if audio_events_future:
-                        try:
-                            early_audio_events_result = audio_events_future.result()
-                            if early_audio_events_result:
-                                log.info(f"[DOWNLOAD] Early audio events completed successfully")
-                        except CancelledError:
-                            raise
-                        except Exception as e:
-                            log.warning(f"[DOWNLOAD] Early audio events error: {e}")
-                    
-                    # Clean up temp audio file
+                    # Clean up temp audio file (DAG copied it to project)
                     if audio_path_for_transcript and Path(audio_path_for_transcript).exists():
                         try:
                             Path(audio_path_for_transcript).unlink()
@@ -1456,16 +1469,27 @@ def create_app(
                     
                     # Use preview if available, otherwise original
                     video_to_open = video_result.preview_path or video_result.video_path
-                    proj = ctx.open_project(video_to_open)
-                    log.info(f"[CHAT DEBUG] Project opened: {proj.project_dir}")
+                    
+                    # If we created an early project during DAG analysis, use it and update video path
+                    if early_proj:
+                        from ..project import set_project_video
+                        set_project_video(early_proj, Path(video_to_open))
+                        proj = early_proj
+                        ctx._project = proj  # Update context to use this project
+                        log.info(f"[DAG] Updated early project with video: {video_to_open}")
+                    else:
+                        # No early project - create one now (fallback path)
+                        proj = ctx.open_project(video_to_open)
+                    log.info(f"[DOWNLOAD] Project ready: {proj.project_dir}")
                     
                     # Store the source URL for chat download later
                     from ..project import set_source_url
                     set_source_url(proj, url)
                     
-                    # If chat was downloaded, import it into the project
-                    log.info(f"[CHAT DEBUG] Checking chat_result: status={chat_result.get('status')}, temp_path={chat_result.get('temp_path')}")
-                    if chat_result.get("status") == "success" and chat_result.get("temp_path"):
+                    # If chat was downloaded and NOT already imported by DAG, import it
+                    chat_already_imported = early_proj is not None and chat_temp_for_dag is not None
+                    log.info(f"[CHAT DEBUG] Checking chat_result: status={chat_result.get('status')}, already_imported={chat_already_imported}")
+                    if chat_result.get("status") == "success" and chat_result.get("temp_path") and not chat_already_imported:
                         chat_temp = Path(chat_result["temp_path"])
                         log.info(f"[CHAT DEBUG] Chat temp file exists: {chat_temp.exists()}")
                         if chat_temp.exists():
@@ -1479,8 +1503,8 @@ def create_app(
                                 "video_status": "complete",
                                 "chat_status": "importing",
                                 "chat_message": "Reading chat file...",
-                                "transcript_status": transcript_status.get("status", "pending"),
-                                "transcript_progress": transcript_status.get("progress", 0),
+                                "dag_status": early_dag_status.get("status", "pending"),
+                                "dag_progress": early_dag_status.get("progress", 0),
                             }
                         )
                         try:
@@ -1495,8 +1519,8 @@ def create_app(
                                     "video_status": "complete",
                                     "chat_status": "importing",
                                     "chat_message": "Parsing messages...",
-                                    "transcript_status": transcript_status.get("status", "pending"),
-                                    "transcript_progress": transcript_status.get("progress", 0),
+                                    "dag_status": early_dag_status.get("status", "pending"),
+                                    "dag_progress": early_dag_status.get("progress", 0),
                                 }
                             )
                             
@@ -1590,6 +1614,11 @@ def create_app(
                             # Record failed import status
                             from ..project import set_chat_config
                             set_chat_config(proj, download_status="failed", download_error=str(e))
+                    elif chat_already_imported:
+                        log.info(f"[CHAT DEBUG] Chat already imported by DAG analysis")
+                        chat_result["imported"] = True
+                        from ..project import set_chat_config
+                        set_chat_config(proj, download_status="success")
                     else:
                         log.info(f"[CHAT DEBUG] Skipping import - condition not met")
                         # Record the chat download status
@@ -1600,52 +1629,31 @@ def create_app(
                         elif chat_status == "skipped":
                             set_chat_config(proj, download_status="skipped")
                     
-                    # Save early transcript if we computed one during download
-                    if early_transcript_result:
-                        try:
-                            from ..analysis_transcript import save_transcript_to_project
-                            save_transcript_to_project(proj, early_transcript_result)
-                            log.info(f"[DOWNLOAD] Saved early transcript to project")
-                        except Exception as e:
-                            log.warning(f"[DOWNLOAD] Failed to save early transcript: {e}")
-                    
-                    # Save early audio RMS analysis if we computed one during download
-                    if early_audio_rms_result:
-                        try:
-                            from ..analysis_audio import save_audio_rms_to_project
-                            save_audio_rms_to_project(proj, early_audio_rms_result)
-                            log.info(f"[DOWNLOAD] Saved early audio RMS to project")
-                        except Exception as e:
-                            log.warning(f"[DOWNLOAD] Failed to save early audio RMS: {e}")
-                    
-                    # Save early audio events analysis if we computed one during download
-                    if early_audio_events_result and not early_audio_events_result.get("skipped"):
-                        try:
-                            from ..analysis_audio_events import save_audio_events_to_project
-                            save_audio_events_to_project(proj, early_audio_events_result)
-                            log.info(f"[DOWNLOAD] Saved early audio events to project")
-                        except Exception as e:
-                            log.warning(f"[DOWNLOAD] Failed to save early audio events: {e}")
+                    # Early analysis is already saved to project by DAG runner
+                    # Just log what was computed
+                    if early_dag_result:
+                        log.info(f"[DOWNLOAD] DAG analysis completed: {len(early_dag_result.tasks_run)} tasks")
                     
                     result_dict["project"] = get_project_data(proj)
                     result_dict["auto_opened"] = True
                     result_dict["chat"] = chat_result
                     
-                    # Include transcript status in result
-                    if early_transcript_result:
-                        result_dict["transcript"] = {
+                    # Include DAG analysis status in result
+                    if early_dag_result:
+                        result_dict["dag_analysis"] = {
                             "status": "complete",
-                            "segment_count": early_transcript_result.get("segment_count", 0),
+                            "tasks_run": len(early_dag_result.tasks_run),
+                            "elapsed_seconds": early_dag_result.total_elapsed_seconds,
                         }
-                    elif transcript_status.get("status") == "failed":
-                        result_dict["transcript"] = {"status": "failed"}
-                    elif transcript_status.get("status") == "disabled":
-                        result_dict["transcript"] = {"status": "disabled"}
+                    elif early_dag_status.get("status") == "failed":
+                        result_dict["dag_analysis"] = {"status": "failed", "error": early_dag_status.get("message")}
 
                 # Build final message
                 final_msg = "Download complete!"
+                if early_dag_result:
+                    final_msg = f"Download complete! Analysis ready ({len(early_dag_result.tasks_run)} tasks)."
                 if chat_result.get("imported"):
-                    final_msg = "Download complete! Chat imported."
+                    final_msg += " Chat imported."
                 elif chat_result.get("import_error"):
                     final_msg = f"Download complete. Chat import failed: {chat_result.get('import_error')}"
                 elif chat_result.get("status") == "failed":

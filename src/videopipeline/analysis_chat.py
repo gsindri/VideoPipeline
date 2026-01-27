@@ -173,7 +173,12 @@ def compute_chat_analysis(
     messages = _load_messages(chat_path)
     raw_timestamps = _extract_timestamps(messages)
 
-    duration_s = ffprobe_duration_seconds(proj.video_path)
+    # Get duration from project.json first, fallback to audio_source
+    from .project import get_project_data
+    proj_data = get_project_data(proj)
+    duration_s = float(proj_data.get("video", {}).get("duration_seconds", 0))
+    if duration_s <= 0:
+        duration_s = ffprobe_duration_seconds(proj.audio_source)
     if hop_s <= 0:
         raise ValueError("hop_s must be > 0")
 
