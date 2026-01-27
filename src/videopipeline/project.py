@@ -154,17 +154,61 @@ class Project:
         return self.project_dir / "exports"
 
     @property
+    def inputs_dir(self) -> Path:
+        """Directory for raw input files (audio, chat) copied into the project."""
+        return self.analysis_dir / "inputs"
+
+    @property
+    def audio_raw_path(self) -> Path:
+        """Path to store downloaded audio file within the project.
+        
+        When audio is downloaded before video (e.g., during URL download),
+        it's copied here so all analysis can use it without external references.
+        
+        Note: This returns the expected path for a new audio file.
+        Use find_audio_raw() to find an existing audio file with any extension.
+        """
+        return self.inputs_dir / "audio.m4a"
+
+    def find_audio_raw(self) -> Optional[Path]:
+        """Find downloaded audio file in the inputs directory.
+        
+        Searches for audio files with common extensions (m4a, mp3, opus, wav, webm, ogg).
+        
+        Returns:
+            Path to audio file if found, None otherwise
+        """
+        if not self.inputs_dir.exists():
+            return None
+        
+        audio_extensions = {".m4a", ".mp3", ".opus", ".wav", ".webm", ".ogg", ".aac", ".flac"}
+        for f in self.inputs_dir.iterdir():
+            if f.is_file() and f.name.startswith("audio") and f.suffix.lower() in audio_extensions:
+                return f
+        return None
+
+    @property
     def audio_source(self) -> Path:
         """Get the path to use for audio extraction.
         
-        Returns video_path if it exists, otherwise falls back to early_audio_path
-        stored in project.json (for early analysis during download).
+        Priority order:
+        1. Audio file in inputs_dir - Audio file stored in project (best: self-contained)
+        2. video_path - Extract audio from video (normal case)
+        3. early_audio_path from project.json - Legacy temp file reference
+        4. video_path as fallback
+        
+        This allows early analysis during download when only audio is available.
         """
-        # If video exists, use it
+        # 1. Prefer audio file stored in project (self-contained)
+        audio_raw = self.find_audio_raw()
+        if audio_raw and audio_raw.exists():
+            return audio_raw
+        
+        # 2. If video exists, use it (normal case)
         if self.video_path.exists():
             return self.video_path
         
-        # Check for early audio path in project.json
+        # 3. Check for early audio path in project.json (legacy/temp reference)
         if self.project_json_path.exists():
             try:
                 data = load_json(self.project_json_path)
@@ -176,7 +220,7 @@ class Project:
             except Exception:
                 pass
         
-        # Fall back to video_path (may not exist, but callers will handle)
+        # 4. Fall back to video_path (may not exist, but callers will handle)
         return self.video_path
 
 

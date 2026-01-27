@@ -1201,7 +1201,14 @@ def create_app(
             early_dag_status = {"status": "pending", "progress": 0, "message": ""}
             
             def run_early_dag_analysis(audio_path: Path, chat_temp_path: Optional[Path] = None):
-                """Create project early and run pre_download DAG bundle."""
+                """Create project early and run pre_download DAG bundle.
+                
+                This is the core of the "best-use" approach:
+                1. Create project immediately with content ID
+                2. Copy audio into project (audio_raw_path) for self-contained storage
+                3. Import chat if available
+                4. Run DAG analysis - incremental, so safe to call multiple times
+                """
                 nonlocal early_proj, early_dag_result, early_dag_status, audio_rms_status, audio_events_status, transcript_status
                 import logging
                 import shutil
@@ -1226,7 +1233,7 @@ def create_app(
                     early_dag_status["status"] = "creating_project"
                     early_dag_status["message"] = "Creating project..."
                     
-                    # Create project early
+                    # Create project early (with placeholder video path)
                     early_proj = create_project_early(
                         content_id,
                         source_url=url,
@@ -1236,11 +1243,13 @@ def create_app(
                     
                     log.info(f"[DAG] Early project created at: {early_proj.project_dir}")
                     
-                    # Copy audio to project for analysis
-                    project_audio_path = early_proj.analysis_dir / "audio_source.m4a"
-                    early_proj.analysis_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(audio_path, project_audio_path)
-                    log.info(f"[DAG] Copied audio to project: {project_audio_path}")
+                    # Copy audio INTO the project directory (self-contained)
+                    # This is the key improvement: audio is now part of the project
+                    # Preserve the original extension (m4a, mp3, opus, etc.)
+                    early_proj.inputs_dir.mkdir(parents=True, exist_ok=True)
+                    audio_dest = early_proj.inputs_dir / f"audio{audio_path.suffix}"
+                    shutil.copy2(audio_path, audio_dest)
+                    log.info(f"[DAG] Copied audio to project: {audio_dest}")
                     
                     # Import chat if available
                     if chat_temp_path and chat_temp_path.exists():
@@ -1321,14 +1330,17 @@ def create_app(
             try:
                 # Run video, chat, and audio downloads in parallel
                 # Audio finishes first -> start DAG analysis while video continues
+                # If chat finishes later -> re-run DAG incrementally (cached tasks are skipped)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
                     video_future = executor.submit(download_video)
                     chat_future = executor.submit(download_chat)
                     audio_future = executor.submit(download_audio_for_transcript)
                     
                     dag_future = None
+                    dag_rerun_future = None  # For incremental re-run when chat arrives
                     audio_path_for_transcript = None
                     chat_temp_for_dag = None
+                    chat_arrived_after_dag_started = False
                     
                     # Wait for all to complete, checking for cancellation
                     # and starting analysis tasks when audio is ready
@@ -1368,12 +1380,79 @@ def create_app(
                             except Exception as e:
                                 log.warning(f"[DOWNLOAD] Audio download error: {e}")
                         
+                        # Check if chat finished AFTER DAG started (need incremental re-run)
+                        dag_started = dag_future is not None
+                        dag_running = dag_started and not dag_future.done()
+                        dag_finished = dag_started and dag_future.done()
+                        chat_just_finished = chat_done_early and not chat_arrived_after_dag_started
+                        
+                        if dag_finished and chat_just_finished and chat_temp_for_dag is None and dag_rerun_future is None:
+                            # Chat arrived after DAG finished without it - do incremental re-run
+                            try:
+                                chat_result_late = chat_future.result()
+                                if chat_result_late and chat_result_late.get("status") == "success":
+                                    late_chat_path = Path(chat_result_late.get("temp_path", ""))
+                                    if late_chat_path.exists() and early_proj:
+                                        log.info(f"[DOWNLOAD] Chat arrived after initial DAG, doing incremental re-run...")
+                                        chat_arrived_after_dag_started = True
+                                        
+                                        # Import chat and re-run DAG (will only compute chat-dependent tasks)
+                                        def incremental_dag_with_chat():
+                                            nonlocal early_dag_result, early_dag_status
+                                            try:
+                                                from ..chat.downloader import import_chat_to_project
+                                                from ..analysis import run_analysis
+                                                
+                                                import_chat_to_project(early_proj, late_chat_path)
+                                                log.info(f"[DAG] Imported late chat to project")
+                                                
+                                                early_dag_status["status"] = "analyzing"
+                                                early_dag_status["message"] = "Adding chat features..."
+                                                
+                                                analysis_cfg = ctx.profile.get("analysis", {})
+                                                dag_config = {
+                                                    "audio": analysis_cfg.get("audio", {}),
+                                                    "silence": analysis_cfg.get("silence", {}),
+                                                    "speech": analysis_cfg.get("speech", {}),
+                                                    "sentences": analysis_cfg.get("sentences", {}),
+                                                    "speech_features": analysis_cfg.get("speech_features", {}),
+                                                    "highlights": analysis_cfg.get("highlights", {}),
+                                                    "audio_events": analysis_cfg.get("audio_events", {}),
+                                                    "include_chat": True,
+                                                    "include_audio_events": bool(analysis_cfg.get("audio_events", {}).get("enabled", True)),
+                                                }
+                                                
+                                                def on_rerun_progress(frac: float, msg: str) -> None:
+                                                    check_cancel()
+                                                    early_dag_status["progress"] = frac
+                                                    early_dag_status["message"] = msg
+                                                
+                                                result = run_analysis(
+                                                    early_proj,
+                                                    bundle="pre_download",
+                                                    config=dag_config,
+                                                    on_progress=on_rerun_progress,
+                                                )
+                                                
+                                                early_dag_status["status"] = "complete"
+                                                early_dag_result = result
+                                                log.info(f"[DAG] Incremental re-run complete: {len(result.tasks_run)} tasks")
+                                                return result
+                                            except Exception as e:
+                                                log.warning(f"[DAG] Incremental re-run failed: {e}")
+                                                return None
+                                        
+                                        dag_rerun_future = executor.submit(incremental_dag_with_chat)
+                            except Exception:
+                                pass
+                        
                         # Check if all required futures are done
                         video_done = video_future.done()
                         chat_done = chat_future.done()
                         dag_done = dag_future is None or dag_future.done()
+                        rerun_done = dag_rerun_future is None or dag_rerun_future.done()
                         
-                        if video_done and chat_done and dag_done:
+                        if video_done and chat_done and dag_done and rerun_done:
                             break
                         
                         # Update UI with current analysis progress while waiting
@@ -1445,6 +1524,18 @@ def create_app(
                             raise  # Re-raise cancellation
                         except Exception as e:
                             log.warning(f"[DOWNLOAD] Early DAG analysis error: {e}")
+                    
+                    # Get incremental rerun result if we did one
+                    if dag_rerun_future:
+                        try:
+                            rerun_result = dag_rerun_future.result()
+                            if rerun_result:
+                                early_dag_result = rerun_result  # Use the more complete result
+                                log.info(f"[DOWNLOAD] Incremental DAG rerun completed successfully")
+                        except CancelledError:
+                            raise
+                        except Exception as e:
+                            log.warning(f"[DOWNLOAD] Incremental DAG rerun error: {e}")
                     
                     # Clean up temp audio file (DAG copied it to project)
                     if audio_path_for_transcript and Path(audio_path_for_transcript).exists():
