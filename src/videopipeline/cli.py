@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import threading
 import time
 import uuid
@@ -25,6 +26,10 @@ from .publisher.secrets import delete_tokens, store_tokens
 from .publisher.state import accounts_path
 from .publisher.connectors.tiktok import build_authorize_url, build_pkce_pair, exchange_code
 from .publisher.presets import AccountPreset
+
+
+class UserFacingError(RuntimeError):
+    """Errors safe to present directly in CLI output."""
 
 
 def _fmt_time(seconds: float) -> str:
@@ -173,19 +178,28 @@ def cmd_export_top(args: argparse.Namespace) -> None:
             )
             tjson = proj.analysis_dir / "transcripts" / f"{selection['id']}_{int(start_s)}_{int(end_s)}.json"
             if tjson.exists():
-                segments = load_transcript_json(tjson)
+                try:
+                    segments = load_transcript_json(tjson)
+                except OSError as exc:
+                    raise UserFacingError(f"Failed to read transcript data from {tjson}.") from exc
             else:
                 segments = transcribe_segment(proj.video_path, start_s=start_s, end_s=end_s, cfg=cfg)
-                save_transcript_json(tjson, segments, cfg)
+                try:
+                    save_transcript_json(tjson, segments, cfg)
+                except OSError as exc:
+                    raise UserFacingError(f"Failed to write transcript data to {tjson}.") from exc
             ass_path = proj.analysis_dir / "subtitles" / f"{selection['id']}.ass"
             from .subtitles import write_ass
 
-            subtitles_ass = write_ass(
-                segments,
-                ass_path,
-                playres_x=int(export_cfg.get("width", 1080)),
-                playres_y=int(export_cfg.get("height", 1920)),
-            )
+            try:
+                subtitles_ass = write_ass(
+                    segments,
+                    ass_path,
+                    playres_x=int(export_cfg.get("width", 1080)),
+                    playres_y=int(export_cfg.get("height", 1920)),
+                )
+            except OSError as exc:
+                raise UserFacingError(f"Failed to write subtitles to {ass_path}.") from exc
         else:
             subtitles_ass = None
 
@@ -389,7 +403,11 @@ def cmd_publish(args: argparse.Namespace) -> None:
     store = AccountStore()
     account = store.get(args.account)
     if not account:
-        raise RuntimeError("account_not_found")
+        raise UserFacingError(f"Account not found: {args.account}")
+    if not args.export.exists():
+        raise UserFacingError(f"Export file not found: {args.export}")
+    if not args.meta.exists():
+        raise UserFacingError(f"Metadata file not found: {args.meta}")
     worker = PublishWorker(account_store=store)
     job = worker.queue_job(
         platform=account.platform,
@@ -410,9 +428,16 @@ def cmd_publish_project(args: argparse.Namespace) -> None:
         project_path = Path("outputs") / "projects" / args.project
     project_file = project_path / "project.json"
     if not project_file.exists():
-        raise RuntimeError("project_not_found")
+        raise UserFacingError(f"Project not found: {project_file}")
 
-    proj_data = json.loads(project_file.read_text(encoding="utf-8"))
+    try:
+        proj_contents = project_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise UserFacingError(f"Failed to read project file: {project_file}") from exc
+    try:
+        proj_data = json.loads(proj_contents)
+    except json.JSONDecodeError as exc:
+        raise UserFacingError(f"Project file is not valid JSON: {project_file}") from exc
     exports = proj_data.get("exports") or []
     if not exports:
         print("No exports to publish.")
@@ -421,7 +446,7 @@ def cmd_publish_project(args: argparse.Namespace) -> None:
     store = AccountStore()
     account = store.get(args.account)
     if not account:
-        raise RuntimeError("account_not_found")
+        raise UserFacingError(f"Account not found: {args.account}")
     worker = PublishWorker(account_store=store)
     queued = 0
     for exp in exports:
@@ -559,7 +584,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     jobs_retry.set_defaults(func=cmd_jobs_retry)
 
     args = parser.parse_args(argv)
-    args.func(args)
+    try:
+        args.func(args)
+    except UserFacingError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":
