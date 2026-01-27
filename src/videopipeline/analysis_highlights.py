@@ -1288,3 +1288,634 @@ def json_load(path: Path) -> Dict[str, Any]:
     import json
 
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+# =============================================================================
+# Split functions for DAG runner
+# =============================================================================
+
+def compute_highlights_scores(
+    proj: Project,
+    *,
+    audio_cfg: Dict[str, Any],
+    motion_cfg: Dict[str, Any],
+    highlights_cfg: Dict[str, Any],
+    audio_events_cfg: Optional[Dict[str, Any]] = None,
+    include_chat: bool = True,
+    include_audio_events: bool = True,
+    on_progress: Optional[Callable[[float], None]] = None,
+) -> Dict[str, Any]:
+    """Compute signal fusion and peak detection (SCORING phase).
+    
+    This function:
+    1. Loads all available signal features (audio, motion, chat, events, speech)
+    2. Fuses them with weights
+    3. Computes z-scores and picks peaks
+    4. Saves highlights_features.npz with scores and peak indices
+    
+    This is separate from candidate shaping so that shaping can be re-run
+    when boundary information improves.
+    
+    Args:
+        proj: Project instance
+        audio_cfg: Audio analysis config
+        motion_cfg: Motion analysis config
+        highlights_cfg: Highlights config with weights, etc.
+        audio_events_cfg: Audio events config
+        include_chat: Whether to include chat signal
+        include_audio_events: Whether to include audio events signal
+        on_progress: Progress callback
+        
+    Returns:
+        Dict with peak_indices, weights, hop_s, signals_used
+    """
+    proj_data = get_project_data(proj)
+    hop_s = float(audio_cfg.get("hop_seconds", 0.5))
+    
+    if on_progress:
+        on_progress(0.05)
+    
+    # Load audio features (required)
+    if not proj.audio_features_path.exists():
+        raise ValueError("audio_features.npz not found - run audio_features task first")
+    
+    audio_data = load_npz(proj.audio_features_path)
+    audio_scores = audio_data.get("scores")
+    if audio_scores is None:
+        raise ValueError("audio_features.npz missing scores")
+    audio_scores = audio_scores.astype(np.float64)
+    
+    if on_progress:
+        on_progress(0.10)
+    
+    # Load motion features (optional)
+    motion_resampled = np.zeros_like(audio_scores)
+    motion_used = False
+    if proj.motion_features_path.exists():
+        motion_data = load_npz(proj.motion_features_path)
+        motion_scores = motion_data.get("scores")
+        if motion_scores is not None:
+            motion_fps_arr = motion_data.get("fps")
+            motion_fps = float(motion_fps_arr[0]) if motion_fps_arr is not None and len(motion_fps_arr) > 0 else 1.0
+            motion_hop_s = 1.0 / motion_fps
+            motion_resampled = resample_series(
+                motion_scores.astype(np.float64),
+                src_hop_s=motion_hop_s,
+                target_hop_s=hop_s,
+                target_len=len(audio_scores),
+                fill_value=0.0,
+            )
+            motion_used = True
+    
+    if on_progress:
+        on_progress(0.20)
+    
+    # Load chat features (optional)
+    chat_scores = np.zeros_like(audio_scores)
+    chat_used = False
+    if include_chat and proj.chat_features_path.exists():
+        chat_data = load_npz(proj.chat_features_path)
+        chat_raw = chat_data.get("scores")
+        chat_hop_arr = chat_data.get("hop_seconds")
+        if chat_raw is not None and chat_hop_arr is not None and len(chat_hop_arr) > 0:
+            chat_scores = resample_series(
+                chat_raw.astype(np.float64),
+                src_hop_s=float(chat_hop_arr[0]),
+                target_hop_s=hop_s,
+                target_len=len(audio_scores),
+                fill_value=0.0,
+            )
+            chat_used = True
+    
+    if on_progress:
+        on_progress(0.30)
+    
+    # Load audio events (optional)
+    audio_events_scores = np.zeros_like(audio_scores)
+    audio_events_used = False
+    if include_audio_events and proj.audio_events_features_path.exists():
+        try:
+            events_data = load_npz(proj.audio_events_features_path)
+            events_raw = events_data.get("event_combo_z")
+            events_hop_arr = events_data.get("hop_seconds")
+            if events_raw is not None and events_hop_arr is not None and len(events_hop_arr) > 0:
+                audio_events_scores = resample_series(
+                    events_raw.astype(np.float64),
+                    src_hop_s=float(events_hop_arr[0]),
+                    target_hop_s=hop_s,
+                    target_len=len(audio_scores),
+                    fill_value=0.0,
+                )
+                audio_events_used = True
+        except Exception:
+            pass
+    
+    if on_progress:
+        on_progress(0.40)
+    
+    # Load speech features (optional)
+    speech_scores = np.zeros_like(audio_scores)
+    speech_used = False
+    if proj.speech_features_path.exists():
+        try:
+            speech_data = load_npz(proj.speech_features_path)
+            speech_raw = speech_data.get("speech_score")
+            if speech_raw is None:
+                word_count = speech_data.get("word_count")
+                if word_count is not None:
+                    speech_raw = robust_z(word_count.astype(np.float64))
+            
+            speech_hop_arr = speech_data.get("hop_seconds")
+            if speech_raw is not None and speech_hop_arr is not None and len(speech_hop_arr) > 0:
+                speech_scores = resample_series(
+                    speech_raw.astype(np.float64),
+                    src_hop_s=float(speech_hop_arr[0]),
+                    target_hop_s=hop_s,
+                    target_len=len(audio_scores),
+                    fill_value=0.0,
+                )
+                speech_used = True
+        except Exception:
+            pass
+    
+    if on_progress:
+        on_progress(0.50)
+    
+    # Load reaction audio (optional)
+    reaction_scores = np.zeros_like(audio_scores)
+    reaction_used = False
+    if proj.reaction_audio_features_path.exists():
+        try:
+            reaction_data = load_npz(proj.reaction_audio_features_path)
+            reaction_raw = reaction_data.get("scores")
+            reaction_hop_arr = reaction_data.get("hop_seconds")
+            if reaction_raw is not None and reaction_hop_arr is not None and len(reaction_hop_arr) > 0:
+                reaction_scores = resample_series(
+                    reaction_raw.astype(np.float64),
+                    src_hop_s=float(reaction_hop_arr[0]),
+                    target_hop_s=hop_s,
+                    target_len=len(audio_scores),
+                    fill_value=0.0,
+                )
+                reaction_used = True
+        except Exception:
+            pass
+    
+    if on_progress:
+        on_progress(0.55)
+    
+    # Get weights
+    weights = highlights_cfg.get("weights", {})
+    w_audio = float(weights.get("audio", 0.45))
+    w_motion = float(weights.get("motion", 0.15)) if motion_used else 0.0
+    w_chat = float(weights.get("chat", 0.20)) if chat_used else 0.0
+    w_audio_events = float(weights.get("audio_events", 0.20)) if audio_events_used else 0.0
+    w_speech = float(weights.get("speech", 0.15)) if speech_used else 0.0
+    w_reaction = float(weights.get("reaction", 0.15)) if reaction_used else 0.0
+    
+    # Normalize weights
+    w_total = w_audio + w_motion + w_chat + w_audio_events + w_speech + w_reaction
+    if w_total > 0 and abs(w_total - 1.0) > 0.001:
+        w_audio /= w_total
+        w_motion /= w_total
+        w_chat /= w_total
+        w_audio_events /= w_total
+        w_speech /= w_total
+        w_reaction /= w_total
+    
+    # Signal processing config
+    use_relu = bool(highlights_cfg.get("relu_zscores", True))
+    signal_clip_z = float(highlights_cfg.get("signal_clip_z", 6.0))
+    signal_softclip = str(highlights_cfg.get("signal_softclip", "clip")).lower().strip()
+    use_motion_gating = bool(highlights_cfg.get("motion_gating", True))
+    motion_gate_threshold_z = float(highlights_cfg.get("motion_gate_threshold_z", 0.0))
+    motion_gate_scale_z = float(highlights_cfg.get("motion_gate_scale_z", 2.0))
+    use_audio_events_gating = bool(highlights_cfg.get("audio_events_gating", True))
+    audio_events_gate_threshold_z = float(highlights_cfg.get("audio_events_gate_threshold_z", 0.0))
+    audio_events_gate_scale_z = float(highlights_cfg.get("audio_events_gate_scale_z", 2.0))
+    
+    motion_gate = np.ones_like(audio_scores)
+    audio_events_gate = np.ones_like(audio_scores)
+    
+    if on_progress:
+        on_progress(0.60)
+    
+    # Compute weighted terms
+    if use_relu:
+        audio_scores_pos = _pos_transform(audio_scores, clip_z=signal_clip_z, mode=signal_softclip)
+        motion_resampled_pos = _pos_transform(motion_resampled, clip_z=signal_clip_z, mode=signal_softclip)
+        chat_scores_pos = _pos_transform(chat_scores, clip_z=signal_clip_z, mode=signal_softclip)
+        audio_events_scores_pos = _pos_transform(audio_events_scores, clip_z=signal_clip_z, mode=signal_softclip)
+        speech_scores_pos = _pos_transform(speech_scores, clip_z=signal_clip_z, mode=signal_softclip)
+        reaction_scores_pos = _pos_transform(reaction_scores, clip_z=signal_clip_z, mode=signal_softclip)
+        
+        if use_motion_gating and w_motion > 0:
+            motion_gate = _linear_gate(
+                np.maximum(audio_scores_pos, chat_scores_pos),
+                threshold=motion_gate_threshold_z,
+                scale=motion_gate_scale_z,
+            )
+            term_motion = w_motion * motion_resampled_pos * motion_gate
+        else:
+            term_motion = w_motion * motion_resampled_pos
+        
+        if use_audio_events_gating and w_audio_events > 0:
+            audio_events_gate = _linear_gate(
+                audio_scores_pos,
+                threshold=audio_events_gate_threshold_z,
+                scale=audio_events_gate_scale_z,
+            )
+            term_audio_events = w_audio_events * audio_events_scores_pos * audio_events_gate
+        else:
+            term_audio_events = w_audio_events * audio_events_scores_pos
+        
+        term_audio = w_audio * audio_scores_pos
+        term_chat = w_chat * chat_scores_pos
+        term_speech = w_speech * speech_scores_pos
+        term_reaction = w_reaction * reaction_scores_pos
+    else:
+        if use_motion_gating and w_motion > 0:
+            motion_gate = _linear_gate(
+                np.maximum(audio_scores, chat_scores),
+                threshold=motion_gate_threshold_z,
+                scale=motion_gate_scale_z,
+            )
+            term_motion = w_motion * motion_resampled * motion_gate
+        else:
+            term_motion = w_motion * motion_resampled
+        
+        if use_audio_events_gating and w_audio_events > 0:
+            audio_events_gate = _linear_gate(
+                audio_scores,
+                threshold=audio_events_gate_threshold_z,
+                scale=audio_events_gate_scale_z,
+            )
+            term_audio_events = w_audio_events * audio_events_scores * audio_events_gate
+        else:
+            term_audio_events = w_audio_events * audio_events_scores
+        
+        term_audio = w_audio * audio_scores
+        term_chat = w_chat * chat_scores
+        term_speech = w_speech * speech_scores
+        term_reaction = w_reaction * reaction_scores
+    
+    combined_raw = (
+        term_audio + term_motion + term_chat + 
+        term_audio_events + term_speech + term_reaction
+    )
+    
+    if on_progress:
+        on_progress(0.70)
+    
+    # Smooth and z-score
+    smooth_s = float(highlights_cfg.get("smooth_seconds", max(1.0, 2.0 * hop_s)))
+    smooth_frames = max(1, int(round(smooth_s / hop_s)))
+    combined_smoothed = moving_average(combined_raw, smooth_frames) if len(combined_raw) > 0 else combined_raw
+    combined_scores = robust_z(combined_smoothed) if len(combined_smoothed) > 0 else combined_smoothed
+    
+    # Peak selection
+    scores_for_peaks = combined_scores.copy()
+    skip_start_frames = int(round(float(highlights_cfg.get("skip_start_seconds", 10.0)) / hop_s))
+    if skip_start_frames > 0 and skip_start_frames < len(scores_for_peaks):
+        scores_for_peaks[:skip_start_frames] = -np.inf
+    
+    min_gap_frames = max(1, int(round(float(highlights_cfg.get("min_gap_seconds", 15.0)) / hop_s)))
+    min_peak_score = float(highlights_cfg.get("min_peak_score", 0.0))
+    peak_idxs = pick_top_peaks(
+        scores_for_peaks,
+        top_k=int(highlights_cfg.get("top", 20)),
+        min_gap_frames=min_gap_frames,
+        min_score=min_peak_score,
+    )
+    
+    if on_progress:
+        on_progress(0.85)
+    
+    # Save features NPZ with peak indices
+    save_npz(
+        proj.highlights_features_path,
+        combined_raw=combined_raw,
+        combined_smoothed=combined_smoothed,
+        combined_scores=combined_scores,
+        scores_for_peaks=scores_for_peaks,
+        peak_indices=np.array(peak_idxs, dtype=np.int64),
+        audio_scores=audio_scores,
+        motion_scores=motion_resampled,
+        chat_scores=chat_scores,
+        audio_events_scores=audio_events_scores,
+        speech_scores=speech_scores,
+        reaction_scores=reaction_scores,
+        term_audio=term_audio,
+        term_motion=term_motion,
+        term_chat=term_chat,
+        term_audio_events=term_audio_events,
+        term_speech=term_speech,
+        term_reaction=term_reaction,
+        motion_gate=motion_gate,
+        audio_events_gate=audio_events_gate,
+        hop_seconds=np.array([hop_s], dtype=np.float64),
+    )
+    
+    if on_progress:
+        on_progress(1.0)
+    
+    return {
+        "peak_count": len(peak_idxs),
+        "hop_s": hop_s,
+        "weights": {
+            "audio": w_audio,
+            "motion": w_motion,
+            "chat": w_chat,
+            "audio_events": w_audio_events,
+            "speech": w_speech,
+            "reaction": w_reaction,
+        },
+        "signals_used": {
+            "motion": motion_used,
+            "chat": chat_used,
+            "audio_events": audio_events_used,
+            "speech": speech_used,
+            "reaction": reaction_used,
+        },
+    }
+
+
+def compute_highlights_candidates(
+    proj: Project,
+    *,
+    highlights_cfg: Dict[str, Any],
+    scenes_cfg: Optional[Dict[str, Any]] = None,
+    llm_complete: Optional[Callable[[str], str]] = None,
+    on_progress: Optional[Callable[[float], None]] = None,
+) -> Dict[str, Any]:
+    """Shape peaks into clip candidates (SHAPING phase).
+    
+    This function:
+    1. Loads peaks from highlights_features.npz
+    2. Uses boundary graph (if available) for optimal clip edges
+    3. Applies overlap filtering
+    4. Optionally runs LLM semantic scoring
+    5. Saves highlights.json
+    
+    This can be re-run quickly when boundary information improves.
+    
+    Args:
+        proj: Project instance
+        highlights_cfg: Highlights config with clip settings
+        scenes_cfg: Scenes config (for snap_window)
+        llm_complete: Optional LLM function for semantic scoring
+        on_progress: Progress callback
+        
+    Returns:
+        Dict with candidates
+    """
+    import json
+    from datetime import datetime, timezone
+    
+    if scenes_cfg is None:
+        scenes_cfg = {}
+    
+    proj_data = get_project_data(proj)
+    
+    if on_progress:
+        on_progress(0.05)
+    
+    # Load scores and peaks
+    if not proj.highlights_features_path.exists():
+        raise ValueError("highlights_features.npz not found - run highlights_scores task first")
+    
+    features = load_npz(proj.highlights_features_path)
+    combined_smoothed = features.get("combined_smoothed")
+    combined_scores = features.get("combined_scores")
+    peak_idxs = features.get("peak_indices")
+    hop_arr = features.get("hop_seconds")
+    
+    if combined_smoothed is None or peak_idxs is None or hop_arr is None:
+        raise ValueError("highlights_features.npz missing required arrays")
+    
+    hop_s = float(hop_arr[0]) if len(hop_arr) > 0 else 0.5
+    peak_idxs = peak_idxs.astype(np.int64).tolist()
+    
+    # Load term arrays for breakdown
+    term_audio = features.get("term_audio", np.zeros_like(combined_smoothed))
+    term_motion = features.get("term_motion", np.zeros_like(combined_smoothed))
+    term_chat = features.get("term_chat", np.zeros_like(combined_smoothed))
+    term_audio_events = features.get("term_audio_events", np.zeros_like(combined_smoothed))
+    term_speech = features.get("term_speech", np.zeros_like(combined_smoothed))
+    term_reaction = features.get("term_reaction", np.zeros_like(combined_smoothed))
+    
+    # Load raw signals for debugging
+    audio_scores = features.get("audio_scores", np.zeros_like(combined_smoothed))
+    motion_scores = features.get("motion_scores", np.zeros_like(combined_smoothed))
+    chat_scores = features.get("chat_scores", np.zeros_like(combined_smoothed))
+    audio_events_scores = features.get("audio_events_scores", np.zeros_like(combined_smoothed))
+    speech_scores = features.get("speech_scores", np.zeros_like(combined_smoothed))
+    reaction_scores = features.get("reaction_scores", np.zeros_like(combined_smoothed))
+    
+    if on_progress:
+        on_progress(0.15)
+    
+    # Load scene cuts
+    scene_cuts = []
+    scenes_enabled = bool(scenes_cfg.get("enabled", True))
+    snap_window_s = float(scenes_cfg.get("snap_window_seconds", 0.0))
+    if scenes_enabled and proj.scenes_path.exists():
+        try:
+            scene_payload = json.loads(proj.scenes_path.read_text(encoding="utf-8"))
+            scene_cuts = scene_payload.get("cuts_seconds", []) or scene_payload.get("cuts", [])
+        except Exception:
+            pass
+    
+    if on_progress:
+        on_progress(0.20)
+    
+    # Load boundary graph (key for quality)
+    boundary_graph = None
+    try:
+        from .analysis_boundaries import load_boundary_graph
+        boundary_graph = load_boundary_graph(proj)
+    except Exception:
+        pass
+    
+    if on_progress:
+        on_progress(0.25)
+    
+    # Clip config
+    clip_cfg_dict = highlights_cfg.get("clip", {})
+    clip_cfg = ClipConfig(
+        min_seconds=float(clip_cfg_dict.get("min_seconds", 12.0)),
+        max_seconds=float(clip_cfg_dict.get("max_seconds", 60.0)),
+        min_pre_seconds=float(clip_cfg_dict.get("min_pre_seconds", 2.0)),
+        max_pre_seconds=float(clip_cfg_dict.get("max_pre_seconds", 12.0)),
+        min_post_seconds=float(clip_cfg_dict.get("min_post_seconds", 4.0)),
+        max_post_seconds=float(clip_cfg_dict.get("max_post_seconds", 28.0)),
+    )
+    
+    duration_s = float(proj_data.get("video", {}).get("duration_seconds", hop_s * len(audio_scores)))
+    
+    # Overlap filtering config
+    max_overlap_ratio = float(highlights_cfg.get("max_overlap_ratio", 0.0))
+    max_overlap_seconds = float(highlights_cfg.get("max_overlap_seconds", 0.0))
+    overlap_denom = str(highlights_cfg.get("overlap_denominator", "shorter"))
+    
+    if on_progress:
+        on_progress(0.30)
+    
+    # Build raw candidates
+    raw_candidates: List[Dict[str, Any]] = []
+    
+    for rank, idx in enumerate(peak_idxs, start=1):
+        if idx < 0 or idx >= len(combined_smoothed):
+            continue
+            
+        bounds = shape_clip_bounds(
+            peak_idx=idx,
+            scores=combined_smoothed,
+            hop_s=hop_s,
+            duration_s=duration_s,
+            clip_cfg=clip_cfg,
+            scene_cuts=scene_cuts,
+            snap_window_s=snap_window_s,
+            boundary_graph=boundary_graph,
+        )
+        start_s = bounds["start_s"]
+        end_s = bounds["end_s"]
+        if end_s - start_s < max(1.0, clip_cfg.min_seconds * 0.5):
+            continue
+        
+        # Check signals_used (based on non-zero term arrays)
+        chat_used = bool(np.any(term_chat != 0))
+        audio_events_used = bool(np.any(term_audio_events != 0))
+        speech_used = bool(np.any(term_speech != 0))
+        reaction_used = bool(np.any(term_reaction != 0))
+        
+        raw_candidates.append({
+            "rank": rank,
+            "peak_time_s": float(idx * hop_s),
+            "start_s": float(start_s),
+            "end_s": float(end_s),
+            "score": float(combined_scores[idx]) if combined_scores is not None and idx < len(combined_scores) else 0.0,
+            "used_boundary_graph": bounds.get("used_boundary_graph", False),
+            "breakdown": {
+                "audio": float(term_audio[idx]),
+                "motion": float(term_motion[idx]),
+                "chat": float(term_chat[idx]) if chat_used else 0.0,
+                "audio_events": float(term_audio_events[idx]) if audio_events_used else 0.0,
+                "speech": float(term_speech[idx]) if speech_used else 0.0,
+                "reaction": float(term_reaction[idx]) if reaction_used else 0.0,
+            },
+            "raw_signals": {
+                "audio": float(audio_scores[idx]),
+                "motion": float(motion_scores[idx]),
+                "chat": float(chat_scores[idx]) if chat_used else 0.0,
+                "audio_events": float(audio_events_scores[idx]) if audio_events_used else 0.0,
+                "speech": float(speech_scores[idx]) if speech_used else 0.0,
+                "reaction": float(reaction_scores[idx]) if reaction_used else 0.0,
+            },
+        })
+    
+    if on_progress:
+        on_progress(0.50)
+    
+    # Non-overlap filtering
+    raw_candidates.sort(key=lambda c: c.get("score", 0.0), reverse=True)
+    candidates: List[Dict[str, Any]] = []
+    
+    for cand in raw_candidates:
+        if _check_overlap(
+            cand["start_s"],
+            cand["end_s"],
+            candidates,
+            max_overlap_ratio=max_overlap_ratio,
+            max_overlap_seconds=max_overlap_seconds,
+            denom=overlap_denom,
+        ):
+            cand["rank"] = len(candidates) + 1
+            candidates.append(cand)
+    
+    if on_progress:
+        on_progress(0.65)
+    
+    # LLM Semantic Scoring (optional)
+    llm_semantic_used = False
+    llm_semantic_scores: Dict[int, Dict[str, Any]] = {}
+    
+    if llm_complete is not None and candidates:
+        if on_progress:
+            on_progress(0.70)
+        
+        try:
+            llm_semantic_scores = compute_llm_semantic_scores(
+                candidates=candidates,
+                proj=proj,
+                llm_complete=llm_complete,
+                max_candidates=int(highlights_cfg.get("llm_max_candidates", 15)),
+            )
+            
+            if llm_semantic_scores:
+                llm_semantic_used = True
+                semantic_weight = float(highlights_cfg.get("llm_semantic_weight", 0.3))
+                
+                for cand in candidates:
+                    rank = cand.get("rank", 0)
+                    if rank in llm_semantic_scores:
+                        llm_data = llm_semantic_scores[rank]
+                        semantic_score = llm_data.get("semantic_score", 0.5)
+                        signal_score = cand.get("score", 0.0)
+                        semantic_z = (semantic_score - 0.5) * 4.0
+                        blended_score = (1.0 - semantic_weight) * signal_score + semantic_weight * semantic_z
+                        
+                        cand["score_signal"] = signal_score
+                        cand["score_semantic"] = semantic_score
+                        cand["score"] = blended_score
+                        cand["llm_reason"] = llm_data.get("reason", "")
+                        cand["llm_quote"] = llm_data.get("best_quote", "")
+                
+                candidates.sort(key=lambda c: c.get("score", 0.0), reverse=True)
+                for i, cand in enumerate(candidates, start=1):
+                    cand["rank"] = i
+        except Exception as e:
+            _highlight_logger.warning(f"LLM semantic scoring failed: {e}")
+    
+    if on_progress:
+        on_progress(0.90)
+    
+    # Build and save payload
+    payload: Dict[str, Any] = {
+        "method": "dag_split_shaping_v1",
+        "signals_used": {
+            "boundary_graph": boundary_graph is not None,
+            "llm_semantic": llm_semantic_used,
+        },
+        "filtering": {
+            "max_overlap_ratio": max_overlap_ratio,
+            "max_overlap_seconds": max_overlap_seconds,
+            "overlap_denominator": overlap_denom,
+            "candidates_before_filter": len(raw_candidates),
+            "candidates_after_filter": len(candidates),
+        },
+        "candidates": candidates,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    # Save highlights.json
+    highlights_json_path = proj.analysis_dir / "highlights.json"
+    highlights_json_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    
+    # Update project.json
+    def _upd(d: Dict[str, Any]) -> None:
+        d.setdefault("analysis", {})
+        d["analysis"]["highlights"] = {
+            **payload,
+            "features_npz": str(proj.highlights_features_path.relative_to(proj.project_dir)),
+        }
+    
+    update_project(proj, _upd)
+    
+    if on_progress:
+        on_progress(1.0)
+    
+    return payload

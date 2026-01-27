@@ -16,6 +16,7 @@ from ..analysis_audio_events import AudioEventsConfig, compute_audio_events_anal
 from ..analysis_chapters import ChapterConfig, compute_chapters_analysis
 from ..analysis_highlights import compute_highlights_analysis
 from ..analysis_transcript import TranscriptConfig, compute_transcript_analysis, load_transcript
+from ..analysis import run_analysis, BUNDLE_FULL
 from ..analysis_speech_features import SpeechFeatureConfig, compute_speech_features, load_speech_features
 from ..analysis_reaction_audio import ReactionAudioConfig, compute_reaction_audio_features
 from ..enrich_candidates import EnrichConfig, enrich_candidates
@@ -1855,18 +1856,28 @@ def create_app(
                 JOB_MANAGER._set(job, progress=frac, message="analyzing highlights")  # type: ignore[attr-defined]
 
             try:
-                result = compute_highlights_analysis(
+                # Use DAG runner for full analysis with proper dependency ordering
+                dag_config = {
+                    "audio": audio_cfg,
+                    "motion": motion_cfg,
+                    "scenes": scenes_cfg,
+                    "highlights": highlights_cfg,
+                    "audio_events": audio_events_cfg,
+                    "include_chat": True,
+                    "include_audio_events": bool(audio_events_cfg.get("enabled", True)),
+                }
+                
+                def on_dag_progress(frac: float, msg: str) -> None:
+                    on_prog(frac)
+                
+                result = run_analysis(
                     proj,
-                    audio_cfg=audio_cfg,
-                    motion_cfg=motion_cfg,
-                    scenes_cfg=scenes_cfg,
-                    highlights_cfg=highlights_cfg,
-                    audio_events_cfg=audio_events_cfg,
-                    include_chat=True,
-                    include_audio_events=bool(audio_events_cfg.get("enabled", True)),
-                    on_progress=on_prog,
+                    bundle="full",
+                    config=dag_config,
+                    on_progress=on_dag_progress,
+                    upgrade_mode=True,  # Re-shape when boundaries improve
                 )
-                JOB_MANAGER._set(job, status="succeeded", progress=1.0, message="done", result=result)  # type: ignore[attr-defined]
+                JOB_MANAGER._set(job, status="succeeded", progress=1.0, message="done", result={"tasks_run": len(result.tasks_run)})  # type: ignore[attr-defined]
             except Exception as e:
                 JOB_MANAGER._set(job, status="failed", message=f"{type(e).__name__}: {e}")  # type: ignore[attr-defined]
 
@@ -2799,17 +2810,28 @@ def create_app(
                         msg = "Stage 2: Finalizing highlights..."
                     JOB_MANAGER._set(job, progress=scaled, message=msg, result=update_timing_result())
                 
-                compute_highlights_analysis(
+                # Use DAG runner for highlights with proper boundary graph ordering
+                dag_config = {
+                    "audio": audio_cfg,
+                    "motion": motion_cfg,
+                    "scenes": scenes_cfg,
+                    "highlights": highlights_cfg,
+                    "audio_events": audio_events_cfg,
+                    "include_chat": True,
+                    "include_audio_events": bool(audio_events_cfg.get("enabled", True)),
+                    "_llm_complete": llm_complete_fn_highlights,
+                }
+                
+                def on_dag_progress(frac: float, msg: str) -> None:
+                    on_highlights_progress(frac)
+                
+                run_analysis(
                     proj,
-                    audio_cfg=audio_cfg,
-                    motion_cfg=motion_cfg,
-                    scenes_cfg=scenes_cfg,
-                    highlights_cfg=highlights_cfg,
-                    audio_events_cfg=audio_events_cfg,
-                    include_chat=True,
-                    include_audio_events=bool(audio_events_cfg.get("enabled", True)),
+                    targets={"highlights_candidates", "boundary_graph"},
+                    config=dag_config,
+                    on_progress=on_dag_progress,
                     llm_complete=llm_complete_fn_highlights,
-                    on_progress=on_highlights_progress,
+                    upgrade_mode=True,
                 )
                 completed_stages.append("highlights")
                 stage_times["highlights"] = _time.time() - highlights_start
