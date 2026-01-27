@@ -817,6 +817,9 @@ def create_app(
             create_preview=bool(opts.get("create_preview", True)),
             auto_open=auto_open,
         )
+        
+        # Parse whisper verbose option (defaults to True)
+        whisper_verbose = bool(opts.get("whisper_verbose", True))
 
         job = JOB_MANAGER.create("download_url")
 
@@ -850,6 +853,10 @@ def create_app(
             video_result = None
             chat_result = {"status": "skipped", "message": "Not a Twitch VOD"}
             chat_error = None
+            
+            # Track early audio analysis status (initialized early so on_video_progress can access)
+            audio_rms_status = {"status": "pending", "progress": 0}
+            audio_events_status = {"status": "pending", "progress": 0}
 
             def on_video_progress(frac: float, msg: str) -> None:
                 # Check for cancellation
@@ -882,14 +889,36 @@ def create_app(
                     tp = transcript_status.get("progress", 0)
                     transcript_info = f" | 🎙️ Transcribing: {int(tp * 100)}%"
                 elif ts == "complete":
-                    transcript_info = " | 🎙️ Transcript: ✓ done"
+                    transcript_info = " | 🎙️ Transcript: ✓"
                 elif ts == "failed":
-                    transcript_info = " | 🎙️ Transcript: ✗ failed"
+                    transcript_info = " | 🎙️ Transcript: ✗"
+                
+                # Build audio RMS info for message
+                audio_rms_info = ""
+                rms_stat = audio_rms_status.get("status", "pending")
+                if rms_stat == "analyzing":
+                    rp = audio_rms_status.get("progress", 0)
+                    audio_rms_info = f" | 📊 RMS: {int(rp * 100)}%"
+                elif rms_stat == "complete":
+                    audio_rms_info = " | 📊 RMS: ✓"
+                elif rms_stat == "failed":
+                    audio_rms_info = " | 📊 RMS: ✗"
+                
+                # Build audio events info for message
+                audio_events_info = ""
+                events_stat = audio_events_status.get("status", "pending")
+                if events_stat == "analyzing":
+                    ep = audio_events_status.get("progress", 0)
+                    audio_events_info = f" | 🎭 Events: {int(ep * 100)}%"
+                elif events_stat == "complete":
+                    audio_events_info = " | 🎭 Events: ✓"
+                elif events_stat == "failed":
+                    audio_events_info = " | 🎭 Events: ✗"
                 
                 JOB_MANAGER._set(
                     job, 
                     progress=frac * 0.9, 
-                    message=f"{msg}{chat_info}{transcript_info}",
+                    message=f"{msg}{chat_info}{transcript_info}{audio_rms_info}{audio_events_info}",
                     result={
                         "video_status": "downloading",
                         "video_progress": frac,
@@ -903,6 +932,10 @@ def create_app(
                         "audio_total_bytes": transcript_status.get("audio_total_bytes"),
                         "audio_downloaded_bytes": transcript_status.get("audio_downloaded_bytes"),
                         "audio_speed": transcript_status.get("audio_speed"),
+                        "audio_rms_status": audio_rms_status.get("status", "pending"),
+                        "audio_rms_progress": audio_rms_status.get("progress", 0),
+                        "audio_events_status": audio_events_status.get("status", "pending"),
+                        "audio_events_progress": audio_events_status.get("progress", 0),
                     }
                 )
 
@@ -1125,6 +1158,7 @@ def create_app(
                         threads=int(speech_cfg.get("threads", 0)),
                         n_processors=int(speech_cfg.get("n_processors", 1)),
                         strict=bool(speech_cfg.get("strict", False)),
+                        verbose=whisper_verbose,  # From download options
                     )
                     
                     log.info(f"[TRANSCRIPT] Starting early transcription from audio...")
@@ -1160,35 +1194,123 @@ def create_app(
                     transcript_result = {"status": "failed", "error": str(e)}
                     return None
 
+            # Track early audio analysis results
+            early_audio_rms_result = None
+            early_audio_events_result = None
+            # Note: audio_rms_status and audio_events_status are initialized earlier (before on_video_progress)
+            
+            def run_early_audio_rms(audio_path: Path):
+                """Run audio RMS analysis on downloaded audio while video downloads."""
+                nonlocal early_audio_rms_result, audio_rms_status
+                import logging
+                log = logging.getLogger("videopipeline.studio")
+                
+                try:
+                    from ..analysis_audio import compute_audio_rms_from_file
+                    
+                    audio_cfg = ctx.profile.get("analysis", {}).get("audio", {})
+                    
+                    log.info(f"[AUDIO_RMS] Starting early audio RMS analysis...")
+                    audio_rms_status["status"] = "analyzing"
+                    
+                    def on_rms_progress(frac: float) -> None:
+                        check_cancel()
+                        audio_rms_status["progress"] = frac
+                    
+                    result = compute_audio_rms_from_file(
+                        audio_path,
+                        sample_rate=int(audio_cfg.get("sample_rate", 16000)),
+                        hop_s=float(audio_cfg.get("hop_seconds", 0.5)),
+                        smooth_s=float(audio_cfg.get("smooth_seconds", 2.0)),
+                        on_progress=on_rms_progress,
+                    )
+                    
+                    audio_rms_status["status"] = "complete"
+                    audio_rms_status["progress"] = 1.0
+                    early_audio_rms_result = result
+                    log.info(f"[AUDIO_RMS] Early audio RMS complete: {result.get('duration_seconds', 0):.1f}s analyzed in {result.get('elapsed_seconds', 0):.1f}s")
+                    return result
+                    
+                except Exception as e:
+                    log.warning(f"[AUDIO_RMS] Early audio RMS failed: {e}")
+                    audio_rms_status["status"] = "failed"
+                    return None
+            
+            def run_early_audio_events(audio_path: Path):
+                """Run audio event detection on downloaded audio while video downloads."""
+                nonlocal early_audio_events_result, audio_events_status
+                import logging
+                log = logging.getLogger("videopipeline.studio")
+                
+                try:
+                    from ..analysis_audio_events import AudioEventsConfig, compute_audio_events_from_file
+                    
+                    events_cfg = ctx.profile.get("analysis", {}).get("audio_events", {})
+                    if not events_cfg.get("enabled", True):
+                        log.info("[AUDIO_EVENTS] Audio events disabled, skipping")
+                        audio_events_status["status"] = "disabled"
+                        return None
+                    
+                    log.info(f"[AUDIO_EVENTS] Starting early audio event detection...")
+                    audio_events_status["status"] = "analyzing"
+                    
+                    cfg = AudioEventsConfig.from_dict(events_cfg)
+                    
+                    def on_events_progress(frac: float) -> None:
+                        check_cancel()
+                        audio_events_status["progress"] = frac
+                    
+                    result = compute_audio_events_from_file(
+                        audio_path,
+                        cfg=cfg,
+                        on_progress=on_events_progress,
+                    )
+                    
+                    audio_events_status["status"] = "complete"
+                    audio_events_status["progress"] = 1.0
+                    early_audio_events_result = result
+                    log.info(f"[AUDIO_EVENTS] Early audio events complete: {result.get('duration_seconds', 0):.1f}s analyzed in {result.get('elapsed_seconds', 0):.1f}s")
+                    return result
+                    
+                except Exception as e:
+                    log.warning(f"[AUDIO_EVENTS] Early audio events failed: {e}")
+                    audio_events_status["status"] = "failed"
+                    return None
+
             # Track early transcript result for saving after project is created
             early_transcript_result = None
             
             try:
                 # Run video, chat, and audio downloads in parallel
-                # Audio finishes first -> start transcription while video continues
-                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                # Audio finishes first -> start transcription + audio analysis while video continues
+                with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
                     video_future = executor.submit(download_video)
                     chat_future = executor.submit(download_chat)
                     audio_future = executor.submit(download_audio_for_transcript)
                     
                     transcript_future = None
+                    audio_rms_future = None
+                    audio_events_future = None
                     audio_path_for_transcript = None
                     
                     # Wait for all to complete, checking for cancellation
-                    # and starting transcript when audio is ready
+                    # and starting analysis tasks when audio is ready
                     while True:
                         if job.cancel_requested:
                             # Job was cancelled - clean up and exit
                             cleanup_downloads()
                             return
                         
-                        # Check if audio is done and we haven't started transcript yet
+                        # Check if audio is done and we haven't started analysis yet
                         if audio_future and audio_future.done() and transcript_future is None:
                             try:
                                 audio_path_for_transcript = audio_future.result()
                                 if audio_path_for_transcript:
-                                    log.info(f"[DOWNLOAD] Audio ready, starting early transcription...")
+                                    log.info(f"[DOWNLOAD] Audio ready, starting early transcription + audio analysis...")
+                                    # Start all three analysis tasks in parallel
                                     transcript_future = executor.submit(run_early_transcription, audio_path_for_transcript)
+                                    audio_rms_future = executor.submit(run_early_audio_rms, audio_path_for_transcript)
+                                    audio_events_future = executor.submit(run_early_audio_events, audio_path_for_transcript)
                                 else:
                                     log.info(f"[DOWNLOAD] Audio download skipped or failed")
                             except Exception as e:
@@ -1198,45 +1320,63 @@ def create_app(
                         video_done = video_future.done()
                         chat_done = chat_future.done()
                         transcript_done = transcript_future is None or transcript_future.done()
+                        audio_rms_done = audio_rms_future is None or audio_rms_future.done()
+                        audio_events_done = audio_events_future is None or audio_events_future.done()
                         
-                        if video_done and chat_done and transcript_done:
+                        if video_done and chat_done and transcript_done and audio_rms_done and audio_events_done:
                             break
                         
-                        # Update UI with current transcript progress while waiting
-                        # This is important when video finishes before transcription
-                        if video_done and not transcript_done:
+                        # Update UI with current analysis progress while waiting
+                        # This is important when video finishes before analysis tasks
+                        if video_done and (not transcript_done or not audio_rms_done or not audio_events_done):
+                            # Build status parts
+                            msg_parts = ["Download complete!"]
+                            
+                            # Chat status
+                            chat_stat = current_chat_status.get("status", "pending")
+                            if chat_stat == "success":
+                                msg_parts.append("💬 ✓")
+                            elif chat_stat == "downloading":
+                                msg_parts.append("💬 ...")
+                            elif chat_stat == "failed":
+                                msg_parts.append("💬 ✗")
+                            
+                            # Transcript status
                             ts = transcript_status.get("status", "pending")
                             if ts == "transcribing":
                                 tp = transcript_status.get("progress", 0)
-                                # Build chat status for message
-                                chat_stat = current_chat_status.get("status", "pending")
-                                if chat_stat == "success":
-                                    chat_msg = "💬 Chat: ✓ done"
-                                elif chat_stat == "skipped":
-                                    chat_msg = ""  # Don't show for non-Twitch
-                                elif chat_stat == "downloading":
-                                    chat_msg = "💬 Chat: downloading..."
-                                elif chat_stat == "failed":
-                                    chat_msg = "💬 Chat: ✗ failed"
-                                else:
-                                    chat_msg = ""
-                                
-                                msg_parts = ["Download complete!"]
-                                if chat_msg:
-                                    msg_parts.append(chat_msg)
-                                msg_parts.append(f"🎙️ Transcribing: {int(tp * 100)}%")
-                                
-                                # Show transcript progress: video done (90%), transcript running
-                                # Keep overall progress at 90% until transcript finishes
-                                JOB_MANAGER._set(
-                                    job,
-                                    progress=0.90,
-                                    message=" | ".join(msg_parts),
-                                    result={
-                                        "video_status": "complete",
-                                        "video_progress": 1.0,
-                                        "chat_status": current_chat_status["status"],
-                                        "chat_progress": current_chat_status.get("progress", 0),
+                                msg_parts.append(f"🎙️ {int(tp * 100)}%")
+                            elif ts == "complete":
+                                msg_parts.append("🎙️ ✓")
+                            elif ts == "failed":
+                                msg_parts.append("🎙️ ✗")
+                            
+                            # Audio RMS status
+                            rms_stat = audio_rms_status.get("status", "pending")
+                            if rms_stat == "analyzing":
+                                rp = audio_rms_status.get("progress", 0)
+                                msg_parts.append(f"📊 {int(rp * 100)}%")
+                            elif rms_stat == "complete":
+                                msg_parts.append("📊 ✓")
+                            
+                            # Audio events status
+                            events_stat = audio_events_status.get("status", "pending")
+                            if events_stat == "analyzing":
+                                ep = audio_events_status.get("progress", 0)
+                                msg_parts.append(f"🎭 {int(ep * 100)}%")
+                            elif events_stat == "complete":
+                                msg_parts.append("🎭 ✓")
+                            
+                            # Keep overall progress at 90% until all analysis tasks finish
+                            JOB_MANAGER._set(
+                                job,
+                                progress=0.90,
+                                message=" | ".join(msg_parts),
+                                result={
+                                    "video_status": "complete",
+                                    "video_progress": 1.0,
+                                    "chat_status": current_chat_status["status"],
+                                    "chat_progress": current_chat_status.get("progress", 0),
                                         "chat_message": current_chat_status.get("message", ""),
                                         "chat_messages_count": current_chat_status.get("messages_count", 0),
                                         "transcript_status": "transcribing",
@@ -1269,6 +1409,28 @@ def create_app(
                             raise  # Re-raise cancellation
                         except Exception as e:
                             log.warning(f"[DOWNLOAD] Early transcription error: {e}")
+                    
+                    # Get audio RMS result if available
+                    if audio_rms_future:
+                        try:
+                            early_audio_rms_result = audio_rms_future.result()
+                            if early_audio_rms_result:
+                                log.info(f"[DOWNLOAD] Early audio RMS completed successfully")
+                        except CancelledError:
+                            raise
+                        except Exception as e:
+                            log.warning(f"[DOWNLOAD] Early audio RMS error: {e}")
+                    
+                    # Get audio events result if available
+                    if audio_events_future:
+                        try:
+                            early_audio_events_result = audio_events_future.result()
+                            if early_audio_events_result:
+                                log.info(f"[DOWNLOAD] Early audio events completed successfully")
+                        except CancelledError:
+                            raise
+                        except Exception as e:
+                            log.warning(f"[DOWNLOAD] Early audio events error: {e}")
                     
                     # Clean up temp audio file
                     if audio_path_for_transcript and Path(audio_path_for_transcript).exists():
@@ -1445,6 +1607,24 @@ def create_app(
                             log.info(f"[DOWNLOAD] Saved early transcript to project")
                         except Exception as e:
                             log.warning(f"[DOWNLOAD] Failed to save early transcript: {e}")
+                    
+                    # Save early audio RMS analysis if we computed one during download
+                    if early_audio_rms_result:
+                        try:
+                            from ..analysis_audio import save_audio_rms_to_project
+                            save_audio_rms_to_project(proj, early_audio_rms_result)
+                            log.info(f"[DOWNLOAD] Saved early audio RMS to project")
+                        except Exception as e:
+                            log.warning(f"[DOWNLOAD] Failed to save early audio RMS: {e}")
+                    
+                    # Save early audio events analysis if we computed one during download
+                    if early_audio_events_result and not early_audio_events_result.get("skipped"):
+                        try:
+                            from ..analysis_audio_events import save_audio_events_to_project
+                            save_audio_events_to_project(proj, early_audio_events_result)
+                            log.info(f"[DOWNLOAD] Saved early audio events to project")
+                        except Exception as e:
+                            log.warning(f"[DOWNLOAD] Failed to save early audio events: {e}")
                     
                     result_dict["project"] = get_project_data(proj)
                     result_dict["auto_opened"] = True

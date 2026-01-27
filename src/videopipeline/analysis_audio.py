@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time as _time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -11,6 +12,133 @@ from .ffmpeg import ffprobe_duration_seconds
 from .peaks import moving_average, pick_top_peaks, robust_z
 from .project import Project, save_npz, update_project
 
+
+# ============================================================================
+# Standalone Audio RMS Analysis (for early processing during download)
+# ============================================================================
+
+def compute_audio_rms_from_file(
+    audio_path: Path,
+    *,
+    sample_rate: int = 16000,
+    hop_s: float = 0.5,
+    smooth_s: float = 2.0,
+    on_progress: Optional[Callable[[float], None]] = None,
+) -> Dict[str, Any]:
+    """Compute audio RMS timeline from an audio file (no Project required).
+    
+    This is used during URL download to run audio analysis in parallel with
+    video download and transcription.
+    
+    Args:
+        audio_path: Path to audio file (WAV, MP3, M4A, etc.)
+        sample_rate: Sample rate for analysis
+        hop_s: Hop size in seconds
+        smooth_s: Smoothing window in seconds
+        on_progress: Optional progress callback
+        
+    Returns:
+        Dict with timeline_db, smoothed_db, scores, times, hop_seconds
+        Can be saved to a project later using save_audio_rms_to_project()
+    """
+    start_time = _time.time()
+    audio_path = Path(audio_path)
+    
+    if not audio_path.exists():
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+    
+    duration_s = ffprobe_duration_seconds(audio_path)
+    
+    if on_progress:
+        on_progress(0.1)
+    
+    # Compute RMS timeline (works on any audio/video file)
+    cfg = AudioFeatureConfig(sample_rate=sample_rate, hop_seconds=hop_s)
+    timeline_db = audio_rms_db_timeline(audio_path, cfg)
+    
+    if on_progress:
+        on_progress(0.7)
+    
+    x = np.array(timeline_db, dtype=np.float64)
+    times = np.arange(len(x)) * hop_s
+    
+    # Smooth the timeline
+    smooth_frames = max(1, int(round(smooth_s / hop_s)))
+    xs = moving_average(x, smooth_frames)
+    scores = robust_z(xs)
+    
+    if on_progress:
+        on_progress(0.9)
+    
+    elapsed_seconds = _time.time() - start_time
+    
+    result = {
+        "timeline_db": x.tolist(),
+        "smoothed_db": xs.tolist(),
+        "scores": scores.tolist(),
+        "times": times.tolist(),
+        "hop_seconds": hop_s,
+        "sample_rate": sample_rate,
+        "smooth_seconds": smooth_s,
+        "duration_seconds": duration_s,
+        "elapsed_seconds": elapsed_seconds,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    if on_progress:
+        on_progress(1.0)
+    
+    return result
+
+
+def save_audio_rms_to_project(
+    proj: Project,
+    audio_data: Dict[str, Any],
+) -> None:
+    """Save pre-computed audio RMS analysis to a project.
+    
+    Args:
+        proj: Project instance
+        audio_data: Audio analysis data from compute_audio_rms_from_file()
+    """
+    # Convert lists back to numpy arrays for npz saving
+    timeline_db = np.array(audio_data["timeline_db"], dtype=np.float64)
+    smoothed_db = np.array(audio_data["smoothed_db"], dtype=np.float64)
+    scores = np.array(audio_data["scores"], dtype=np.float64)
+    times = np.array(audio_data["times"], dtype=np.float64)
+    hop_seconds = np.array([audio_data["hop_seconds"]], dtype=np.float64)
+    
+    save_npz(
+        proj.audio_features_path,
+        timeline_db=timeline_db,
+        smoothed_db=smoothed_db,
+        scores=scores,
+        times=times,
+        hop_seconds=hop_seconds,
+    )
+    
+    def _upd(d: Dict[str, Any]) -> None:
+        d.setdefault("analysis", {})
+        d["analysis"]["audio"] = {
+            "video": str(proj.video_path),
+            "duration_seconds": audio_data["duration_seconds"],
+            "method": "audio_rms_db_peaks",
+            "config": {
+                "sample_rate": audio_data["sample_rate"],
+                "hop_seconds": audio_data["hop_seconds"],
+                "smooth_seconds": audio_data["smooth_seconds"],
+            },
+            "features_npz": str(proj.audio_features_path.relative_to(proj.project_dir)),
+            "elapsed_seconds": audio_data["elapsed_seconds"],
+            "generated_at": audio_data["generated_at"],
+        }
+    
+    update_project(proj, _upd)
+
+
+# ============================================================================
+# Project-based Audio Analysis
+# ============================================================================
 
 def compute_audio_analysis(
     proj: Project,

@@ -709,6 +709,7 @@ async function startUrlDownload(url) {
     create_preview: $('#dlCreatePreview')?.checked ?? true,
     speed_mode: $('#dlSpeedMode')?.value ?? 'auto',
     quality_cap: $('#dlQualityCap')?.value ?? 'source',
+    whisper_verbose: $('#dlWhisperVerbose')?.checked ?? true,
   };
 
   try {
@@ -1119,6 +1120,130 @@ function updateParallelTasks(tasksEl, job) {
     transPctEl.textContent = '';
     transProgress.style.display = 'none';
     transDetail.style.display = 'none';
+  }
+  
+  // Get audio analysis status from job result
+  const rmsStatus = job.result?.audio_rms_status;
+  const rmsPct = job.result?.audio_rms_progress || 0;
+  const eventsStatus = job.result?.audio_events_status;
+  const eventsPct = job.result?.audio_events_progress || 0;
+  
+  // Get or create Audio RMS row
+  let rmsRow = tasksEl.querySelector('[data-task="audio_rms"]');
+  if (!rmsRow) {
+    rmsRow = document.createElement('div');
+    rmsRow.className = 'task-row';
+    rmsRow.dataset.task = 'audio_rms';
+    rmsRow.style.cssText = 'padding:6px 8px;border-radius:6px;margin-bottom:6px';
+    rmsRow.innerHTML = `
+      <div class="small" style="display:flex;align-items:center;gap:6px">
+        <span data-role="icon">📊</span>
+        <span style="flex:1" data-role="label">Audio RMS</span>
+        <span data-role="pct"></span>
+      </div>
+      <div class="progress" style="margin-top:4px;height:3px"><div data-role="bar" style="width:0%;transition:width 0.2s"></div></div>
+    `;
+    tasksEl.appendChild(rmsRow);
+  }
+  
+  // Get or create Audio Events row
+  let eventsRow = tasksEl.querySelector('[data-task="audio_events"]');
+  if (!eventsRow) {
+    eventsRow = document.createElement('div');
+    eventsRow.className = 'task-row';
+    eventsRow.dataset.task = 'audio_events';
+    eventsRow.style.cssText = 'padding:6px 8px;border-radius:6px;margin-bottom:6px';
+    eventsRow.innerHTML = `
+      <div class="small" style="display:flex;align-items:center;gap:6px">
+        <span data-role="icon">🎭</span>
+        <span style="flex:1" data-role="label">Audio Events</span>
+        <span data-role="pct"></span>
+      </div>
+      <div class="progress" style="margin-top:4px;height:3px"><div data-role="bar" style="width:0%;transition:width 0.2s"></div></div>
+    `;
+    tasksEl.appendChild(eventsRow);
+  }
+  
+  // Update Audio RMS row
+  const rmsIcon = rmsRow.querySelector('[data-role="icon"]');
+  const rmsLabel = rmsRow.querySelector('[data-role="label"]');
+  const rmsPctEl = rmsRow.querySelector('[data-role="pct"]');
+  const rmsBar = rmsRow.querySelector('[data-role="bar"]');
+  const rmsProgress = rmsRow.querySelector('.progress');
+  
+  if (rmsStatus === 'analyzing') {
+    rmsRow.style.background = 'rgba(59,130,246,0.1)';
+    rmsRow.querySelector('.small').style.color = '#3b82f6';
+    rmsIcon.textContent = '📊';
+    rmsLabel.textContent = 'Audio RMS';
+    const rmsPctDisplay = Math.round(rmsPct * 100);
+    rmsPctEl.textContent = `${rmsPctDisplay}%`;
+    rmsBar.style.width = `${rmsPctDisplay}%`;
+    rmsBar.style.background = '#3b82f6';
+    rmsProgress.style.display = '';
+  } else if (rmsStatus === 'complete') {
+    rmsRow.style.background = 'rgba(34,197,94,0.1)';
+    rmsRow.querySelector('.small').style.color = '#22c55e';
+    rmsIcon.textContent = '✓';
+    rmsLabel.textContent = 'Audio RMS ready';
+    rmsPctEl.textContent = '';
+    rmsProgress.style.display = 'none';
+  } else if (rmsStatus === 'failed') {
+    rmsRow.style.background = 'rgba(239,68,68,0.1)';
+    rmsRow.querySelector('.small').style.color = '#ef4444';
+    rmsIcon.textContent = '⚠️';
+    rmsLabel.textContent = 'Audio RMS failed';
+    rmsPctEl.textContent = '';
+    rmsProgress.style.display = 'none';
+  } else {
+    // Pending or unknown state - hide until analysis starts
+    rmsRow.style.background = 'rgba(100,100,100,0.1)';
+    rmsRow.querySelector('.small').style.color = '#888';
+    rmsIcon.textContent = '📊';
+    rmsLabel.textContent = 'Audio RMS waiting...';
+    rmsPctEl.textContent = '';
+    rmsProgress.style.display = 'none';
+  }
+  
+  // Update Audio Events row
+  const eventsIcon = eventsRow.querySelector('[data-role="icon"]');
+  const eventsLabel = eventsRow.querySelector('[data-role="label"]');
+  const eventsPctEl = eventsRow.querySelector('[data-role="pct"]');
+  const eventsBar = eventsRow.querySelector('[data-role="bar"]');
+  const eventsProgress = eventsRow.querySelector('.progress');
+  
+  if (eventsStatus === 'analyzing') {
+    eventsRow.style.background = 'rgba(168,85,247,0.1)';
+    eventsRow.querySelector('.small').style.color = '#a855f7';
+    eventsIcon.textContent = '🎭';
+    eventsLabel.textContent = 'Audio Events';
+    const eventsPctDisplay = Math.round(eventsPct * 100);
+    eventsPctEl.textContent = `${eventsPctDisplay}%`;
+    eventsBar.style.width = `${eventsPctDisplay}%`;
+    eventsBar.style.background = '#a855f7';
+    eventsProgress.style.display = '';
+  } else if (eventsStatus === 'complete') {
+    eventsRow.style.background = 'rgba(34,197,94,0.1)';
+    eventsRow.querySelector('.small').style.color = '#22c55e';
+    eventsIcon.textContent = '✓';
+    eventsLabel.textContent = 'Audio Events ready';
+    eventsPctEl.textContent = '';
+    eventsProgress.style.display = 'none';
+  } else if (eventsStatus === 'failed') {
+    eventsRow.style.background = 'rgba(239,68,68,0.1)';
+    eventsRow.querySelector('.small').style.color = '#ef4444';
+    eventsIcon.textContent = '⚠️';
+    eventsLabel.textContent = 'Audio Events failed';
+    eventsPctEl.textContent = '';
+    eventsProgress.style.display = 'none';
+  } else {
+    // Pending or unknown state - hide until analysis starts
+    eventsRow.style.background = 'rgba(100,100,100,0.1)';
+    eventsRow.querySelector('.small').style.color = '#888';
+    eventsIcon.textContent = '🎭';
+    eventsLabel.textContent = 'Audio Events waiting...';
+    eventsPctEl.textContent = '';
+    eventsProgress.style.display = 'none';
   }
 }
 

@@ -685,7 +685,7 @@ def compute_highlights_analysis(
     hop_s = float(audio_cfg.get("hop_seconds", 0.5))
     if not proj.audio_features_path.exists():
         if on_progress:
-            on_progress(0.05)
+            on_progress(0.02)  # Starting audio analysis
         compute_audio_analysis(
             proj,
             sample_rate=int(audio_cfg.get("sample_rate", 16000)),
@@ -701,7 +701,7 @@ def compute_highlights_analysis(
 
     if not proj.motion_features_path.exists():
         if on_progress:
-            on_progress(0.25)
+            on_progress(0.10)  # Starting motion analysis
         compute_motion_analysis(
             proj,
             sample_fps=float(motion_cfg.get("sample_fps", 3.0)),
@@ -713,7 +713,7 @@ def compute_highlights_analysis(
     scenes_enabled = bool(scenes_cfg.get("enabled", True))
     if scenes_enabled and not proj.scenes_path.exists():
         if on_progress:
-            on_progress(0.45)
+            on_progress(0.20)  # Starting scene detection
         compute_scene_analysis(
             proj,
             threshold_z=float(scenes_cfg.get("threshold_z", 3.5)),
@@ -725,7 +725,7 @@ def compute_highlights_analysis(
     # Chat analysis: prefer SQLite store, fall back to raw JSON
     if include_chat and not proj.chat_features_path.exists():
         if on_progress:
-            on_progress(0.6)
+            on_progress(0.25)  # Starting chat analysis
         chat_db_path = proj.analysis_dir / "chat.sqlite"
         if chat_db_path.exists():
             # Use new SQLite-based chat features
@@ -750,7 +750,7 @@ def compute_highlights_analysis(
             )
 
     if on_progress:
-        on_progress(0.20)  # Done loading dependencies
+        on_progress(0.35)  # Loading audio features
 
     audio_data = load_npz(proj.audio_features_path)
     audio_scores = audio_data.get("scores")
@@ -759,7 +759,7 @@ def compute_highlights_analysis(
     audio_scores = audio_scores.astype(np.float64)
 
     if on_progress:
-        on_progress(0.25)
+        on_progress(0.38)  # Loading motion features
 
     motion_data = load_npz(proj.motion_features_path)
     motion_scores = motion_data.get("scores")
@@ -804,14 +804,13 @@ def compute_highlights_analysis(
             try:
                 from .analysis_audio_events import compute_audio_events_analysis, AudioEventsConfig
                 if on_progress:
-                    on_progress(0.65)
+                    on_progress(0.40)  # Starting audio events ML analysis
                 
-                # Create a sub-progress callback to scale audio events progress (0-0.85) into (0.65-0.85)
+                # Create a sub-progress callback to scale audio events progress into (0.40-0.55)
                 def audio_events_progress(p: float) -> None:
                     if on_progress:
-                        # Scale: 0.0 -> 0.65, 0.85 -> 0.82
-                        scaled = 0.65 + p * 0.20
-                        on_progress(min(0.85, scaled))
+                        scaled = 0.40 + p * 0.15
+                        on_progress(min(0.55, scaled))
                 
                 compute_audio_events_analysis(
                     proj,
@@ -1025,7 +1024,7 @@ def compute_highlights_analysis(
         scores_for_peaks[:skip_start_frames] = -np.inf
 
     if on_progress:
-        on_progress(0.50)  # Done with signal fusion
+        on_progress(0.60)  # Done with signal fusion
 
     min_gap_frames = max(1, int(round(float(highlights_cfg.get("min_gap_seconds", 15.0)) / hop_s)))
     min_peak_score = float(highlights_cfg.get("min_peak_score", 0.0))
@@ -1037,7 +1036,7 @@ def compute_highlights_analysis(
     )
 
     if on_progress:
-        on_progress(0.55)  # Done picking peaks
+        on_progress(0.65)  # Done picking peaks
 
     scene_cuts = []
     snap_window_s = float(scenes_cfg.get("snap_window_seconds", 0.0))
@@ -1143,7 +1142,7 @@ def compute_highlights_analysis(
             candidates.append(cand)
 
     if on_progress:
-        on_progress(0.70)  # Done shaping candidates
+        on_progress(0.75)  # Done shaping candidates
 
     # LLM Semantic Scoring (optional enhancement)
     llm_semantic_used = False
@@ -1151,7 +1150,7 @@ def compute_highlights_analysis(
     
     if llm_complete is not None and candidates:
         if on_progress:
-            on_progress(0.75)  # Starting LLM scoring
+            on_progress(0.78)  # Starting LLM scoring
         
         try:
             _highlight_logger.info(f"[highlights] Starting LLM semantic scoring for {len(candidates)} candidates...")
@@ -1163,7 +1162,7 @@ def compute_highlights_analysis(
             )
             
             if on_progress:
-                on_progress(0.90)  # LLM scoring done
+                on_progress(0.95)  # LLM scoring done
             
             if llm_semantic_scores:
                 llm_semantic_used = True
