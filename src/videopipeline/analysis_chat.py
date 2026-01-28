@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import time as _time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional
 
@@ -166,6 +167,7 @@ def compute_chat_analysis(
     smooth_s: float,
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
+    start_time = _time.time()
     chat_path = Path(chat_path)
     if not chat_path.exists():
         raise FileNotFoundError(f"Chat JSON not found: {chat_path}")
@@ -207,6 +209,7 @@ def compute_chat_analysis(
         hop_seconds=np.array([hop_s], dtype=np.float64),
     )
 
+    elapsed_seconds = _time.time() - start_time
     payload = {
         "method": "chat_message_rate",
         "config": {
@@ -216,7 +219,8 @@ def compute_chat_analysis(
             "messages_in_range": valid_count,
             "timebase": timebase,
         },
-        "generated_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_seconds": round(elapsed_seconds, 2),
     }
 
     # Use the actual chat_path passed, not proj.chat_raw_path

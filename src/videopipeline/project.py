@@ -173,7 +173,7 @@ class Project:
     def find_audio_raw(self) -> Optional[Path]:
         """Find downloaded audio file in the inputs directory.
         
-        Searches for audio files with common extensions (m4a, mp3, opus, wav, webm, ogg).
+        Searches for audio files with common extensions (m4a, mp3, opus, wav, webm, ogg, mp4).
         
         Returns:
             Path to audio file if found, None otherwise
@@ -181,7 +181,8 @@ class Project:
         if not self.inputs_dir.exists():
             return None
         
-        audio_extensions = {".m4a", ".mp3", ".opus", ".wav", ".webm", ".ogg", ".aac", ".flac"}
+        # Include mp4 because yt-dlp sometimes downloads audio as .mp4 container
+        audio_extensions = {".m4a", ".mp3", ".opus", ".wav", ".webm", ".ogg", ".aac", ".flac", ".mp4"}
         for f in self.inputs_dir.iterdir():
             if f.is_file() and f.name.startswith("audio") and f.suffix.lower() in audio_extensions:
                 return f
@@ -277,6 +278,7 @@ def create_project_early(
         Project with placeholder video path
     """
     import hashlib
+    import shutil
     
     projects_root = projects_root or default_projects_root()
     
@@ -284,6 +286,17 @@ def create_project_early(
     pid = hashlib.sha256(content_id.encode()).hexdigest()
     pdir = projects_root / pid
     pdir.mkdir(parents=True, exist_ok=True)
+    
+    # Check if this is a re-download (project exists but video doesn't)
+    # If so, clear stale analysis outputs so tasks re-run
+    video_dir = pdir / "video"
+    video_file = video_dir / "video.mp4"
+    analysis_dir = pdir / "analysis"
+    if analysis_dir.exists() and not video_file.exists():
+        # Stale analysis from previous incomplete download - clear it
+        import logging
+        logging.getLogger(__name__).info(f"Clearing stale analysis for re-download: {pdir.name[:12]}...")
+        shutil.rmtree(analysis_dir, ignore_errors=True)
     
     # Placeholder video path (will be updated when video downloads)
     placeholder_video = pdir / "video_pending"
@@ -321,26 +334,53 @@ def create_project_early(
 def set_project_video(proj: Project, video_path: Path) -> None:
     """Update a project with the final video path after download completes.
     
+    This copies (or symlinks on Unix) the video into the project's video/ directory
+    for self-contained storage.
+    
     Args:
         proj: Project to update
         video_path: Path to downloaded video file
     """
+    import shutil
+    import os
+    
     video_path = Path(video_path).expanduser().resolve()
     
-    # Update the project's video_path
-    proj.video_path = video_path
+    # Create video directory in project
+    video_dir = proj.project_dir / "video"
+    video_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Destination path - always use "video.mp4" for consistency
+    dest_path = video_dir / "video.mp4"
+    
+    # Copy the video to the project directory if not already there
+    if not dest_path.exists() or not dest_path.samefile(video_path):
+        # On Windows, just copy; on Unix we could symlink
+        if os.name == "nt":
+            shutil.copy2(video_path, dest_path)
+        else:
+            # Try symlink first, fall back to copy
+            try:
+                if dest_path.exists():
+                    dest_path.unlink()
+                dest_path.symlink_to(video_path)
+            except OSError:
+                shutil.copy2(video_path, dest_path)
+    
+    # Update the project's video_path to point to the project-local copy
+    proj.video_path = dest_path
     
     # Get video info
     try:
-        duration_s = ffprobe_duration_seconds(video_path)
+        duration_s = ffprobe_duration_seconds(dest_path)
     except Exception:
         duration_s = None
     
-    st = video_path.stat()
+    st = dest_path.stat()
     
     def _upd(d: Dict[str, Any]) -> None:
         d["video"] = {
-            "path": str(video_path),
+            "path": str(dest_path),
             "status": "ready",
             "size_bytes": st.st_size,
             "mtime_ns": getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)),

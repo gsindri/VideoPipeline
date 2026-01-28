@@ -387,16 +387,19 @@ async function loadRecentVideos() {
     container.innerHTML = '';
     for (const v of videos) {
       const el = document.createElement('div');
-      el.className = 'item' + (v.favorite ? ' favorite' : '');
+      el.className = 'item' + (v.favorite ? ' favorite' : '') + (v.orphaned ? ' orphaned' : '');
       const dur = fmtTime(v.duration_seconds || 0);
       const sizeMB = ((v.size_bytes || 0) / 1024 / 1024).toFixed(1);
       
       // Build status badges
       let badges = '';
-      if (v.favorite) {
+      if (v.orphaned) {
+        badges += `<span class="badge" style="background:#dc2626;color:#fff">⚠ Orphaned</span> `;
+        if (v.analysis_count > 0) badges += `<span class="badge">${v.analysis_count} files</span> `;
+      } else if (v.favorite) {
         badges += `<span class="badge badge-favorite">★ Favorite</span> `;
       }
-      if (v.has_project) {
+      if (v.has_project && !v.orphaned) {
         badges += `<span class="badge" style="background:#22c55e;color:#000">Project</span> `;
         if (v.selections_count > 0) badges += `<span class="badge">${v.selections_count} sel</span> `;
         if (v.exports_count > 0) badges += `<span class="badge">${v.exports_count} exp</span> `;
@@ -405,20 +408,27 @@ async function loadRecentVideos() {
         badges += `<span class="badge" style="background:#6366f1">${v.extractor}</span> `;
       }
       
+      // Handle orphaned projects differently
+      const pathDisplay = v.path || `outputs/projects/${v.project_id}/`;
+      const checkboxPath = v.path || v.project_id;
+      
       el.innerHTML = `
         <div class="item-header">
-          <input type="checkbox" class="video-checkbox" data-path="${v.path.replace(/"/g, '&quot;')}" data-has-project="${v.has_project}" data-project-id="${v.project_id || ''}" style="margin-right:8px;cursor:pointer" />
+          <input type="checkbox" class="video-checkbox" data-path="${(checkboxPath || '').replace(/"/g, '&quot;')}" data-has-project="${v.has_project}" data-project-id="${v.project_id || ''}" data-orphaned="${v.orphaned || false}" style="margin-right:8px;cursor:pointer" />
           <div class="title" style="flex:1">${v.title || v.filename}</div>
-          <button class="btn-favorite ${v.favorite ? 'active' : ''}" title="${v.favorite ? 'Remove from favorites' : 'Add to favorites'}" data-path="${v.path.replace(/"/g, '&quot;')}">
+          ${!v.orphaned ? `<button class="btn-favorite ${v.favorite ? 'active' : ''}" title="${v.favorite ? 'Remove from favorites' : 'Add to favorites'}" data-path="${(v.path || '').replace(/"/g, '&quot;')}">
             ${v.favorite ? '★' : '☆'}
-          </button>
+          </button>` : ''}
         </div>
-        <div class="meta" style="margin-left:24px">${dur} • ${sizeMB} MB ${badges}</div>
-        <div class="meta small" style="opacity:0.7;word-break:break-all;margin-left:24px">${v.path}</div>
+        <div class="meta" style="margin-left:24px">${v.orphaned ? 'No video file' : `${dur} • ${sizeMB} MB`} ${badges}</div>
+        <div class="meta small" style="opacity:0.7;word-break:break-all;margin-left:24px">${pathDisplay}</div>
+        ${v.url ? `<div class="meta small" style="opacity:0.5;word-break:break-all;margin-left:24px">${v.url}</div>` : ''}
         <div class="actions" style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;margin-left:24px">
-          <button class="primary btn-open">Open</button>
-          ${v.has_project ? `<button class="btn-delete-project" style="background:#ef4444" data-project-id="${v.project_id}">Delete Project</button>` : ''}
-          <button class="btn-delete-video" style="background:#dc2626" data-path="${v.path.replace(/"/g, '&quot;')}" data-has-project="${v.has_project}">Delete Video</button>
+          ${!v.orphaned ? `<button class="primary btn-open">Open</button>` : ''}
+          ${v.has_project && !v.orphaned ? `<button class="btn-delete-all" style="background:#dc2626" data-path="${(v.path || '').replace(/"/g, '&quot;')}" data-project-id="${v.project_id}">Delete All</button>` : ''}
+          ${v.has_project && !v.orphaned ? `<button class="btn-delete-project" style="background:#ef4444" data-project-id="${v.project_id}">Delete Project Only</button>` : ''}
+          ${v.orphaned ? `<button class="btn-delete-project" style="background:#ef4444" data-project-id="${v.project_id}">Delete Orphaned Project</button>` : ''}
+          ${!v.orphaned && !v.has_project ? `<button class="btn-delete-video" style="background:#dc2626" data-path="${(v.path || '').replace(/"/g, '&quot;')}" data-has-project="false">Delete Video</button>` : ''}
         </div>
       `;
       
@@ -427,15 +437,17 @@ async function loadRecentVideos() {
       checkbox.onclick = (e) => {
         e.stopPropagation();
         if (checkbox.checked) {
-          selectedVideos.add(v.path);
+          selectedVideos.add(checkboxPath);
         } else {
-          selectedVideos.delete(v.path);
+          selectedVideos.delete(checkboxPath);
         }
         updateVideoSelectionToolbar();
       };
       
       const btnOpen = el.querySelector('.btn-open');
-      btnOpen.onclick = () => openProjectByPath(v.path);
+      if (btnOpen) {
+        btnOpen.onclick = () => openProjectByPath(v.path);
+      }
       
       // Favorite button
       const btnFavorite = el.querySelector('.btn-favorite');
@@ -447,6 +459,26 @@ async function loadRecentVideos() {
             loadRecentVideos(); // Refresh list
           } catch (err) {
             alert(`Failed to toggle favorite: ${err.message}`);
+          }
+        };
+      }
+      
+      // Delete All button (project + video + downloads + all analysis data)
+      const btnDeleteAll = el.querySelector('.btn-delete-all');
+      if (btnDeleteAll) {
+        btnDeleteAll.onclick = async (e) => {
+          e.stopPropagation();
+          const msg = `Delete EVERYTHING for "${v.title || v.filename}"?\n\nThis will permanently delete:\n• Project folder (all analysis data, selections, exports)\n• Video file in project\n• Original download and metadata files\n\nThis cannot be undone!`;
+          if (confirm(msg)) {
+            try {
+              await apiJson('DELETE', '/api/home/video_complete', { 
+                video_path: v.path, 
+                project_id: v.project_id
+              });
+              loadRecentVideos(); // Refresh list
+            } catch (err) {
+              alert(`Failed to delete: ${err.message}`);
+            }
           }
         };
       }
@@ -480,7 +512,12 @@ async function loadRecentVideos() {
           }
           if (confirm(msg)) {
             try {
-              await apiJson('DELETE', '/api/home/video', { video_path: v.path, delete_project: true });
+              // Pass project_id if available for reliable deletion
+              await apiJson('DELETE', '/api/home/video', { 
+                video_path: v.path, 
+                delete_project: true,
+                project_id: v.project_id || null
+              });
               loadRecentVideos(); // Refresh list
             } catch (err) {
               alert(`Failed to delete video: ${err.message}`);
@@ -783,6 +820,12 @@ function _doRenderHomeJobs() {
   if (homeJobs.size === 0) {
     container.innerHTML = '<div class="small">No active jobs.</div>';
     return;
+  }
+
+  // Remove "No active jobs" message if present (it doesn't have data-job-id)
+  const noJobsMsg = container.querySelector('.small:not([data-job-id])');
+  if (noJobsMsg && !noJobsMsg.closest('.item')) {
+    noJobsMsg.remove();
   }
 
   // Build job cards - update in place if possible to prevent flicker
@@ -1503,7 +1546,7 @@ function renderPipelineStatus() {
       check: () => {
         const cv = analysis.clip_variants;
         if (hasRun(cv)) {
-          const count = cv.variants_count || 0;
+          const count = cv.candidate_count || 0;
           const timeStr = cv.elapsed_seconds ? ` • ${formatPipelineTime(cv.elapsed_seconds)}` : '';
           return { state: 'done', detail: `${count} variants generated${timeStr}` };
         }
@@ -1584,10 +1627,16 @@ function renderPipelineStatus() {
         pendingCount++;
     }
     
+    // Only make clickable if task has run (done or partial)
+    const isClickable = result.state === 'done' || result.state === 'partial';
+    const cursorStyle = isClickable ? 'cursor:pointer;' : '';
+    const hoverTitle = isClickable ? 'title="Click for details"' : '';
+    
     html += `
-      <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:${bgColor};border-radius:6px;border-left:3px solid ${stateColor}">
+      <div class="pipeline-stage" data-task-id="${stage.id}" data-clickable="${isClickable}" style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:${bgColor};border-radius:6px;border-left:3px solid ${stateColor};${cursorStyle}" ${hoverTitle}>
         <span style="font-size:14px">${stage.icon}</span>
         <span style="flex:1;color:${stateColor};font-weight:500">${stage.name}</span>
+        ${isClickable ? '<span style="color:#666;font-size:10px;margin-right:4px">ℹ️</span>' : ''}
         <span style="color:${stateColor};font-size:11px">${stateIcon}</span>
       </div>
       <div style="margin-left:32px;margin-top:-4px;margin-bottom:4px;color:#888;font-size:10px">${result.detail}</div>
@@ -1607,6 +1656,175 @@ function renderPipelineStatus() {
   ` + html;
   
   container.innerHTML = html;
+  
+  // Wire up click handlers for completed stages
+  container.querySelectorAll('.pipeline-stage[data-clickable="true"]').forEach(el => {
+    el.addEventListener('click', () => {
+      const taskId = el.dataset.taskId;
+      showTaskDetailsModal(taskId);
+    });
+    // Add hover effect
+    el.addEventListener('mouseenter', () => el.style.opacity = '0.8');
+    el.addEventListener('mouseleave', () => el.style.opacity = '1');
+  });
+}
+
+// Modal for showing task details ("show work" feature)
+async function showTaskDetailsModal(taskId) {
+  // Remove existing modal if any
+  const existing = document.querySelector('.task-details-modal-overlay');
+  if (existing) existing.remove();
+  
+  // Fetch task details from API
+  try {
+    const data = await apiGet(`/api/task_details/${taskId}`);
+    if (!data.ok) {
+      alert(`No details available: ${data.reason}`);
+      return;
+    }
+    
+    const overlay = document.createElement('div');
+    overlay.className = 'task-details-modal-overlay';
+    overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);z-index:1000;display:flex;align-items:center;justify-content:center;';
+    
+    const modal = document.createElement('div');
+    modal.style.cssText = 'background:var(--bg);padding:24px;border-radius:8px;max-width:600px;max-height:80vh;overflow-y:auto;min-width:400px;';
+    
+    // Build content based on task type
+    let contentHtml = `<h3 style="margin:0 0 16px 0;">📊 ${formatTaskName(taskId)} - Details</h3>`;
+    
+    // Summary section
+    if (data.summary) {
+      contentHtml += '<div style="background:rgba(255,255,255,0.05);padding:12px;border-radius:6px;margin-bottom:12px;">';
+      contentHtml += '<div style="font-weight:600;margin-bottom:8px;color:#22c55e;">Summary</div>';
+      for (const [key, value] of Object.entries(data.summary)) {
+        if (value !== null && value !== undefined) {
+          const displayKey = key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+          let displayValue = value;
+          if (typeof value === 'object') {
+            displayValue = JSON.stringify(value, null, 2);
+          } else if (typeof value === 'boolean') {
+            displayValue = value ? '✓ Yes' : '✗ No';
+          } else if (key.includes('seconds') && typeof value === 'number') {
+            displayValue = value < 60 ? `${value.toFixed(2)}s` : `${Math.floor(value/60)}m ${(value%60).toFixed(0)}s`;
+          } else if ((key === 'created_at' || key === 'enriched_at') && typeof value === 'string') {
+            // Format ISO timestamp to readable date/time
+            try {
+              const d = new Date(value);
+              displayValue = d.toLocaleString();
+            } catch (e) {
+              displayValue = value;
+            }
+          }
+          contentHtml += `<div style="display:flex;justify-content:space-between;margin:4px 0;"><span style="color:#888;">${displayKey}:</span><span style="color:#fff;">${displayValue}</span></div>`;
+        }
+      }
+      contentHtml += '</div>';
+    }
+    
+    // Source breakdown for boundaries
+    if (data.source_breakdown) {
+      contentHtml += '<div style="background:rgba(255,255,255,0.05);padding:12px;border-radius:6px;margin-bottom:12px;">';
+      contentHtml += '<div style="font-weight:600;margin-bottom:8px;color:#3b82f6;">Boundary Sources Used</div>';
+      for (const [source, count] of Object.entries(data.source_breakdown).sort((a,b) => b[1] - a[1])) {
+        const barWidth = Math.min(100, (count / Math.max(...Object.values(data.source_breakdown))) * 100);
+        contentHtml += `
+          <div style="margin:6px 0;">
+            <div style="display:flex;justify-content:space-between;margin-bottom:2px;">
+              <span style="color:#fff;">${source}</span>
+              <span style="color:#888;">${count}</span>
+            </div>
+            <div style="background:rgba(255,255,255,0.1);border-radius:3px;height:6px;">
+              <div style="background:#3b82f6;width:${barWidth}%;height:100%;border-radius:3px;"></div>
+            </div>
+          </div>
+        `;
+      }
+      contentHtml += '</div>';
+    }
+    
+    // Variant type counts
+    if (data.variant_type_counts) {
+      contentHtml += '<div style="background:rgba(255,255,255,0.05);padding:12px;border-radius:6px;margin-bottom:12px;">';
+      contentHtml += '<div style="font-weight:600;margin-bottom:8px;color:#eab308;">Variants by Type</div>';
+      for (const [type, count] of Object.entries(data.variant_type_counts)) {
+        contentHtml += `<span style="background:rgba(234,179,8,0.2);color:#eab308;padding:4px 8px;border-radius:4px;margin-right:6px;">${type}: ${count}</span>`;
+      }
+      contentHtml += '</div>';
+    }
+    
+    // Chapters list
+    if (data.chapters && data.chapters.length > 0) {
+      contentHtml += '<div style="background:rgba(255,255,255,0.05);padding:12px;border-radius:6px;margin-bottom:12px;">';
+      contentHtml += '<div style="font-weight:600;margin-bottom:8px;color:#a855f7;">Chapters</div>';
+      for (const ch of data.chapters) {
+        contentHtml += `<div style="margin:4px 0;padding:6px;background:rgba(168,85,247,0.1);border-radius:4px;">
+          <span style="color:#a855f7;">${fmtTime(ch.start_s)} - ${fmtTime(ch.end_s)}</span>
+          <span style="color:#fff;margin-left:8px;">${ch.title}</span>
+        </div>`;
+      }
+      contentHtml += '</div>';
+    }
+    
+    // Sample segments/events/candidates
+    const sampleSections = [
+      { key: 'sample_segments', title: 'Sample Transcript Segments', color: '#22c55e' },
+      { key: 'top_peaks', title: 'Top Audio Peaks', color: '#f59e0b' },
+      { key: 'sample_events', title: 'Sample Audio Events', color: '#ec4899' },
+      { key: 'top_candidates', title: 'Top Highlight Candidates', color: '#eab308' },
+      { key: 'sample_enriched', title: 'Sample Enriched Candidates', color: '#6366f1' },
+      { key: 'sample_results', title: 'Sample AI Director Results', color: '#06b6d4' },
+    ];
+    
+    for (const section of sampleSections) {
+      if (data[section.key] && data[section.key].length > 0) {
+        contentHtml += `<div style="background:rgba(255,255,255,0.05);padding:12px;border-radius:6px;margin-bottom:12px;">`;
+        contentHtml += `<div style="font-weight:600;margin-bottom:8px;color:${section.color};">${section.title}</div>`;
+        for (const item of data[section.key]) {
+          contentHtml += '<div style="margin:4px 0;padding:6px;background:rgba(255,255,255,0.03);border-radius:4px;font-size:12px;">';
+          for (const [k, v] of Object.entries(item)) {
+            if (v !== null && v !== undefined && v !== '') {
+              const displayVal = typeof v === 'object' ? JSON.stringify(v) : v;
+              contentHtml += `<div><span style="color:#888;">${k}:</span> <span style="color:#fff;">${displayVal}</span></div>`;
+            }
+          }
+          contentHtml += '</div>';
+        }
+        contentHtml += '</div>';
+      }
+    }
+    
+    contentHtml += `<div style="margin-top:16px;text-align:right;"><button class="close-modal">Close</button></div>`;
+    
+    modal.innerHTML = contentHtml;
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+    
+    modal.querySelector('.close-modal').onclick = () => overlay.remove();
+    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+    
+  } catch (e) {
+    alert(`Failed to load task details: ${e.message}`);
+  }
+}
+
+function formatTaskName(taskId) {
+  const names = {
+    'transcript': 'Transcription',
+    'audio': 'Audio RMS',
+    'motion': 'Motion Analysis',
+    'audio_events': 'Audio Events',
+    'chat_features': 'Chat Features',
+    'highlights': 'Highlight Fusion',
+    'speech_features': 'Speech Features',
+    'reaction_audio': 'Reaction Audio',
+    'enrich': 'Enrich Candidates',
+    'chapters': 'Semantic Chapters',
+    'boundaries': 'Context Boundaries',
+    'clip_variants': 'Clip Variants',
+    'director': 'AI Director',
+  };
+  return names[taskId] || taskId;
 }
 
 function renderCandidates() {

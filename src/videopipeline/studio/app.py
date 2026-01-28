@@ -45,7 +45,7 @@ from ..ingest import (
     SiteType,
     probe_url,
 )
-from ..ingest.ytdlp_runner import download_url
+from ..ingest.ytdlp_runner import download_url, DownloadCancelled
 
 
 class StudioContext:
@@ -557,36 +557,131 @@ def create_app(
         Body:
             video_path: str - Path to the video file
             delete_project: bool - Also delete the associated project (default True)
+            project_id: str - Optional project ID for reliable deletion
         """
         import shutil
         from ..project import default_projects_root, project_dir_for_video
         
         video_path = body.get("video_path")
         delete_project = body.get("delete_project", True)
+        project_id = body.get("project_id")
         
-        if not video_path:
+        if not video_path and not project_id:
             raise HTTPException(status_code=400, detail="video_path_required")
         
-        video_path = Path(video_path)
-        if not video_path.exists():
-            raise HTTPException(status_code=404, detail="video_not_found")
-        
+        projects_root = default_projects_root()
         deleted_files = []
         project_deleted = False
         
+        # If project_id provided, try to delete via project_id first (most reliable)
+        # This handles videos inside project folders directly
+        if project_id and delete_project:
+            project_dir = projects_root / project_id
+            if project_dir.exists():
+                # Close project if it's currently open
+                if ctx.project and ctx.project.project_id == project_id:
+                    ctx.close_project()
+                try:
+                    # Find video path inside project for response
+                    video_dir = project_dir / "video"
+                    if video_dir.exists():
+                        for ext in [".mp4", ".mkv", ".webm", ".m4v", ".avi", ".mov", ".ts"]:
+                            for f in video_dir.glob(f"*{ext}"):
+                                deleted_files.append(str(f))
+                    
+                    shutil.rmtree(project_dir)
+                    return JSONResponse({
+                        "deleted": True,
+                        "video_path": video_path or (deleted_files[0] if deleted_files else None),
+                        "deleted_files": deleted_files,
+                        "project_deleted": True,
+                    })
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"Failed to delete project: {e}")
+        
+        # Resolve video path - handle both absolute and relative paths
+        if video_path:
+            video_path = Path(video_path)
+            if not video_path.is_absolute():
+                # Try resolving relative to CWD first
+                resolved = video_path.resolve()
+                if not resolved.exists():
+                    # Try relative to projects_root parent (outputs/)
+                    resolved = (projects_root.parent / video_path).resolve()
+                video_path = resolved
+            else:
+                video_path = video_path.resolve()
+            
+            if not video_path.exists():
+                raise HTTPException(status_code=404, detail="video_not_found")
+        else:
+            raise HTTPException(status_code=400, detail="video_path_required")
+        
         # Close project if this video is currently open
-        if ctx.project and Path(ctx.project.video_path).resolve() == video_path.resolve():
+        if ctx.project and Path(ctx.project.video_path).resolve() == video_path:
             ctx.close_project()
         
-        # Delete associated project if requested
-        if delete_project:
+        # Check if video is inside a project folder (self-contained project)
+        video_in_project = False
+        containing_project_dir = None
+        try:
+            # Check if video path is under projects_root/*/video/
+            resolved_projects_root = projects_root.resolve()
+            if resolved_projects_root in video_path.parents:
+                rel_parts = video_path.relative_to(resolved_projects_root).parts
+                if len(rel_parts) >= 2 and rel_parts[1] == "video":
+                    containing_project_dir = resolved_projects_root / rel_parts[0]
+                    video_in_project = True
+        except ValueError:
+            pass
+        
+        # If video is inside project folder and delete_project is True,
+        # just delete the whole project (which includes the video)
+        if video_in_project and containing_project_dir and delete_project:
             try:
-                project_dir = project_dir_for_video(video_path)
-                if project_dir.exists():
-                    shutil.rmtree(project_dir)
-                    project_deleted = True
-            except Exception:
-                pass  # Project may not exist, continue
+                shutil.rmtree(containing_project_dir)
+                project_deleted = True
+                deleted_files.append(str(video_path))
+                return JSONResponse({
+                    "deleted": True,
+                    "video_path": str(video_path),
+                    "deleted_files": deleted_files,
+                    "project_deleted": project_deleted,
+                })
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to delete project: {e}")
+        
+        # Delete associated project if requested (for videos NOT in project folders)
+        if delete_project:
+            # Try finding project by video path fingerprint
+            if not project_deleted:
+                try:
+                    project_dir = project_dir_for_video(video_path)
+                    if project_dir.exists():
+                        shutil.rmtree(project_dir)
+                        project_deleted = True
+                except Exception:
+                    pass
+            
+            # Fallback: scan projects for matching video_path
+            if not project_deleted:
+                try:
+                    for pdir in projects_root.iterdir():
+                        if not pdir.is_dir():
+                            continue
+                        pjson = pdir / "project.json"
+                        if pjson.exists():
+                            try:
+                                data = json.loads(pjson.read_text(encoding="utf-8"))
+                                pv = data.get("video", {}).get("path")
+                                if pv and Path(pv).resolve() == video_path.resolve():
+                                    shutil.rmtree(pdir)
+                                    project_deleted = True
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
         
         # Delete the video file
         try:
@@ -610,6 +705,174 @@ def create_app(
             "video_path": str(video_path),
             "deleted_files": deleted_files,
             "project_deleted": project_deleted,
+        })
+
+    @app.delete("/api/home/video_complete")
+    def api_home_delete_video_complete(body: Dict[str, Any] = Body(...)) -> JSONResponse:
+        """Delete everything related to a video: project folder, downloads, and metadata.
+        
+        This is the "nuke it all" option that removes:
+        - Project folder with all analysis data, selections, exports (if exists)
+        - Video in downloads folder (if exists)  
+        - Video in project folder (if exists)
+        - Associated metadata files (.info.json, .description, thumbnails)
+        
+        Body:
+            video_path: str - Path to any video file (in downloads or project)
+            project_id: str - Optional project ID for reliable deletion
+        """
+        import shutil
+        from ..project import default_projects_root
+        from ..ingest.ytdlp_runner import _default_downloads_dir
+        
+        video_path = body.get("video_path")
+        project_id = body.get("project_id")
+        
+        if not video_path and not project_id:
+            raise HTTPException(status_code=400, detail="video_path_or_project_id_required")
+        
+        projects_root = default_projects_root()
+        downloads_dir = _default_downloads_dir()
+        deleted_items = []
+        
+        # Close project if it's currently open
+        if project_id and ctx.project and ctx.project.project_id == project_id:
+            ctx.close_project()
+        elif video_path:
+            video_path_obj = Path(video_path)
+            if not video_path_obj.is_absolute():
+                video_path_obj = video_path_obj.resolve()
+            if ctx.project and Path(ctx.project.video_path).resolve() == video_path_obj:
+                ctx.close_project()
+        
+        # Track what we find
+        project_deleted = False
+        source_url = None
+        downloads_video_path = None
+        
+        # 1. Delete project folder if we have project_id
+        if project_id:
+            project_dir = projects_root / project_id
+            if project_dir.exists():
+                # Try to get source URL and original download path from project.json
+                project_json = project_dir / "project.json"
+                if project_json.exists():
+                    try:
+                        data = json.loads(project_json.read_text(encoding="utf-8"))
+                        source_url = data.get("source_url")
+                        # Check if there's a reference to the downloads folder video
+                        video_info = data.get("video", {})
+                        original_path = video_info.get("original_path")
+                        if original_path:
+                            downloads_video_path = Path(original_path)
+                    except Exception:
+                        pass
+                
+                try:
+                    shutil.rmtree(project_dir)
+                    deleted_items.append(f"Project folder (with all analysis data)")
+                    project_deleted = True
+                except Exception:
+                    pass  # Continue trying to delete other items
+        
+        # 2. Handle the video path
+        if video_path:
+            video_path_obj = Path(video_path)
+            if not video_path_obj.is_absolute():
+                # Try to resolve relative paths
+                for base in [Path.cwd(), projects_root.parent, downloads_dir.parent if downloads_dir.exists() else Path.cwd()]:
+                    candidate = (base / video_path).resolve()
+                    if candidate.exists():
+                        video_path_obj = candidate
+                        break
+                else:
+                    video_path_obj = video_path_obj.resolve()
+            
+            # Check if this is in the downloads folder
+            try:
+                resolved_downloads = downloads_dir.resolve() if downloads_dir.exists() else None
+                if resolved_downloads and (resolved_downloads in video_path_obj.parents or video_path_obj.parent == resolved_downloads):
+                    downloads_video_path = video_path_obj
+            except Exception:
+                pass
+            
+            # Check if this is in a project folder (and we haven't deleted it yet)
+            try:
+                resolved_projects = projects_root.resolve()
+                if resolved_projects in video_path_obj.parents:
+                    # Extract project_id from path
+                    rel_parts = video_path_obj.relative_to(resolved_projects).parts
+                    if rel_parts and not project_deleted:
+                        proj_id = rel_parts[0]
+                        proj_dir = projects_root / proj_id
+                        if proj_dir.exists():
+                            # Get source URL before deleting
+                            project_json = proj_dir / "project.json"
+                            if project_json.exists():
+                                try:
+                                    data = json.loads(project_json.read_text(encoding="utf-8"))
+                                    source_url = source_url or data.get("source_url")
+                                    original_path = data.get("video", {}).get("original_path")
+                                    if original_path:
+                                        downloads_video_path = downloads_video_path or Path(original_path)
+                                except Exception:
+                                    pass
+                            
+                            shutil.rmtree(proj_dir)
+                            deleted_items.append(f"Project folder (with all analysis data)")
+                            project_deleted = True
+            except Exception:
+                pass
+        
+        # 3. Delete the downloads folder copy and its metadata
+        if downloads_video_path and downloads_video_path.exists():
+            try:
+                downloads_video_path.unlink()
+                deleted_items.append(f"Downloaded video: {downloads_video_path.name}")
+            except Exception:
+                pass
+            
+            # Delete associated metadata files
+            for ext in [".info.json", ".description", ".jpg", ".webp", ".png", ".live_chat.json"]:
+                meta_file = downloads_video_path.with_suffix(ext)
+                if meta_file.exists():
+                    try:
+                        meta_file.unlink()
+                        deleted_items.append(f"Metadata: {meta_file.name}")
+                    except Exception:
+                        pass
+        
+        # 4. If we have a source URL, try to find and delete any other matching videos in downloads
+        if source_url and downloads_dir.exists():
+            try:
+                import re
+                video_id = None
+                twitch_match = re.search(r'twitch\.tv/videos/(\d+)', source_url)
+                youtube_match = re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]+)', source_url)
+                if twitch_match:
+                    video_id = twitch_match.group(1)
+                elif youtube_match:
+                    video_id = youtube_match.group(1)
+                
+                if video_id:
+                    for f in downloads_dir.iterdir():
+                        if video_id in f.name and f.is_file():
+                            try:
+                                f.unlink()
+                                deleted_items.append(f"Related file: {f.name}")
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+        
+        if not deleted_items:
+            raise HTTPException(status_code=404, detail="nothing_found_to_delete")
+        
+        return JSONResponse({
+            "deleted": True,
+            "deleted_items": deleted_items,
+            "project_deleted": project_deleted,
+            "source_url": source_url,
         })
 
     @app.post("/api/home/favorite")
@@ -663,6 +926,7 @@ def create_app(
         """Unified list of all videos (projects + downloads merged).
         
         Returns videos sorted by most recently modified, with project status.
+        Includes videos from both downloads folder AND project folders.
         """
         from ..ingest.ytdlp_runner import _default_downloads_dir
         from ..project import default_projects_root
@@ -721,6 +985,113 @@ def create_app(
                         })
                     except Exception:
                         continue
+        
+        # Also scan project folders for videos (self-contained projects)
+        projects_root = default_projects_root()
+        if projects_root.exists():
+            for proj_dir in projects_root.iterdir():
+                if not proj_dir.is_dir():
+                    continue
+                video_dir = proj_dir / "video"
+                if not video_dir.exists():
+                    continue
+                for ext in video_exts:
+                    for f in video_dir.glob(f"*{ext}"):
+                        resolved = str(f.resolve())
+                        if resolved in seen_paths:
+                            continue
+                        seen_paths.add(resolved)
+                        
+                        try:
+                            st = f.stat()
+                            # Load project.json for metadata
+                            project_json = proj_dir / "project.json"
+                            proj_data = {}
+                            if project_json.exists():
+                                try:
+                                    proj_data = json.loads(project_json.read_text(encoding="utf-8"))
+                                except Exception:
+                                    pass
+                            
+                            video_info = proj_data.get("video", {})
+                            
+                            videos.append({
+                                "path": str(f),
+                                "filename": f.name,
+                                "title": proj_data.get("title", video_info.get("title", f.stem)),
+                                "size_bytes": st.st_size,
+                                "mtime": st.st_mtime,
+                                "duration_seconds": video_info.get("duration_seconds", 0),
+                                "url": proj_data.get("source_url", ""),
+                                "extractor": proj_data.get("extractor", ""),
+                                # Project info - always has project since it's in project folder
+                                "has_project": True,
+                                "project_id": proj_dir.name,
+                                "selections_count": len(proj_data.get("selections", [])),
+                                "exports_count": len(proj_data.get("exports", [])),
+                                "favorite": proj_data.get("favorite", False),
+                            })
+                        except Exception:
+                            continue
+        
+        # Also list orphaned projects (projects without video files)
+        # These are incomplete/failed downloads that left analysis artifacts
+        seen_project_ids = {v.get("project_id") for v in videos if v.get("project_id")}
+        if projects_root.exists():
+            for proj_dir in projects_root.iterdir():
+                if not proj_dir.is_dir():
+                    continue
+                if proj_dir.name in seen_project_ids:
+                    continue  # Already listed via video
+                
+                # Check if this project has any content worth showing
+                project_json = proj_dir / "project.json"
+                analysis_dir = proj_dir / "analysis"
+                if not project_json.exists() and not analysis_dir.exists():
+                    continue  # Empty project folder, skip
+                
+                try:
+                    proj_data = {}
+                    if project_json.exists():
+                        try:
+                            proj_data = json.loads(project_json.read_text(encoding="utf-8"))
+                        except Exception:
+                            pass
+                    
+                    video_info = proj_data.get("video", {})
+                    
+                    # Get mtime from project.json or analysis folder
+                    mtime = 0
+                    if project_json.exists():
+                        mtime = project_json.stat().st_mtime
+                    elif analysis_dir.exists():
+                        mtime = analysis_dir.stat().st_mtime
+                    
+                    # Count analysis files
+                    analysis_count = 0
+                    if analysis_dir.exists():
+                        analysis_count = len(list(analysis_dir.glob("*")))
+                    
+                    videos.append({
+                        "path": None,  # No video file
+                        "filename": f"[Orphaned Project]",
+                        "title": proj_data.get("title", video_info.get("title", f"Project {proj_dir.name[:12]}...")),
+                        "size_bytes": 0,
+                        "mtime": mtime,
+                        "duration_seconds": video_info.get("duration_seconds", 0),
+                        "url": proj_data.get("source_url", ""),
+                        "extractor": proj_data.get("extractor", ""),
+                        # Project info
+                        "has_project": True,
+                        "project_id": proj_dir.name,
+                        "selections_count": len(proj_data.get("selections", [])),
+                        "exports_count": len(proj_data.get("exports", [])),
+                        "favorite": proj_data.get("favorite", False),
+                        "orphaned": True,  # Flag for UI
+                        "analysis_count": analysis_count,
+                    })
+                except Exception:
+                    continue
         
         # Sort by mtime descending
         videos.sort(key=lambda v: v["mtime"], reverse=True)
@@ -942,7 +1313,10 @@ def create_app(
 
             def download_video():
                 nonlocal video_result
-                video_result = download_url(url, request=request, on_progress=on_video_progress)
+                # Pass check_cancel to allow yt-dlp to abort cleanly
+                def check_cancel_video() -> bool:
+                    return job.cancel_requested
+                video_result = download_url(url, request=request, on_progress=on_video_progress, check_cancel=check_cancel_video)
                 return video_result
 
             def download_chat():
@@ -1282,20 +1656,36 @@ def create_app(
                     early_dag_status["status"] = "analyzing"
                     
                     def on_dag_progress(frac: float, msg: str) -> None:
-                        check_cancel()
+                        try:
+                            check_cancel()
+                        except CancelledError:
+                            # Re-raise to stop the DAG, but don't crash parallel threads
+                            raise
+                        
                         early_dag_status["progress"] = frac
                         early_dag_status["message"] = msg
                         
                         # Update sub-status based on what DAG is doing
-                        if "transcript" in msg.lower():
+                        # Handle both single task ("Running transcript...") and parallel ("Running X, Y in parallel...")
+                        msg_lower = msg.lower()
+                        if "transcript" in msg_lower:
                             transcript_status["status"] = "transcribing"
                             transcript_status["progress"] = frac
-                        elif "audio_features" in msg.lower():
+                        if "audio_features" in msg_lower:
                             audio_rms_status["status"] = "analyzing"
                             audio_rms_status["progress"] = frac
-                        elif "audio_events" in msg.lower():
+                        if "audio_events" in msg_lower:
                             audio_events_status["status"] = "analyzing"
                             audio_events_status["progress"] = frac
+                        
+                        # For parallel execution, mark all mentioned tasks as running
+                        if "parallel" in msg_lower:
+                            if "transcript" in msg_lower:
+                                transcript_status["status"] = "transcribing"
+                            if "audio_features" in msg_lower:
+                                audio_rms_status["status"] = "analyzing"
+                            if "audio_events" in msg_lower:
+                                audio_events_status["status"] = "analyzing"
                     
                     result = run_analysis(
                         early_proj,
@@ -1308,14 +1698,33 @@ def create_app(
                     early_dag_status["progress"] = 1.0
                     early_dag_result = result
                     
-                    # Update sub-statuses
-                    transcript_status["status"] = "complete"
-                    transcript_status["progress"] = 1.0
-                    audio_rms_status["status"] = "complete"
-                    audio_rms_status["progress"] = 1.0
+                    # Update sub-statuses based on actual task results
+                    # Build a dict of task_name -> status for easy lookup
+                    task_results = {tr.task_name: tr.status for tr in result.tasks_run}
+                    log.info(f"[DAG] Task results: {task_results}")
+                    
+                    # Only mark as complete if the task actually ran to completion
+                    if task_results.get("transcript") == "completed":
+                        transcript_status["status"] = "complete"
+                        transcript_status["progress"] = 1.0
+                    elif task_results.get("transcript") == "skipped":
+                        # Transcript was skipped because it already exists (cached)
+                        log.info(f"[DAG] Transcript task skipped - already exists (cached)")
+                        transcript_status["status"] = "complete"  # Still mark as complete since it exists
+                        transcript_status["progress"] = 1.0
+                    elif "transcript" in task_results:
+                        log.warning(f"[DAG] Transcript task status: {task_results.get('transcript')}")
+                    else:
+                        log.info(f"[DAG] Transcript task not in tasks_run - outputs already exist")
+                    
+                    if task_results.get("audio_features") == "completed":
+                        audio_rms_status["status"] = "complete"
+                        audio_rms_status["progress"] = 1.0
+                    
                     if analysis_cfg.get("audio_events", {}).get("enabled", True):
-                        audio_events_status["status"] = "complete"
-                        audio_events_status["progress"] = 1.0
+                        if task_results.get("audio_events") == "completed":
+                            audio_events_status["status"] = "complete"
+                            audio_events_status["progress"] = 1.0
                     
                     log.info(f"[DAG] Pre-download analysis complete: {len(result.tasks_run)} tasks in {result.total_elapsed_seconds:.1f}s")
                     return result
@@ -1504,12 +1913,19 @@ def create_app(
                         time.sleep(0.5)
                     
                     # Get results (will raise if video download failed or cancelled)
-                    video_future.result()  # Raises CancelledError if cancelled
+                    try:
+                        video_future.result()  # Raises CancelledError or DownloadCancelled if cancelled
+                    except DownloadCancelled:
+                        # Video download was cancelled cleanly
+                        cleanup_downloads()
+                        return
                     
                     # Chat failures are non-fatal, but propagate cancellation
                     try:
                         chat_future.result()
                     except CancelledError:
+                        raise  # Re-raise cancellation
+                    except DownloadCancelled:
                         raise  # Re-raise cancellation
                     except Exception:
                         pass  # Chat failures are non-fatal
@@ -1521,6 +1937,8 @@ def create_app(
                             if early_dag_result:
                                 log.info(f"[DOWNLOAD] Early DAG analysis completed successfully")
                         except CancelledError:
+                            raise  # Re-raise cancellation
+                        except DownloadCancelled:
                             raise  # Re-raise cancellation
                         except Exception as e:
                             log.warning(f"[DOWNLOAD] Early DAG analysis error: {e}")
@@ -1534,6 +1952,8 @@ def create_app(
                                 log.info(f"[DOWNLOAD] Incremental DAG rerun completed successfully")
                         except CancelledError:
                             raise
+                        except DownloadCancelled:
+                            raise  # Re-raise cancellation
                         except Exception as e:
                             log.warning(f"[DOWNLOAD] Incremental DAG rerun error: {e}")
                     
@@ -1570,7 +1990,11 @@ def create_app(
                         log.info(f"[DAG] Updated early project with video: {video_to_open}")
                     else:
                         # No early project - create one now (fallback path)
-                        proj = ctx.open_project(video_to_open)
+                        # Use set_project_video to ensure video is copied into project
+                        from ..project import create_project_early, set_project_video
+                        proj = create_project_early(url, source_url=url)  # Create based on URL
+                        set_project_video(proj, Path(video_to_open))  # Copy video into project
+                        ctx._project = proj
                     log.info(f"[DOWNLOAD] Project ready: {proj.project_dir}")
                     
                     # Store the source URL for chat download later
@@ -2924,7 +3348,8 @@ def create_app(
                 def on_dag_progress(frac: float, msg: str) -> None:
                     on_highlights_progress(frac)
                 
-                run_analysis(
+                log.info(f"[analyze_full] Running DAG with targets: highlights_candidates, boundary_graph")
+                dag_result = run_analysis(
                     proj,
                     targets={"highlights_candidates", "boundary_graph"},
                     config=dag_config,
@@ -2932,9 +3357,18 @@ def create_app(
                     llm_complete=llm_complete_fn_highlights,
                     upgrade_mode=True,
                 )
+                log.info(f"[analyze_full] DAG result: success={dag_result.success}, tasks_run={[t.task_name for t in dag_result.tasks_run]}")
+                if dag_result.error:
+                    log.warning(f"[analyze_full] DAG error: {dag_result.error}")
+                for tr in dag_result.tasks_run:
+                    log.info(f"[analyze_full] Task '{tr.task_name}': {tr.status} ({tr.elapsed_seconds:.1f}s)")
+                    if tr.error:
+                        log.warning(f"[analyze_full] Task error: {tr.error}")
+                        
                 completed_stages.append("highlights")
                 stage_times["highlights"] = _time.time() - highlights_start
             except Exception as e:
+                log.error(f"[analyze_full] highlights exception: {e}", exc_info=True)
                 errors.append(f"highlights: {e}")
                 stage_times["highlights"] = _time.time() - highlights_start
 
@@ -3159,6 +3593,257 @@ def create_app(
                 })
 
         return JSONResponse({"ok": False, "reason": "candidate_not_found"}, status_code=404)
+
+    @app.get("/api/task_details/{task_id}")
+    def api_get_task_details(task_id: str) -> JSONResponse:
+        """Get detailed info about a pipeline task for 'show work' feature."""
+        proj = ctx.require_project()
+        proj_data = get_project_data(proj)
+        analysis = proj_data.get("analysis", {})
+        
+        details: Dict[str, Any] = {"task_id": task_id, "ok": True}
+        
+        # Helper to get created_at from various key names
+        def get_timestamp(d: Dict[str, Any]) -> Optional[str]:
+            return d.get("created_at") or d.get("generated_at")
+        
+        # Map task_id to data sources and format appropriately
+        if task_id == "transcript":
+            t = analysis.get("transcript", {})
+            details["summary"] = {
+                "segments": t.get("segment_count", 0),
+                "backend": t.get("backend_used", "unknown"),
+                "gpu_used": t.get("gpu_used", False),
+                "language": t.get("detected_language", "unknown"),
+                "elapsed_seconds": t.get("elapsed_seconds"),
+                "created_at": get_timestamp(t),
+            }
+            # Try to load some sample segments
+            transcript_path = proj.analysis_dir / "transcript_full.json"
+            if transcript_path.exists():
+                import json
+                try:
+                    t_data = json.loads(transcript_path.read_text(encoding="utf-8"))
+                    segments = t_data.get("segments", [])[:5]  # First 5 as sample
+                    details["sample_segments"] = [
+                        {"start": s.get("start"), "end": s.get("end"), "text": s.get("text", "")[:100]}
+                        for s in segments
+                    ]
+                    details["total_duration_s"] = segments[-1].get("end", 0) if segments else 0
+                except Exception:
+                    pass
+                    
+        elif task_id == "audio":
+            a = analysis.get("audio", {})
+            details["summary"] = {
+                "peak_count": len(a.get("candidates", [])),
+                "elapsed_seconds": a.get("elapsed_seconds"),
+                "created_at": get_timestamp(a),
+            }
+            # Top 5 peaks
+            peaks = a.get("candidates", [])[:5]
+            details["top_peaks"] = [
+                {"time_s": p.get("peak_time_s"), "score": p.get("score")}
+                for p in peaks
+            ]
+            
+        elif task_id == "motion":
+            m = analysis.get("motion", {})
+            details["summary"] = {
+                "elapsed_seconds": m.get("elapsed_seconds"),
+                "created_at": get_timestamp(m),
+            }
+            
+        elif task_id == "audio_events":
+            ae = analysis.get("audio_events", {})
+            details["summary"] = {
+                "candidate_count": len(ae.get("candidates", [])),
+                "elapsed_seconds": ae.get("elapsed_seconds"),
+                "created_at": get_timestamp(ae),
+            }
+            # Sample events
+            events = ae.get("candidates", [])[:5]
+            details["sample_events"] = [
+                {"time_s": e.get("peak_time_s"), "label": e.get("label", ""), "score": e.get("score")}
+                for e in events
+            ]
+            
+        elif task_id == "chat_features":
+            cf = analysis.get("chat", {})
+            details["summary"] = {
+                "laugh_source": cf.get("laugh_source", "unknown"),
+                "laugh_tokens_count": cf.get("laugh_tokens_count", 0),
+                "llm_learned_count": cf.get("llm_learned_count", 0),
+                "elapsed_seconds": cf.get("elapsed_seconds"),
+                "created_at": get_timestamp(cf),
+            }
+            
+        elif task_id == "highlights":
+            h = analysis.get("highlights", {})
+            details["summary"] = {
+                "candidate_count": len(h.get("candidates", [])),
+                "signals_used": h.get("signals_used", {}),
+                "elapsed_seconds": h.get("elapsed_seconds"),
+                "created_at": get_timestamp(h),
+            }
+            # Top 5 highlights
+            candidates = h.get("candidates", [])[:5]
+            details["top_candidates"] = [
+                {"rank": c.get("rank"), "peak_time_s": c.get("peak_time_s"), "score": c.get("score"), "breakdown": c.get("breakdown")}
+                for c in candidates
+            ]
+            
+        elif task_id == "speech_features":
+            sf = analysis.get("speech", {})
+            config = sf.get("config", {})
+            details["summary"] = {
+                "hop_seconds": config.get("hop_seconds", 0.5),
+                "duration_seconds": sf.get("duration_seconds"),
+                "hop_count": sf.get("hop_count"),
+                "elapsed_seconds": sf.get("elapsed_seconds"),
+                "created_at": get_timestamp(sf),
+            }
+            # Try to load speech features and show stats
+            try:
+                sf_data = load_speech_features(proj)
+                if sf_data:
+                    import numpy as np
+                    speech_score = sf_data.get("speech_score", np.array([]))
+                    if len(speech_score) > 0:
+                        details["stats"] = {
+                            "mean_speech_score": float(np.mean(speech_score)),
+                            "max_speech_score": float(np.max(speech_score)),
+                            "min_speech_score": float(np.min(speech_score)),
+                        }
+                        # Find top 5 time windows by speech score
+                        hop_s = config.get("hop_seconds", 0.5)
+                        top_indices = np.argsort(speech_score)[-5:][::-1]
+                        details["top_windows"] = [
+                            {"time_s": float(idx * hop_s), "score": float(speech_score[idx])}
+                            for idx in top_indices
+                        ]
+            except Exception:
+                pass
+            
+        elif task_id == "reaction_audio":
+            ra = analysis.get("reaction_audio", {})
+            details["summary"] = {
+                "elapsed_seconds": ra.get("elapsed_seconds"),
+                "created_at": get_timestamp(ra),
+            }
+            
+        elif task_id == "enrich":
+            h = analysis.get("highlights", {})
+            details["summary"] = {
+                "enriched_at": h.get("enriched_at"),
+                "elapsed_seconds": h.get("enrich_elapsed_seconds"),
+                "created_at": h.get("enriched_at"),  # Use enriched_at as timestamp for this task
+            }
+            # Sample enriched candidates
+            candidates = h.get("candidates", [])[:3]
+            details["sample_enriched"] = [
+                {"rank": c.get("rank"), "hook_text": (c.get("hook_text") or "")[:100], "quote_text": (c.get("quote_text") or "")[:100]}
+                for c in candidates
+            ]
+            
+        elif task_id == "chapters":
+            ch = analysis.get("chapters", {})
+            details["summary"] = {
+                "chapter_count": ch.get("chapter_count", 0),
+                "elapsed_seconds": ch.get("elapsed_seconds"),
+                "created_at": get_timestamp(ch),
+            }
+            # Load chapters
+            chapters_path = proj.analysis_dir / "chapters.json"
+            if chapters_path.exists():
+                import json
+                try:
+                    ch_data = json.loads(chapters_path.read_text(encoding="utf-8"))
+                    chapters = ch_data.get("chapters", [])
+                    details["chapters"] = [
+                        {"title": c.get("title", ""), "start_s": c.get("start_s"), "end_s": c.get("end_s")}
+                        for c in chapters
+                    ]
+                except Exception:
+                    pass
+                    
+        elif task_id == "boundaries":
+            b = analysis.get("boundaries", {})
+            details["summary"] = {
+                "start_boundary_count": b.get("start_boundary_count", 0),
+                "end_boundary_count": b.get("end_boundary_count", 0),
+                "elapsed_seconds": b.get("elapsed_seconds"),
+                "created_at": get_timestamp(b),
+                "config": b.get("config", {}),
+            }
+            # Load source breakdown from boundaries.json
+            boundaries_path = proj.analysis_dir / "boundaries.json"
+            if not boundaries_path.exists():
+                boundaries_path = proj.analysis_dir / "boundary_graph.json"
+            if boundaries_path.exists():
+                import json
+                try:
+                    bd_data = json.loads(boundaries_path.read_text(encoding="utf-8"))
+                    # Count sources
+                    source_counts: Dict[str, int] = {}
+                    for bp in bd_data.get("start_boundaries", []) + bd_data.get("end_boundaries", []):
+                        for src in bp.get("sources", []):
+                            source_counts[src] = source_counts.get(src, 0) + 1
+                    details["source_breakdown"] = source_counts
+                except Exception:
+                    pass
+                    
+        elif task_id == "clip_variants":
+            cv = analysis.get("clip_variants", {})
+            details["summary"] = {
+                "candidate_count": cv.get("candidate_count", 0),
+                "config": cv.get("config", {}),
+                "elapsed_seconds": cv.get("elapsed_seconds"),
+                "created_at": get_timestamp(cv),
+            }
+            # Load variant stats
+            variants_path = proj.analysis_dir / "clip_variants.json"
+            if variants_path.exists():
+                import json
+                try:
+                    v_data = json.loads(variants_path.read_text(encoding="utf-8"))
+                    details["summary"]["chapters_used"] = v_data.get("chapters_used", False)
+                    details["summary"]["chapters_count"] = v_data.get("chapters_count", 0)
+                    # Count variants by type
+                    variant_counts: Dict[str, int] = {}
+                    for cand in v_data.get("candidates", []):
+                        for v in cand.get("variants", []):
+                            vid = v.get("variant_id", "unknown")
+                            variant_counts[vid] = variant_counts.get(vid, 0) + 1
+                    details["variant_type_counts"] = variant_counts
+                except Exception:
+                    pass
+                    
+        elif task_id == "director":
+            d = analysis.get("ai_director", {})
+            details["summary"] = {
+                "candidate_count": d.get("candidate_count", 0),
+                "llm_available": d.get("llm_available", False),
+                "elapsed_seconds": d.get("elapsed_seconds"),
+                "created_at": get_timestamp(d),
+            }
+            # Load sample results
+            director_path = proj.analysis_dir / "ai_director.json"
+            if director_path.exists():
+                import json
+                try:
+                    dir_data = json.loads(director_path.read_text(encoding="utf-8"))
+                    results = dir_data.get("results", [])[:3]
+                    details["sample_results"] = [
+                        {"rank": r.get("rank"), "title": r.get("title", ""), "hook": r.get("hook", ""), "chosen_variant": r.get("chosen_variant")}
+                        for r in results
+                    ]
+                except Exception:
+                    pass
+        else:
+            return JSONResponse({"ok": False, "reason": f"unknown_task: {task_id}"}, status_code=404)
+            
+        return JSONResponse(details)
 
     @app.get("/api/speech/timeline")
     def api_speech_timeline(max_points: int = 2000) -> JSONResponse:

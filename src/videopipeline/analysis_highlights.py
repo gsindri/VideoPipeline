@@ -1690,11 +1690,41 @@ def compute_highlights_candidates(
     peak_idxs = features.get("peak_indices")
     hop_arr = features.get("hop_seconds")
     
-    if combined_smoothed is None or peak_idxs is None or hop_arr is None:
+    if combined_smoothed is None or hop_arr is None:
         raise ValueError("highlights_features.npz missing required arrays")
     
     hop_s = float(hop_arr[0]) if len(hop_arr) > 0 else 0.5
-    peak_idxs = peak_idxs.astype(np.int64).tolist()
+    
+    # Handle legacy format that may be missing peak_indices
+    if peak_idxs is None:
+        _highlight_logger.warning(
+            "[highlights_candidates] Legacy highlights_features.npz detected (missing peak_indices). "
+            "Computing peaks from combined_scores. Re-run highlights_scores for best results."
+        )
+        # Compute peaks on-the-fly from combined_scores
+        if combined_scores is None:
+            combined_scores = combined_smoothed  # fallback
+        
+        # Simple peak finding: local maxima above threshold
+        top_n = int(highlights_cfg.get("top", 20))
+        min_gap_s = float(highlights_cfg.get("min_gap_seconds", 15.0))
+        skip_start_s = float(highlights_cfg.get("skip_start_seconds", 10.0))
+        min_gap_idx = max(1, int(min_gap_s / hop_s))
+        skip_start_idx = int(skip_start_s / hop_s)
+        
+        # Zero out the skip-start region
+        scores_for_peaks = combined_scores.copy()
+        if skip_start_idx > 0:
+            scores_for_peaks[:skip_start_idx] = -np.inf
+        
+        peak_idxs = pick_top_peaks(
+            scores_for_peaks,
+            top_k=top_n,
+            min_gap_frames=min_gap_idx,
+            min_score=0.0,
+        )
+    else:
+        peak_idxs = peak_idxs.astype(np.int64).tolist()
     
     # Load term arrays for breakdown
     term_audio = features.get("term_audio", np.zeros_like(combined_smoothed))
@@ -1730,12 +1760,19 @@ def compute_highlights_candidates(
         on_progress(0.20)
     
     # Load boundary graph (key for quality)
+    # Note: boundary_graph may not exist during pre-download analysis (expected)
+    # It will be created after full analysis when video-based silence detection runs
     boundary_graph = None
     try:
         from .analysis_boundaries import load_boundary_graph
         boundary_graph = load_boundary_graph(proj)
-    except Exception:
-        pass
+        if boundary_graph is not None:
+            _highlight_logger.info(f"[Highlights] Loaded boundary graph: {len(boundary_graph.start_boundaries)} starts, {len(boundary_graph.end_boundaries)} ends")
+        else:
+            # Debug level since this is expected during pre-download
+            _highlight_logger.debug("[Highlights] Boundary graph not available yet (will use valley fallback)")
+    except Exception as e:
+        _highlight_logger.error(f"[Highlights] Failed to load boundary graph: {e}")
     
     if on_progress:
         on_progress(0.25)
