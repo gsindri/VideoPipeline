@@ -1877,6 +1877,11 @@ def compute_highlights_candidates(
     llm_semantic_used = False
     llm_semantic_scores: Dict[int, Dict[str, Any]] = {}
     
+    if llm_complete is None:
+        _highlight_logger.info("[highlights_candidates] LLM semantic scoring skipped (no llm_complete function provided)")
+    elif not candidates:
+        _highlight_logger.info("[highlights_candidates] LLM semantic scoring skipped (no candidates)")
+    
     if llm_complete is not None and candidates:
         if on_progress:
             on_progress(0.70)

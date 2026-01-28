@@ -2353,12 +2353,14 @@ def create_app(
     def api_analyze_highlights(body: Dict[str, Any] = Body(default={})):  # type: ignore[valid-type]
         proj = ctx.require_project()
         analysis_cfg = ctx.profile.get("analysis", {})
+        ai_cfg = ctx.profile.get("ai", {}).get("director", {})
         body = body or {}
         audio_cfg = {**analysis_cfg.get("audio", {}), **(body.get("audio") or {})}
         motion_cfg = {**analysis_cfg.get("motion", {}), **(body.get("motion") or {})}
         scenes_cfg = {**analysis_cfg.get("scenes", {}), **(body.get("scenes") or {})}
         highlights_cfg = {**analysis_cfg.get("highlights", {}), **(body.get("highlights") or {})}
         audio_events_cfg = {**analysis_cfg.get("audio_events", {}), **(body.get("audio_events") or {})}
+        ai_cfg = {**ai_cfg, **(body.get("ai") or {})}
 
         # Normalize motion_weight_mode into actual numeric weight
         motion_mode = str(highlights_cfg.get("motion_weight_mode", "off")).lower()
@@ -2379,6 +2381,11 @@ def create_app(
                 JOB_MANAGER._set(job, progress=frac, message="analyzing highlights")  # type: ignore[attr-defined]
 
             try:
+                # Set up LLM client for semantic scoring
+                llm_complete_fn = None
+                if ai_cfg.get("enabled", True) and highlights_cfg.get("llm_semantic_enabled", True):
+                    llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
+                
                 # Use DAG runner for full analysis with proper dependency ordering
                 dag_config = {
                     "audio": audio_cfg,
@@ -2388,6 +2395,7 @@ def create_app(
                     "audio_events": audio_events_cfg,
                     "include_chat": True,
                     "include_audio_events": bool(audio_events_cfg.get("enabled", True)),
+                    "_llm_complete": llm_complete_fn,
                 }
                 
                 def on_dag_progress(frac: float, msg: str) -> None:
@@ -2398,6 +2406,7 @@ def create_app(
                     bundle="full",
                     config=dag_config,
                     on_progress=on_dag_progress,
+                    llm_complete=llm_complete_fn,
                     upgrade_mode=True,  # Re-shape when boundaries improve
                 )
                 JOB_MANAGER._set(job, status="succeeded", progress=1.0, message="done", result={"tasks_run": len(result.tasks_run)})  # type: ignore[attr-defined]
@@ -2406,6 +2415,135 @@ def create_app(
 
         import threading
 
+        threading.Thread(target=runner, daemon=True).start()
+        return JSONResponse({"job_id": job.id})
+
+    @app.post("/api/analyze/llm_semantic")
+    def api_analyze_llm_semantic(body: Dict[str, Any] = Body(default={})):  # type: ignore[valid-type]
+        """Re-run LLM semantic scoring on existing highlight candidates.
+        
+        This is a fast operation that takes existing candidates and applies
+        LLM semantic scoring to rerank them. Use this when:
+        - Initial analysis ran without LLM available
+        - You want to refresh semantic scores with updated LLM
+        
+        Requires: existing highlights.json with candidates
+        """
+        proj = ctx.require_project()
+        analysis_cfg = ctx.profile.get("analysis", {})
+        ai_cfg = ctx.profile.get("ai", {}).get("director", {})
+        body = body or {}
+        
+        highlights_cfg = {**analysis_cfg.get("highlights", {}), **(body.get("highlights") or {})}
+        ai_cfg = {**ai_cfg, **(body.get("ai") or {})}
+        
+        job = JOB_MANAGER.create("analyze_llm_semantic")
+        
+        def runner() -> None:
+            import json
+            import logging
+            from datetime import datetime, timezone
+            
+            log = logging.getLogger("videopipeline.studio")
+            JOB_MANAGER._set(job, status="running", progress=0.0, message="Loading candidates...")
+            
+            try:
+                # Check for existing candidates
+                highlights_json_path = proj.analysis_dir / "highlights.json"
+                if not highlights_json_path.exists():
+                    raise ValueError("No highlights.json found - run full highlights analysis first")
+                
+                payload = json.loads(highlights_json_path.read_text(encoding="utf-8"))
+                candidates = payload.get("candidates", [])
+                
+                if not candidates:
+                    raise ValueError("No candidates found in highlights.json")
+                
+                JOB_MANAGER._set(job, progress=0.1, message=f"Found {len(candidates)} candidates, starting LLM...")
+                
+                # Get LLM function
+                llm_complete = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
+                if llm_complete is None:
+                    raise ValueError("LLM not available - check server configuration")
+                
+                JOB_MANAGER._set(job, progress=0.2, message="LLM connected, scoring candidates...")
+                
+                # Run semantic scoring
+                from ..analysis_highlights import compute_llm_semantic_scores
+                
+                llm_semantic_scores = compute_llm_semantic_scores(
+                    candidates=candidates,
+                    proj=proj,
+                    llm_complete=llm_complete,
+                    max_candidates=int(highlights_cfg.get("llm_max_candidates", 15)),
+                )
+                
+                JOB_MANAGER._set(job, progress=0.8, message="Applying scores and re-ranking...")
+                
+                if not llm_semantic_scores:
+                    raise ValueError("LLM returned no scores")
+                
+                # Apply semantic scores
+                semantic_weight = float(highlights_cfg.get("llm_semantic_weight", 0.3))
+                
+                for cand in candidates:
+                    rank = cand.get("rank", 0)
+                    if rank in llm_semantic_scores:
+                        llm_data = llm_semantic_scores[rank]
+                        semantic_score = llm_data.get("semantic_score", 0.5)
+                        signal_score = cand.get("score_signal", cand.get("score", 0.0))
+                        semantic_z = (semantic_score - 0.5) * 4.0
+                        blended_score = (1.0 - semantic_weight) * signal_score + semantic_weight * semantic_z
+                        
+                        cand["score_signal"] = signal_score
+                        cand["score_semantic"] = semantic_score
+                        cand["score"] = blended_score
+                        cand["llm_reason"] = llm_data.get("reason", "")
+                        cand["llm_quote"] = llm_data.get("best_quote", "")
+                
+                # Re-sort and re-rank
+                candidates.sort(key=lambda c: c.get("score", 0.0), reverse=True)
+                for i, cand in enumerate(candidates, start=1):
+                    cand["rank"] = i
+                
+                # Update payload
+                payload["signals_used"]["llm_semantic"] = True
+                payload["candidates"] = candidates
+                payload["llm_semantic_updated_at"] = datetime.now(timezone.utc).isoformat()
+                
+                # Save updated highlights.json
+                highlights_json_path.write_text(
+                    json.dumps(payload, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                
+                # Update project.json
+                from ..project import update_project_json
+                def _upd(d: Dict[str, Any]) -> None:
+                    d.setdefault("analysis", {})
+                    if "highlights" in d["analysis"]:
+                        d["analysis"]["highlights"]["signals_used"]["llm_semantic"] = True
+                        d["analysis"]["highlights"]["candidates"] = candidates
+                
+                update_project_json(proj, _upd)
+                
+                log.info(f"[llm_semantic] Applied LLM scoring to {len(llm_semantic_scores)} candidates")
+                JOB_MANAGER._set(
+                    job, 
+                    status="succeeded", 
+                    progress=1.0, 
+                    message="done",
+                    result={
+                        "candidates_scored": len(llm_semantic_scores),
+                        "total_candidates": len(candidates),
+                    }
+                )
+                
+            except Exception as e:
+                log.error(f"[llm_semantic] Error: {e}", exc_info=True)
+                JOB_MANAGER._set(job, status="failed", message=f"{type(e).__name__}: {e}")
+        
+        import threading
         threading.Thread(target=runner, daemon=True).start()
         return JSONResponse({"job_id": job.id})
 
@@ -3315,7 +3453,14 @@ def create_app(
             # Set up LLM client for semantic scoring (optional enhancement)
             llm_complete_fn_highlights = None
             if ai_cfg.get("enabled", True) and highlights_cfg.get("llm_semantic_enabled", True):
+                log.info(f"[analyze_full] Attempting to get LLM function for semantic scoring...")
                 llm_complete_fn_highlights = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
+                if llm_complete_fn_highlights:
+                    log.info(f"[analyze_full] LLM function obtained successfully")
+                else:
+                    log.warning(f"[analyze_full] LLM function not available (server not running?)")
+            else:
+                log.info(f"[analyze_full] LLM semantic scoring disabled in config (ai.enabled={ai_cfg.get('enabled', True)}, highlights.llm_semantic_enabled={highlights_cfg.get('llm_semantic_enabled', True)})")
             
             try:
                 def on_highlights_progress(p: float) -> None:
@@ -3364,8 +3509,13 @@ def create_app(
                     log.info(f"[analyze_full] Task '{tr.task_name}': {tr.status} ({tr.elapsed_seconds:.1f}s)")
                     if tr.error:
                         log.warning(f"[analyze_full] Task error: {tr.error}")
-                        
-                completed_stages.append("highlights")
+                
+                # Treat DAG failure as partial completion - still continue but record the error
+                if not dag_result.success:
+                    errors.append(f"highlights (DAG partial): {dag_result.error or 'unknown error'}")
+                    completed_stages.append("highlights_partial")
+                else:
+                    completed_stages.append("highlights")
                 stage_times["highlights"] = _time.time() - highlights_start
             except Exception as e:
                 log.error(f"[analyze_full] highlights exception: {e}", exc_info=True)

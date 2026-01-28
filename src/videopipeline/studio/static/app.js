@@ -1794,6 +1794,27 @@ async function showTaskDetailsModal(taskId) {
       }
     }
     
+    // Add "Apply LLM Scoring" button for highlights task when llm_semantic is false
+    const showLlmButton = taskId === 'highlights' && 
+      data.summary?.signals_used && 
+      data.summary.signals_used.llm_semantic === false;
+    
+    if (showLlmButton) {
+      contentHtml += `
+        <div style="background:rgba(234,179,8,0.1);border:1px solid rgba(234,179,8,0.3);padding:12px;border-radius:6px;margin-bottom:12px;">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <span style="color:#eab308;">⚠️ LLM semantic scoring was not applied</span>
+            <button class="run-llm-scoring" style="background:#eab308;color:#000;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-weight:600;">
+              🤖 Apply LLM Scoring
+            </button>
+          </div>
+          <div style="color:#888;font-size:12px;margin-top:6px;">
+            This will use AI to re-rank candidates based on content quality.
+          </div>
+        </div>
+      `;
+    }
+    
     contentHtml += `<div style="margin-top:16px;text-align:right;"><button class="close-modal">Close</button></div>`;
     
     modal.innerHTML = contentHtml;
@@ -1802,6 +1823,36 @@ async function showTaskDetailsModal(taskId) {
     
     modal.querySelector('.close-modal').onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+    
+    // Handle LLM scoring button click
+    const llmBtn = modal.querySelector('.run-llm-scoring');
+    if (llmBtn) {
+      llmBtn.onclick = async () => {
+        llmBtn.disabled = true;
+        llmBtn.textContent = '⏳ Running...';
+        try {
+          const resp = await apiJson('POST', '/api/analyze/llm_semantic', {});
+          if (resp.job_id) {
+            // Close modal
+            overlay.remove();
+            // Poll for completion
+            pollJobStatus(resp.job_id, () => {
+              alert('✅ LLM scoring complete! Refresh to see updated rankings.');
+              // Refresh project data to show updated results
+              if (typeof refreshProject === 'function') {
+                refreshProject();
+              }
+            }, (err) => {
+              alert(`❌ LLM scoring failed: ${err}`);
+            });
+          }
+        } catch (e) {
+          llmBtn.disabled = false;
+          llmBtn.textContent = '🤖 Apply LLM Scoring';
+          alert(`Failed to start LLM scoring: ${e.message}`);
+        }
+      };
+    }
     
   } catch (e) {
     alert(`Failed to load task details: ${e.message}`);
@@ -1906,6 +1957,14 @@ function renderCandidates() {
       const v = $('#video');
       v.currentTime = c.start_s;
       v.play();
+      // Update timeline overlays to show new selection
+      updateTimelineOverlays();
+      // Show AI suggestions panel if AI data is available
+      if (hasAI) {
+        showAISuggestionsPanel(c.rank);
+      } else {
+        hideAISuggestionsPanel();
+      }
     };
     btnPeak.onclick = () => {
       const v = $('#video');
@@ -1923,6 +1982,8 @@ function renderCandidates() {
         } else {
           setBuilder(c.start_s, c.end_s, aiTitle, $('#template').value);
         }
+        // Update timeline overlays
+        updateTimelineOverlays();
       };
     }
     if (btnVariants && aiResult) {
@@ -2021,6 +2082,10 @@ function renderSelections() {
       const v = $('#video');
       v.currentTime = Number(s.start_s);
       v.play();
+      // Update timeline clip region
+      updateClipRegion();
+      // Hide AI suggestions panel for saved selections (no AI data)
+      hideAISuggestionsPanel();
     };
     btnDelete.onclick = async () => {
       if (!confirm('Delete this selection?')) return;
@@ -2306,6 +2371,27 @@ function stopJobsTimer() {
   }
 }
 
+// Simple job polling for background tasks (used in modals)
+function pollJobStatus(jobId, onComplete, onError) {
+  const poll = async () => {
+    try {
+      const job = await apiGet(`/api/jobs/${jobId}`);
+      if (job.status === 'succeeded') {
+        if (onComplete) onComplete(job);
+        return;
+      } else if (job.status === 'failed') {
+        if (onError) onError(job.message || 'Job failed');
+        return;
+      }
+      // Still running, poll again
+      setTimeout(poll, 1000);
+    } catch (e) {
+      if (onError) onError(e.message);
+    }
+  };
+  poll();
+}
+
 function watchJob(jobId) {
   const es = new EventSource(`/api/jobs/${jobId}/events`);
   es.onmessage = async (ev) => {
@@ -2351,6 +2437,37 @@ function watchJob(jobId) {
   };
 }
 
+// =========================================================================
+// INTERACTIVE TIMELINE - State and utilities
+// =========================================================================
+
+// Store timeline data globally for overlay calculations
+let timelineData = {
+  xs: [],           // time values (seconds)
+  ys: [],           // score values
+  hop: 0.5,         // hop in seconds
+  duration: 0,      // total video duration
+  chartArea: null,  // chart area bounds for coordinate mapping
+};
+
+// Track clip handles drag state
+let clipHandleDrag = {
+  active: false,
+  handle: null,    // 'start' or 'end'
+  startX: 0,
+};
+
+// Track segment drag state
+let segmentDrag = {
+  active: false,
+  segment: null,
+  handle: null,    // 'left', 'right', or 'body'
+  candidateIndex: -1,
+  originalStart: 0,
+  originalEnd: 0,
+  startX: 0,
+};
+
 async function refreshTimeline() {
   try {
     let t = null;
@@ -2364,6 +2481,12 @@ async function refreshTimeline() {
     const hop = t.hop_seconds;
     const xs = t.indices.map(i => i * hop);
     const ys = t.scores;
+    
+    // Store timeline data for overlays
+    timelineData.xs = xs;
+    timelineData.ys = ys;
+    timelineData.hop = hop;
+    timelineData.duration = xs.length > 0 ? xs[xs.length - 1] : (project?.video?.duration_seconds || 0);
 
     const ctx = $('#chart').getContext('2d');
     if (chart) chart.destroy();
@@ -2377,11 +2500,19 @@ async function refreshTimeline() {
           borderWidth: 1,
           pointRadius: 0,
           tension: 0.15,
+          borderColor: 'rgba(79, 140, 255, 0.9)',
+          backgroundColor: 'rgba(79, 140, 255, 0.1)',
+          fill: true,
         }]
       },
       options: {
         responsive: true,
+        maintainAspectRatio: false,
         animation: false,
+        interaction: {
+          mode: 'index',
+          intersect: false,
+        },
         plugins: {
           legend: { display: false },
           tooltip: {
@@ -2389,38 +2520,672 @@ async function refreshTimeline() {
               title: (items) => `t = ${fmtTime(items[0].label)}`,
               label: (item) => `score ${Number(item.raw).toFixed(2)}`
             }
-          }
+          },
+          zoom: {
+            pan: {
+              enabled: true,
+              mode: 'x',
+              onPan: () => { updateTimelineOverlays(); updateZoomInfo(); },
+              onPanComplete: () => { updateTimelineOverlays(); updateZoomInfo(); },
+            },
+            zoom: {
+              wheel: { enabled: true },
+              pinch: { enabled: true },
+              mode: 'x',
+              onZoom: () => { updateTimelineOverlays(); updateZoomInfo(); },
+              onZoomComplete: () => { updateTimelineOverlays(); updateZoomInfo(); },
+            },
+            limits: {
+              x: { min: 0, max: timelineData.duration, minRange: 5 },
+            },
+          },
         },
         scales: {
           x: {
+            type: 'linear',
+            min: 0,
+            max: xs.length > 0 ? xs[xs.length - 1] : 100,
             ticks: {
-              callback: (val) => {
-                const sec = xs[val];
-                return sec !== undefined ? fmtTime(sec) : '';
-              },
+              callback: (val) => fmtTime(val),
               maxTicksLimit: 8,
             }
           },
           y: {
-            ticks: { maxTicksLimit: 5 }
+            ticks: { maxTicksLimit: 5 },
+            beginAtZero: true,
           }
         },
-        onClick: (_, elements) => {
-          if (!elements || elements.length === 0) return;
-          const idx = elements[0].index;
-          const sec = xs[idx];
-          if (sec === undefined) return;
-          const v = $('#video');
-          v.currentTime = sec;
-          v.play();
+        onClick: (evt, elements) => {
+          // Only handle clicks when not dragging
+          if (clipHandleDrag.active || segmentDrag.active) return;
+          
+          // Get click position and convert to time
+          const rect = evt.chart.canvas.getBoundingClientRect();
+          const x = evt.native.clientX - rect.left;
+          const time = pixelToTime(x);
+          if (time !== null && time >= 0) {
+            const v = $('#video');
+            v.currentTime = time;
+            v.play();
+          }
         }
       }
     });
+    
+    // Store chart area reference and set up overlays after chart renders
+    setTimeout(() => {
+      if (chart) {
+        timelineData.chartArea = chart.chartArea;
+        updateTimelineOverlays();
+        updatePlayhead();
+        updateZoomInfo();
+      }
+    }, 50);
 
   } catch (e) {
     // timeline might not exist yet
   }
 }
+
+// =========================================================================
+// TIMELINE COORDINATE CONVERSION
+// =========================================================================
+
+function timeToPixel(time) {
+  if (!chart || !chart.chartArea) return null;
+  const { left, right } = chart.chartArea;
+  const scale = chart.scales.x;
+  if (!scale) return null;
+  
+  const minTime = scale.min;
+  const maxTime = scale.max;
+  if (maxTime <= minTime) return null;
+  
+  const fraction = (time - minTime) / (maxTime - minTime);
+  return left + fraction * (right - left);
+}
+
+function pixelToTime(pixel) {
+  if (!chart || !chart.chartArea) return null;
+  const { left, right } = chart.chartArea;
+  const scale = chart.scales.x;
+  if (!scale) return null;
+  
+  const minTime = scale.min;
+  const maxTime = scale.max;
+  
+  const fraction = (pixel - left) / (right - left);
+  return minTime + fraction * (maxTime - minTime);
+}
+
+// =========================================================================
+// CANDIDATE SEGMENT OVERLAYS
+// =========================================================================
+
+function getCandidates() {
+  const highlights = project?.analysis?.highlights;
+  const audio = project?.analysis?.audio;
+  return highlights?.candidates || audio?.candidates || [];
+}
+
+function getSegmentScoreClass(score) {
+  // Normalize score to determine color class
+  const candidates = getCandidates();
+  if (candidates.length === 0) return 'score-medium';
+  
+  const scores = candidates.map(c => c.score);
+  const maxScore = Math.max(...scores);
+  const minScore = Math.min(...scores);
+  const range = maxScore - minScore || 1;
+  const normalized = (score - minScore) / range;
+  
+  if (normalized >= 0.66) return 'score-high';
+  if (normalized >= 0.33) return 'score-medium';
+  return 'score-low';
+}
+
+function buildSegmentTooltip(candidate) {
+  const breakdown = candidate.breakdown || {};
+  const reasons = [];
+  
+  // Build reason text based on breakdown
+  if (breakdown.audio > 0.3) reasons.push('high audio energy');
+  if (breakdown.motion > 0.3) reasons.push('high motion');
+  if (breakdown.chat > 0.3) reasons.push('chat spike');
+  if (breakdown.audio_events > 0.3) reasons.push('audio event (laughter/cheer)');
+  if (breakdown.speech > 0.3) reasons.push('speech emphasis');
+  if (breakdown.reaction > 0.3) reasons.push('reaction audio');
+  
+  const reasonText = reasons.length > 0 ? reasons.join(' + ') : 'combined signals';
+  
+  // Build breakdown bars HTML
+  const breakdownItems = [
+    { label: 'Audio', value: breakdown.audio || 0, color: '#3b82f6' },
+    { label: 'Motion', value: breakdown.motion || 0, color: '#8b5cf6' },
+    { label: 'Chat', value: breakdown.chat || 0, color: '#22c55e' },
+    { label: 'Events', value: breakdown.audio_events || 0, color: '#eab308' },
+    { label: 'Speech', value: breakdown.speech || 0, color: '#ec4899' },
+    { label: 'Reaction', value: breakdown.reaction || 0, color: '#f97316' },
+  ].filter(item => item.value > 0.01);
+  
+  const breakdownHtml = breakdownItems.map(item => `
+    <div class="breakdown-item">
+      <span>${item.label}</span>
+      <div class="breakdown-bar">
+        <div class="breakdown-bar-fill" style="width:${Math.min(100, item.value * 100)}%;background:${item.color}"></div>
+      </div>
+    </div>
+  `).join('');
+  
+  return `
+    <div class="tooltip-title">#${candidate.rank} • Score: ${candidate.score.toFixed(2)}</div>
+    <div class="tooltip-reason">${reasonText}</div>
+    <div style="margin-top:4px;font-size:10px;color:#9aa4b2">
+      ${fmtTime(candidate.start_s)} → ${fmtTime(candidate.end_s)} (${(candidate.end_s - candidate.start_s).toFixed(1)}s)
+    </div>
+    ${breakdownHtml ? `<div class="tooltip-breakdown">${breakdownHtml}</div>` : ''}
+  `;
+}
+
+function renderCandidateSegments() {
+  const container = $('#timelineSegments');
+  if (!container) return;
+  
+  // Check if segments should be shown
+  const showSegments = $('#showCandidateSegments')?.checked ?? true;
+  if (!showSegments || !chart || !chart.chartArea) {
+    container.innerHTML = '';
+    return;
+  }
+  
+  const candidates = getCandidates();
+  if (candidates.length === 0) {
+    container.innerHTML = '';
+    return;
+  }
+  
+  // Clear and rebuild segments
+  container.innerHTML = '';
+  
+  candidates.forEach((candidate, index) => {
+    const startPx = timeToPixel(candidate.start_s);
+    const endPx = timeToPixel(candidate.end_s);
+    
+    // Skip if segment is not in view
+    if (startPx === null || endPx === null) return;
+    if (endPx < chart.chartArea.left || startPx > chart.chartArea.right) return;
+    
+    // Clamp to visible area
+    const left = Math.max(startPx, chart.chartArea.left);
+    const right = Math.min(endPx, chart.chartArea.right);
+    const width = right - left;
+    
+    if (width < 2) return; // Skip if too narrow
+    
+    const segment = document.createElement('div');
+    segment.className = `timeline-segment ${getSegmentScoreClass(candidate.score)}`;
+    segment.dataset.index = index;
+    segment.style.left = `${left}px`;
+    segment.style.width = `${width}px`;
+    
+    // Check if this is the currently selected candidate
+    if (currentCandidate && currentCandidate.rank === candidate.rank) {
+      segment.classList.add('selected');
+    }
+    
+    // Add drag handles
+    segment.innerHTML = `
+      <div class="segment-handle left"></div>
+      <div class="segment-handle right"></div>
+    `;
+    
+    // Tooltip on hover
+    segment.addEventListener('mouseenter', (e) => {
+      if (segmentDrag.active) return;
+      showSegmentTooltip(segment, candidate);
+    });
+    
+    segment.addEventListener('mouseleave', () => {
+      hideSegmentTooltip();
+    });
+    
+    // Click to load candidate
+    segment.addEventListener('click', (e) => {
+      if (segmentDrag.active) return;
+      if (e.target.classList.contains('segment-handle')) return;
+      
+      currentCandidate = candidate;
+      setBuilder(candidate.start_s, candidate.end_s, '', $('#template').value);
+      const v = $('#video');
+      v.currentTime = candidate.start_s;
+      v.play();
+      
+      // Update selection visual
+      container.querySelectorAll('.timeline-segment').forEach(s => s.classList.remove('selected'));
+      segment.classList.add('selected');
+      
+      // Update clip region
+      updateClipRegion();
+    });
+    
+    // Drag handles for resizing segments
+    const leftHandle = segment.querySelector('.segment-handle.left');
+    const rightHandle = segment.querySelector('.segment-handle.right');
+    
+    leftHandle.addEventListener('mousedown', (e) => {
+      e.stopPropagation();
+      startSegmentDrag(e, segment, 'left', index, candidate);
+    });
+    
+    rightHandle.addEventListener('mousedown', (e) => {
+      e.stopPropagation();
+      startSegmentDrag(e, segment, 'right', index, candidate);
+    });
+    
+    container.appendChild(segment);
+  });
+}
+
+let tooltipElement = null;
+
+function showSegmentTooltip(segment, candidate) {
+  hideSegmentTooltip();
+  
+  tooltipElement = document.createElement('div');
+  tooltipElement.className = 'segment-tooltip';
+  tooltipElement.innerHTML = buildSegmentTooltip(candidate);
+  
+  segment.appendChild(tooltipElement);
+}
+
+function hideSegmentTooltip() {
+  if (tooltipElement) {
+    tooltipElement.remove();
+    tooltipElement = null;
+  }
+}
+
+// =========================================================================
+// SEGMENT DRAG/RESIZE
+// =========================================================================
+
+function startSegmentDrag(e, segment, handle, index, candidate) {
+  segmentDrag = {
+    active: true,
+    segment,
+    handle,
+    candidateIndex: index,
+    originalStart: candidate.start_s,
+    originalEnd: candidate.end_s,
+    startX: e.clientX,
+  };
+  
+  hideSegmentTooltip();
+  document.addEventListener('mousemove', onSegmentDrag);
+  document.addEventListener('mouseup', onSegmentDragEnd);
+  document.body.style.cursor = 'ew-resize';
+  document.body.style.userSelect = 'none';
+}
+
+function onSegmentDrag(e) {
+  if (!segmentDrag.active) return;
+  
+  const deltaX = e.clientX - segmentDrag.startX;
+  const rect = $('#chart').getBoundingClientRect();
+  
+  // Convert delta to time
+  const scale = chart?.scales?.x;
+  if (!scale) return;
+  
+  const { left, right } = chart.chartArea;
+  const pxPerSec = (right - left) / (scale.max - scale.min);
+  const deltaTime = deltaX / pxPerSec;
+  
+  const candidates = getCandidates();
+  const candidate = candidates[segmentDrag.candidateIndex];
+  if (!candidate) return;
+  
+  let newStart = segmentDrag.originalStart;
+  let newEnd = segmentDrag.originalEnd;
+  
+  if (segmentDrag.handle === 'left') {
+    newStart = Math.max(0, segmentDrag.originalStart + deltaTime);
+    newStart = Math.min(newStart, newEnd - 1); // Ensure minimum 1 second
+  } else if (segmentDrag.handle === 'right') {
+    newEnd = Math.min(timelineData.duration, segmentDrag.originalEnd + deltaTime);
+    newEnd = Math.max(newEnd, newStart + 1); // Ensure minimum 1 second
+  }
+  
+  // Update segment visual position
+  const startPx = timeToPixel(newStart);
+  const endPx = timeToPixel(newEnd);
+  if (startPx !== null && endPx !== null) {
+    segmentDrag.segment.style.left = `${Math.max(startPx, chart.chartArea.left)}px`;
+    segmentDrag.segment.style.width = `${Math.min(endPx, chart.chartArea.right) - Math.max(startPx, chart.chartArea.left)}px`;
+  }
+  
+  // Update clip builder in real-time
+  if (currentCandidate && currentCandidate.rank === candidate.rank) {
+    setBuilder(newStart, newEnd, $('#title').value, $('#template').value);
+    updateClipRegion();
+  }
+  
+  // Store the new values for use on drag end
+  segmentDrag.newStart = newStart;
+  segmentDrag.newEnd = newEnd;
+}
+
+function onSegmentDragEnd(e) {
+  if (!segmentDrag.active) return;
+  
+  const candidates = getCandidates();
+  const candidate = candidates[segmentDrag.candidateIndex];
+  
+  if (candidate && (segmentDrag.newStart !== undefined || segmentDrag.newEnd !== undefined)) {
+    const newStart = segmentDrag.newStart ?? segmentDrag.originalStart;
+    const newEnd = segmentDrag.newEnd ?? segmentDrag.originalEnd;
+    
+    // Update the candidate in local data
+    candidate.start_s = newStart;
+    candidate.end_s = newEnd;
+    
+    // If this is the current candidate, update the builder
+    if (currentCandidate && currentCandidate.rank === candidate.rank) {
+      currentCandidate.start_s = newStart;
+      currentCandidate.end_s = newEnd;
+      setBuilder(newStart, newEnd, $('#title').value, $('#template').value);
+    }
+  }
+  
+  segmentDrag = { active: false, segment: null, handle: null, candidateIndex: -1, originalStart: 0, originalEnd: 0, startX: 0 };
+  document.removeEventListener('mousemove', onSegmentDrag);
+  document.removeEventListener('mouseup', onSegmentDragEnd);
+  document.body.style.cursor = '';
+  document.body.style.userSelect = '';
+  
+  updateTimelineOverlays();
+}
+
+// =========================================================================
+// CLIP REGION OVERLAY
+// =========================================================================
+
+function updateClipRegion() {
+  const clipRegion = $('#clipRegion');
+  const showClip = $('#showClipHandles')?.checked ?? true;
+  
+  if (!clipRegion || !showClip || !chart || !chart.chartArea) {
+    if (clipRegion) clipRegion.style.display = 'none';
+    return;
+  }
+  
+  const startS = Number($('#startS').value) || 0;
+  const endS = Number($('#endS').value) || 0;
+  
+  if (endS <= startS) {
+    clipRegion.style.display = 'none';
+    return;
+  }
+  
+  const startPx = timeToPixel(startS);
+  const endPx = timeToPixel(endS);
+  
+  if (startPx === null || endPx === null) {
+    clipRegion.style.display = 'none';
+    return;
+  }
+  
+  // Clamp to visible area
+  const left = Math.max(startPx, chart.chartArea.left);
+  const right = Math.min(endPx, chart.chartArea.right);
+  
+  if (right <= left) {
+    clipRegion.style.display = 'none';
+    return;
+  }
+  
+  clipRegion.style.display = 'block';
+  clipRegion.style.left = `${left}px`;
+  clipRegion.style.width = `${right - left}px`;
+  
+  // Position handles
+  const startHandle = $('#clipHandleStart');
+  const endHandle = $('#clipHandleEnd');
+  
+  if (startHandle) {
+    startHandle.style.left = `${startPx - chart.chartArea.left}px`;
+    startHandle.style.display = startPx >= chart.chartArea.left ? 'block' : 'none';
+  }
+  
+  if (endHandle) {
+    endHandle.style.left = `${endPx - chart.chartArea.left - 12}px`;
+    endHandle.style.display = endPx <= chart.chartArea.right ? 'block' : 'none';
+  }
+}
+
+// =========================================================================
+// CLIP HANDLE DRAG
+// =========================================================================
+
+function initClipHandleDrag() {
+  const startHandle = $('#clipHandleStart');
+  const endHandle = $('#clipHandleEnd');
+  
+  if (startHandle) {
+    startHandle.addEventListener('mousedown', (e) => {
+      e.stopPropagation();
+      startClipHandleDrag(e, 'start');
+    });
+  }
+  
+  if (endHandle) {
+    endHandle.addEventListener('mousedown', (e) => {
+      e.stopPropagation();
+      startClipHandleDrag(e, 'end');
+    });
+  }
+}
+
+function startClipHandleDrag(e, handle) {
+  clipHandleDrag = {
+    active: true,
+    handle,
+    startX: e.clientX,
+  };
+  
+  document.addEventListener('mousemove', onClipHandleDrag);
+  document.addEventListener('mouseup', onClipHandleDragEnd);
+  document.body.style.cursor = 'ew-resize';
+  document.body.style.userSelect = 'none';
+}
+
+function onClipHandleDrag(e) {
+  if (!clipHandleDrag.active || !chart) return;
+  
+  const rect = $('#chart').getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const time = pixelToTime(x);
+  
+  if (time === null) return;
+  
+  const clampedTime = Math.max(0, Math.min(time, timelineData.duration));
+  
+  if (clipHandleDrag.handle === 'start') {
+    const endS = Number($('#endS').value) || 0;
+    if (clampedTime < endS - 0.5) {
+      $('#startS').value = clampedTime.toFixed(2);
+    }
+  } else {
+    const startS = Number($('#startS').value) || 0;
+    if (clampedTime > startS + 0.5) {
+      $('#endS').value = clampedTime.toFixed(2);
+    }
+  }
+  
+  updateClipRegion();
+}
+
+function onClipHandleDragEnd() {
+  clipHandleDrag = { active: false, handle: null, startX: 0 };
+  document.removeEventListener('mousemove', onClipHandleDrag);
+  document.removeEventListener('mouseup', onClipHandleDragEnd);
+  document.body.style.cursor = '';
+  document.body.style.userSelect = '';
+}
+
+// =========================================================================
+// PLAYHEAD INDICATOR
+// =========================================================================
+
+function updatePlayhead() {
+  const playhead = $('#timelinePlayhead');
+  if (!playhead || !chart || !chart.chartArea) {
+    if (playhead) playhead.style.display = 'none';
+    return;
+  }
+  
+  const video = $('#video');
+  if (!video) return;
+  
+  const currentTime = video.currentTime;
+  const px = timeToPixel(currentTime);
+  
+  if (px === null || px < chart.chartArea.left || px > chart.chartArea.right) {
+    playhead.style.display = 'none';
+    return;
+  }
+  
+  playhead.style.display = 'block';
+  playhead.style.left = `${px}px`;
+}
+
+// =========================================================================
+// ZOOM CONTROLS
+// =========================================================================
+
+function initZoomControls() {
+  const btnZoomIn = $('#btnZoomIn');
+  const btnZoomOut = $('#btnZoomOut');
+  const btnResetZoom = $('#btnResetZoom');
+  
+  if (btnZoomIn) {
+    btnZoomIn.onclick = () => {
+      if (chart) {
+        chart.zoom(1.5);
+        updateTimelineOverlays();
+        updateZoomInfo();
+      }
+    };
+  }
+  
+  if (btnZoomOut) {
+    btnZoomOut.onclick = () => {
+      if (chart) {
+        chart.zoom(0.67);
+        updateTimelineOverlays();
+        updateZoomInfo();
+      }
+    };
+  }
+  
+  if (btnResetZoom) {
+    btnResetZoom.onclick = () => {
+      if (chart) {
+        chart.resetZoom();
+        updateTimelineOverlays();
+        updateZoomInfo();
+      }
+    };
+  }
+  
+  // Toggle checkboxes
+  const showSegments = $('#showCandidateSegments');
+  const showClip = $('#showClipHandles');
+  
+  if (showSegments) {
+    showSegments.onchange = () => updateTimelineOverlays();
+  }
+  
+  if (showClip) {
+    showClip.onchange = () => updateClipRegion();
+  }
+}
+
+function updateZoomInfo() {
+  const zoomInfo = $('#zoomInfo');
+  if (!zoomInfo || !chart || !chart.scales?.x) return;
+  
+  const scale = chart.scales.x;
+  const visibleRange = scale.max - scale.min;
+  const totalRange = timelineData.duration;
+  
+  if (totalRange <= 0) return;
+  
+  const zoomPercent = Math.round((totalRange / visibleRange) * 100);
+  const viewStart = fmtTime(scale.min);
+  const viewEnd = fmtTime(scale.max);
+  
+  if (zoomPercent <= 100) {
+    zoomInfo.textContent = '100% • Drag to pan, scroll to zoom';
+  } else {
+    zoomInfo.textContent = `${zoomPercent}% • Viewing ${viewStart} - ${viewEnd}`;
+  }
+}
+
+// =========================================================================
+// UPDATE ALL TIMELINE OVERLAYS
+// =========================================================================
+
+function updateTimelineOverlays() {
+  renderCandidateSegments();
+  updateClipRegion();
+  updatePlayhead();
+}
+
+// =========================================================================
+// TIMELINE INITIALIZATION
+// =========================================================================
+
+function initInteractiveTimeline() {
+  initZoomControls();
+  initClipHandleDrag();
+  
+  // Update playhead on video timeupdate
+  const video = $('#video');
+  if (video) {
+    video.addEventListener('timeupdate', () => {
+      updatePlayhead();
+    });
+  }
+  
+  // Update clip region when builder inputs change
+  const startInput = $('#startS');
+  const endInput = $('#endS');
+  
+  if (startInput) {
+    startInput.addEventListener('input', () => updateClipRegion());
+    startInput.addEventListener('change', () => updateClipRegion());
+  }
+  
+  if (endInput) {
+    endInput.addEventListener('input', () => updateClipRegion());
+    endInput.addEventListener('change', () => updateClipRegion());
+  }
+  
+  // Handle window resize
+  window.addEventListener('resize', () => {
+    setTimeout(() => {
+      if (chart) {
+        timelineData.chartArea = chart.chartArea;
+        updateTimelineOverlays();
+      }
+    }, 100);
+  });
+}
+
+// =========================================================================
+// END INTERACTIVE TIMELINE
+// =========================================================================
 
 async function refreshProject() {
   try {
@@ -2436,6 +3201,8 @@ async function refreshProject() {
   renderCandidates();
   renderSelections();
   await refreshTimeline();
+  // Update timeline overlays after refresh
+  updateTimelineOverlays();
   // Also refresh chat UI to show AI analysis status
   updateChatUI();
 }
@@ -2620,26 +3387,31 @@ function wireUI() {
   $('#btnSetStart').onclick = () => {
     const b = getBuilder();
     setBuilder(v.currentTime, b.end_s, b.title, b.template);
+    updateClipRegion();
   };
 
   $('#btnSetEnd').onclick = () => {
     const b = getBuilder();
     setBuilder(b.start_s, v.currentTime, b.title, b.template);
+    updateClipRegion();
   };
 
   $('#btnSnapCandidate').onclick = () => {
     if (!currentCandidate) return;
     setBuilder(currentCandidate.start_s, currentCandidate.end_s, $('#title').value, $('#template').value);
+    updateClipRegion();
   };
 
   $('#btnNudgeBack').onclick = () => {
     const b = getBuilder();
     setBuilder(b.start_s - 0.5, b.end_s - 0.5, b.title, b.template);
+    updateClipRegion();
   };
 
   $('#btnNudgeFwd').onclick = () => {
     const b = getBuilder();
     setBuilder(b.start_s + 0.5, b.end_s + 0.5, b.title, b.template);
+    updateClipRegion();
   };
 
   $('#btnSaveSelection').onclick = async () => {
@@ -3345,6 +4117,10 @@ function updateChatUI() {
     aiStatusHtml += '</div>';
   }
 
+  // Get references to new UI elements
+  const miniTimelineWrap = $('#chatMiniTimelineWrap');
+  const filterControls = $('#chatFilterControls');
+
   if (!chatStatus || !chatStatus.available) {
     statusEl.innerHTML = 'No chat replay available.' + aiStatusHtml;
     statusEl.className = 'small';
@@ -3352,6 +4128,8 @@ function updateChatUI() {
     if (offsetControls) offsetControls.style.display = 'none';
     if (downloadBtn) downloadBtn.disabled = false;
     if (clearBtn) clearBtn.style.display = 'none';
+    if (miniTimelineWrap) miniTimelineWrap.style.display = 'none';
+    if (filterControls) filterControls.style.display = 'none';
 
     // Pre-fill source URL from project if available
     if (sourceUrlInput && chatStatus?.source_url) {
@@ -3373,6 +4151,12 @@ function updateChatUI() {
   }
   if (downloadBtn) downloadBtn.disabled = false;
   if (clearBtn) clearBtn.style.display = 'inline-block';
+  
+  // Show filter controls
+  if (filterControls) filterControls.style.display = 'flex';
+  
+  // Load and show chat mini-timeline
+  loadChatTimeline();
 
   // Start syncing chat
   startChatSync();
@@ -3418,22 +4202,53 @@ function renderChatMessages(messages, currentTimeMs) {
 
   if (!messages || messages.length === 0) {
     messagesEl.innerHTML = '<div class="small" style="opacity:0.5">No messages in this time range</div>';
+    updateChatFilterBadge(0);
     return;
   }
 
-  const html = messages.map(m => {
+  // Apply filtering
+  let filteredMessages = messages;
+  let matchCount = 0;
+  
+  if (chatFilterState.preset) {
+    filteredMessages = messages.map(m => {
+      const matches = matchesChatFilter(m);
+      if (matches) matchCount++;
+      return { ...m, _matches: matches };
+    });
+    
+    // If highlight only is off, filter to only matching messages
+    if (chatFilterState.highlightOnly) {
+      // Keep all messages but mark matches
+    } else if (chatFilterState.preset) {
+      filteredMessages = filteredMessages.filter(m => m._matches);
+    }
+  }
+  
+  updateChatFilterBadge(matchCount);
+
+  if (filteredMessages.length === 0) {
+    messagesEl.innerHTML = '<div class="small" style="opacity:0.5">No messages match the filter</div>';
+    return;
+  }
+
+  const html = filteredMessages.map(m => {
     const offsetMs = chatStatus?.sync_offset_ms || 0;
     const msgTimeMs = m.t_ms - offsetMs;
     const timeSec = msgTimeMs / 1000;
     const isNear = Math.abs(msgTimeMs - currentTimeMs) < 2000;
     const nearClass = isNear ? 'chat-msg-near' : '';
+    const matchClass = m._matches ? 'filter-match' : '';
     const timeStr = fmtTime(timeSec);
     
+    // Highlight filter matches in text
+    const displayText = chatFilterState.preset ? highlightFilterMatches(m.text || '') : escapeHtml(m.text || '');
+    
     return `
-      <div class="chat-msg ${nearClass}" data-time="${timeSec}">
+      <div class="chat-msg ${nearClass} ${matchClass}" data-time="${timeSec}">
         <span class="chat-time" title="Click to seek">${timeStr}</span>
         <span class="chat-author">${escapeHtml(m.author || 'anon')}</span>
-        <span class="chat-text">${escapeHtml(m.text || '')}</span>
+        <span class="chat-text">${displayText}</span>
       </div>
     `;
   }).join('');
@@ -3505,6 +4320,468 @@ async function clearChat() {
     await loadChatStatus();  // Refresh AI Analysis Status panel
   } catch (e) {
     alert(`Failed to clear chat: ${e.message}`);
+  }
+}
+
+// =========================================================================
+// CHAT MINI-TIMELINE
+// =========================================================================
+
+let chatTimelineData = null;
+
+async function loadChatTimeline() {
+  const wrap = $('#chatMiniTimelineWrap');
+  try {
+    const res = await apiGet('/api/chat/timeline');
+    if (res.ok) {
+      chatTimelineData = {
+        hopSeconds: res.hop_seconds,
+        indices: res.indices,
+        scores: res.scores,
+      };
+      renderChatMiniTimeline();
+      if (wrap) wrap.style.display = 'block';
+    } else {
+      chatTimelineData = null;
+      if (wrap) wrap.style.display = 'none';
+    }
+  } catch (e) {
+    // No chat timeline available
+    chatTimelineData = null;
+    if (wrap) wrap.style.display = 'none';
+  }
+}
+
+function renderChatMiniTimeline() {
+  const canvas = $('#chatMiniTimeline');
+  const wrap = $('#chatMiniTimelineWrap');
+  if (!canvas || !chatTimelineData) return;
+  
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  
+  // Set canvas size
+  canvas.width = wrap.clientWidth * dpr;
+  canvas.height = 40 * dpr;
+  ctx.scale(dpr, dpr);
+  
+  const width = wrap.clientWidth;
+  const height = 40;
+  
+  // Clear
+  ctx.fillStyle = '#0a0c0f';
+  ctx.fillRect(0, 0, width, height);
+  
+  const scores = chatTimelineData.scores;
+  if (scores.length === 0) return;
+  
+  const maxScore = Math.max(...scores, 0.01);
+  const barWidth = Math.max(1, width / scores.length);
+  
+  // Draw bars
+  scores.forEach((score, i) => {
+    const normalizedScore = score / maxScore;
+    const barHeight = normalizedScore * (height - 4);
+    const x = (i / scores.length) * width;
+    
+    // Color gradient based on intensity
+    const intensity = Math.min(1, normalizedScore * 1.5);
+    const r = Math.floor(34 + intensity * (234 - 34));
+    const g = Math.floor(197 + intensity * (179 - 197));
+    const b = Math.floor(94 + intensity * (8 - 94));
+    
+    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${0.4 + intensity * 0.5})`;
+    ctx.fillRect(x, height - barHeight - 2, barWidth + 0.5, barHeight);
+  });
+}
+
+function updateChatTimelinePlayhead() {
+  const playhead = $('#chatTimelinePlayhead');
+  const wrap = $('#chatMiniTimelineWrap');
+  const video = $('#video');
+  
+  if (!playhead || !wrap || !video || !chatTimelineData) return;
+  
+  const duration = video.duration || 0;
+  if (duration <= 0) return;
+  
+  const progress = video.currentTime / duration;
+  const x = progress * wrap.clientWidth;
+  
+  playhead.style.left = `${x}px`;
+}
+
+function initChatMiniTimeline() {
+  const wrap = $('#chatMiniTimelineWrap');
+  const video = $('#video');
+  
+  if (wrap) {
+    wrap.onclick = (e) => {
+      if (!video || !chatTimelineData) return;
+      const rect = wrap.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const progress = x / rect.width;
+      const duration = video.duration || 0;
+      if (duration > 0) {
+        video.currentTime = progress * duration;
+      }
+    };
+  }
+  
+  if (video) {
+    video.addEventListener('timeupdate', updateChatTimelinePlayhead);
+  }
+  
+  // Handle resize
+  window.addEventListener('resize', renderChatMiniTimeline);
+}
+
+// =========================================================================
+// CHAT FILTERING
+// =========================================================================
+
+const CHAT_FILTER_PRESETS = {
+  laughter: ['lol', 'lmao', 'lmfao', 'rofl', 'haha', 'hahaha', 'lul', 'kekw', 'omegalul', '😂', '🤣', 'xd'],
+  excitement: ['pog', 'poggers', 'pogchamp', 'lets go', 'let\'s go', 'hype', 'yooo', 'omg', 'wow', '!', '🔥', '🎉', 'w', 'dub'],
+  questions: ['?', 'what', 'how', 'why', 'when', 'where', 'who'],
+  emotes: [],  // Will match any emote pattern
+};
+
+let chatFilterState = {
+  preset: '',
+  keywords: [],
+  highlightOnly: false,
+  matchCount: 0,
+};
+
+function applyChatFilter() {
+  const preset = $('#chatFilterPreset')?.value || '';
+  const customKeywords = $('#chatFilterKeywords')?.value || '';
+  const highlightOnly = $('#chatFilterHighlightOnly')?.checked || false;
+  
+  chatFilterState.preset = preset;
+  chatFilterState.highlightOnly = highlightOnly;
+  
+  if (preset === 'custom' && customKeywords.trim()) {
+    chatFilterState.keywords = customKeywords.split(',').map(k => k.trim().toLowerCase()).filter(k => k);
+  } else if (preset && CHAT_FILTER_PRESETS[preset]) {
+    chatFilterState.keywords = CHAT_FILTER_PRESETS[preset];
+  } else {
+    chatFilterState.keywords = [];
+  }
+  
+  // Show/hide custom input
+  const customWrap = $('#chatCustomFilterWrap');
+  if (customWrap) {
+    customWrap.style.display = preset === 'custom' ? 'flex' : 'none';
+  }
+  
+  // Trigger re-render
+  syncChatMessages();
+}
+
+function matchesChatFilter(message) {
+  if (!chatFilterState.preset || chatFilterState.keywords.length === 0) {
+    if (chatFilterState.preset === 'emotes') {
+      // Match emote patterns (words starting with : or containing only caps)
+      const text = message.text || '';
+      return /:[a-zA-Z0-9_]+:|^[A-Z]{2,}$/.test(text) || text.includes('KEKW') || text.includes('POG');
+    }
+    return false;
+  }
+  
+  const text = (message.text || '').toLowerCase();
+  return chatFilterState.keywords.some(kw => text.includes(kw));
+}
+
+function highlightFilterMatches(text) {
+  if (!chatFilterState.preset || chatFilterState.keywords.length === 0) {
+    return escapeHtml(text);
+  }
+  
+  let result = escapeHtml(text);
+  
+  // Highlight matching keywords
+  chatFilterState.keywords.forEach(kw => {
+    const regex = new RegExp(`(${escapeRegex(kw)})`, 'gi');
+    result = result.replace(regex, '<span class="keyword-highlight">$1</span>');
+  });
+  
+  return result;
+}
+
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function initChatFilters() {
+  const presetSelect = $('#chatFilterPreset');
+  const keywordsInput = $('#chatFilterKeywords');
+  const highlightOnlyChk = $('#chatFilterHighlightOnly');
+  const filterBadge = $('#chatFilterCount');
+  
+  if (presetSelect) {
+    presetSelect.onchange = applyChatFilter;
+  }
+  
+  if (keywordsInput) {
+    keywordsInput.onchange = applyChatFilter;
+    keywordsInput.onkeydown = (e) => {
+      if (e.key === 'Enter') applyChatFilter();
+    };
+  }
+  
+  if (highlightOnlyChk) {
+    highlightOnlyChk.onchange = applyChatFilter;
+  }
+  
+  // Clear filter button in badge
+  if (filterBadge) {
+    const clearBtn = filterBadge.querySelector('.remove-filter');
+    if (clearBtn) {
+      clearBtn.onclick = () => {
+        if (presetSelect) presetSelect.value = '';
+        if (keywordsInput) keywordsInput.value = '';
+        if (highlightOnlyChk) highlightOnlyChk.checked = false;
+        applyChatFilter();
+      };
+    }
+  }
+}
+
+function updateChatFilterBadge(matchCount) {
+  const badge = $('#chatFilterCount');
+  if (!badge) return;
+  
+  chatFilterState.matchCount = matchCount;
+  
+  if (chatFilterState.preset && matchCount >= 0) {
+    badge.style.display = 'inline-flex';
+    badge.querySelector('.count').textContent = matchCount;
+  } else {
+    badge.style.display = 'none';
+  }
+}
+
+// =========================================================================
+// AI SUGGESTIONS PANEL
+// =========================================================================
+
+let aiSuggestionsState = {
+  candidateRank: null,
+  titles: [],
+  hooks: [],
+  hashtags: [],
+  selectedTitleIdx: 0,
+  selectedHookIdx: 0,
+  selectedHashtags: new Set(),
+  model: '',
+};
+
+function showAISuggestionsPanel(candidateRank) {
+  const director = project?.analysis?.director;
+  if (!director?.results) {
+    hideAISuggestionsPanel();
+    return;
+  }
+  
+  const result = director.results.find(r => r.rank === candidateRank);
+  if (!result) {
+    hideAISuggestionsPanel();
+    return;
+  }
+  
+  const panel = $('#aiSuggestionsPanel');
+  if (!panel) return;
+  
+  // Build multiple title/hook options
+  // Primary suggestion from AI director
+  const titles = [result.title];
+  const hooks = [result.hook];
+  
+  // Add variations based on the original
+  if (result.title) {
+    // Generate some variations
+    titles.push(result.title.toUpperCase());
+    if (result.title.length > 30) {
+      titles.push(result.title.slice(0, 30) + '...');
+    }
+    // Add a question variant if it's not already a question
+    if (!result.title.endsWith('?') && !result.title.includes('?')) {
+      titles.push('Did this really happen? ' + result.title);
+    }
+  }
+  
+  if (result.hook) {
+    hooks.push(result.hook.toUpperCase());
+    hooks.push('🔥 ' + result.hook);
+    hooks.push(result.hook + ' 👀');
+  }
+  
+  // Add hashtags
+  const hashtags = result.hashtags || result.tags || [];
+  
+  aiSuggestionsState = {
+    candidateRank,
+    titles: [...new Set(titles)].filter(t => t), // Remove duplicates and empty
+    hooks: [...new Set(hooks)].filter(h => h),
+    hashtags,
+    selectedTitleIdx: 0,
+    selectedHookIdx: 0,
+    selectedHashtags: new Set(hashtags.slice(0, 5)),
+    model: director.model || 'AI',
+  };
+  
+  renderAISuggestionsPanel();
+  panel.style.display = 'block';
+}
+
+function hideAISuggestionsPanel() {
+  const panel = $('#aiSuggestionsPanel');
+  if (panel) panel.style.display = 'none';
+}
+
+function renderAISuggestionsPanel() {
+  const titleOptions = $('#aiTitleOptions');
+  const hookOptions = $('#aiHookOptions');
+  const hashtagsContainer = $('#aiHashtags');
+  const modelBadge = $('#aiModelBadge');
+  
+  if (modelBadge) {
+    modelBadge.textContent = aiSuggestionsState.model;
+  }
+  
+  // Render title options
+  if (titleOptions) {
+    titleOptions.innerHTML = aiSuggestionsState.titles.map((title, idx) => `
+      <div class="ai-suggestion-option ${idx === aiSuggestionsState.selectedTitleIdx ? 'selected' : ''}" data-idx="${idx}" data-type="title">
+        <input type="radio" name="aiTitle" ${idx === aiSuggestionsState.selectedTitleIdx ? 'checked' : ''} />
+        <input type="text" class="ai-suggestion-text editable" value="${escapeHtml(title)}" data-idx="${idx}" />
+      </div>
+    `).join('');
+    
+    // Wire up events
+    titleOptions.querySelectorAll('.ai-suggestion-option').forEach(opt => {
+      opt.onclick = (e) => {
+        if (e.target.classList.contains('editable')) return;
+        const idx = parseInt(opt.dataset.idx);
+        aiSuggestionsState.selectedTitleIdx = idx;
+        renderAISuggestionsPanel();
+      };
+    });
+    
+    titleOptions.querySelectorAll('.editable').forEach(input => {
+      input.oninput = (e) => {
+        const idx = parseInt(input.dataset.idx);
+        aiSuggestionsState.titles[idx] = input.value;
+      };
+      input.onfocus = () => {
+        const idx = parseInt(input.dataset.idx);
+        aiSuggestionsState.selectedTitleIdx = idx;
+        renderAISuggestionsPanel();
+      };
+    });
+  }
+  
+  // Render hook options
+  if (hookOptions) {
+    hookOptions.innerHTML = aiSuggestionsState.hooks.map((hook, idx) => `
+      <div class="ai-suggestion-option ${idx === aiSuggestionsState.selectedHookIdx ? 'selected' : ''}" data-idx="${idx}" data-type="hook">
+        <input type="radio" name="aiHook" ${idx === aiSuggestionsState.selectedHookIdx ? 'checked' : ''} />
+        <input type="text" class="ai-suggestion-text editable" value="${escapeHtml(hook)}" data-idx="${idx}" />
+      </div>
+    `).join('');
+    
+    hookOptions.querySelectorAll('.ai-suggestion-option').forEach(opt => {
+      opt.onclick = (e) => {
+        if (e.target.classList.contains('editable')) return;
+        const idx = parseInt(opt.dataset.idx);
+        aiSuggestionsState.selectedHookIdx = idx;
+        renderAISuggestionsPanel();
+      };
+    });
+    
+    hookOptions.querySelectorAll('.editable').forEach(input => {
+      input.oninput = (e) => {
+        const idx = parseInt(input.dataset.idx);
+        aiSuggestionsState.hooks[idx] = input.value;
+      };
+      input.onfocus = () => {
+        const idx = parseInt(input.dataset.idx);
+        aiSuggestionsState.selectedHookIdx = idx;
+        renderAISuggestionsPanel();
+      };
+    });
+  }
+  
+  // Render hashtags
+  if (hashtagsContainer) {
+    hashtagsContainer.innerHTML = aiSuggestionsState.hashtags.map((tag, idx) => `
+      <div class="ai-tag-chip ${aiSuggestionsState.selectedHashtags.has(tag) ? 'selected' : ''}" data-tag="${escapeHtml(tag)}">
+        #${escapeHtml(tag)}
+      </div>
+    `).join('');
+    
+    hashtagsContainer.querySelectorAll('.ai-tag-chip').forEach(chip => {
+      chip.onclick = () => {
+        const tag = chip.dataset.tag;
+        if (aiSuggestionsState.selectedHashtags.has(tag)) {
+          aiSuggestionsState.selectedHashtags.delete(tag);
+        } else {
+          aiSuggestionsState.selectedHashtags.add(tag);
+        }
+        chip.classList.toggle('selected');
+      };
+    });
+  }
+}
+
+function applyAISuggestions() {
+  const selectedTitle = aiSuggestionsState.titles[aiSuggestionsState.selectedTitleIdx] || '';
+  const selectedHook = aiSuggestionsState.hooks[aiSuggestionsState.selectedHookIdx] || '';
+  const selectedTags = Array.from(aiSuggestionsState.selectedHashtags);
+  
+  // Apply title to clip builder
+  const titleInput = $('#title');
+  if (titleInput && selectedTitle) {
+    // Combine title with hashtags
+    const tagsStr = selectedTags.length > 0 ? ' ' + selectedTags.map(t => '#' + t).join(' ') : '';
+    titleInput.value = selectedTitle + tagsStr;
+  }
+  
+  // Store hook for export (could add to notes field or a dedicated hook field)
+  // For now, we'll show a confirmation
+  const message = `Applied:\n• Title: ${selectedTitle}\n• Hook: ${selectedHook}\n• Tags: ${selectedTags.join(', ')}`;
+  console.log('AI Suggestions applied:', { title: selectedTitle, hook: selectedHook, tags: selectedTags });
+}
+
+function initAISuggestionsPanel() {
+  const applyBtn = $('#btnApplyAISuggestions');
+  const regenBtn = $('#btnRegenerateAI');
+  
+  if (applyBtn) {
+    applyBtn.onclick = applyAISuggestions;
+  }
+  
+  if (regenBtn) {
+    regenBtn.onclick = async () => {
+      if (!aiSuggestionsState.candidateRank) return;
+      
+      // Show loading state
+      regenBtn.disabled = true;
+      regenBtn.textContent = '⏳ Generating...';
+      
+      try {
+        // Could call an API to regenerate suggestions
+        // For now, just shuffle existing options
+        aiSuggestionsState.titles = aiSuggestionsState.titles.sort(() => Math.random() - 0.5);
+        aiSuggestionsState.hooks = aiSuggestionsState.hooks.sort(() => Math.random() - 0.5);
+        renderAISuggestionsPanel();
+      } finally {
+        regenBtn.disabled = false;
+        regenBtn.textContent = '↻ Regenerate';
+      }
+    };
   }
 }
 
@@ -3591,6 +4868,15 @@ function wireChatUI() {
       }
     };
   }
+
+  // Initialize chat mini-timeline
+  initChatMiniTimeline();
+  
+  // Initialize chat filters
+  initChatFilters();
+  
+  // Initialize AI suggestions panel
+  initAISuggestionsPanel();
 }
 
 async function main() {
@@ -3667,6 +4953,9 @@ async function initStudioView() {
   wireUI();
   wireChatUI();
   updateFacecamStatus();
+  
+  // Initialize interactive timeline features (zoom, pan, segment overlays, clip handles)
+  initInteractiveTimeline();
   
   // Update whisper backend dropdown with availability info
   updateWhisperBackendOptions();

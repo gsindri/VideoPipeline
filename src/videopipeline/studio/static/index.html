@@ -6,6 +6,8 @@
   <title>VideoPipeline Studio</title>
   <link rel="stylesheet" href="/static/styles.css" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
 </head>
 <body>
   <!-- ===== HOME VIEW ===== -->
@@ -197,10 +199,56 @@
           <div class="row">
             <span class="small" id="analysisStatus"></span>
           </div>
-          <div class="canvas-wrap">
-            <canvas id="chart" height="120"></canvas>
+          
+          <!-- Interactive Timeline Controls -->
+          <div class="timeline-controls">
+            <button id="btnZoomIn" title="Zoom in (scroll wheel also works)">🔍+ Zoom In</button>
+            <button id="btnZoomOut" title="Zoom out">🔍- Zoom Out</button>
+            <button id="btnResetZoom" title="Reset to full view">↺ Reset View</button>
+            <label class="small" style="display:flex;align-items:center;gap:4px">
+              <input type="checkbox" id="showCandidateSegments" checked /> Show candidates
+            </label>
+            <label class="small" style="display:flex;align-items:center;gap:4px">
+              <input type="checkbox" id="showClipHandles" checked /> Show clip region
+            </label>
+            <span class="zoom-info" id="zoomInfo">100% • Drag to pan, scroll to zoom</span>
           </div>
-          <p class="small">Higher score means more hype based on combined signals (audio energy + motion + chat spikes + audio events).</p>
+          
+          <!-- Timeline with overlays -->
+          <div class="timeline-container">
+            <div class="timeline-canvas-wrap">
+              <canvas id="chart" height="140"></canvas>
+              <div class="timeline-segments-overlay" id="timelineSegments"></div>
+              <div class="timeline-clip-overlay" id="timelineClipOverlay">
+                <div class="clip-region" id="clipRegion" style="display:none">
+                  <div class="clip-handle start" id="clipHandleStart" title="Drag to adjust start time"></div>
+                  <div class="clip-handle end" id="clipHandleEnd" title="Drag to adjust end time"></div>
+                </div>
+              </div>
+              <div class="timeline-playhead" id="timelinePlayhead" style="display:none"></div>
+            </div>
+            
+            <div class="timeline-legend">
+              <div class="timeline-legend-item">
+                <div class="legend-color high"></div>
+                <span>High score</span>
+              </div>
+              <div class="timeline-legend-item">
+                <div class="legend-color medium"></div>
+                <span>Medium score</span>
+              </div>
+              <div class="timeline-legend-item">
+                <div class="legend-color low"></div>
+                <span>Low score</span>
+              </div>
+              <div class="timeline-legend-item">
+                <div class="legend-color clip"></div>
+                <span>Clip region</span>
+              </div>
+            </div>
+          </div>
+          
+          <p class="small" style="margin-top:8px">Higher score = more hype. <strong>Click segments</strong> to load candidates, <strong>drag edges</strong> to fine-tune. Use clip handles to set clip boundaries directly on timeline.</p>
           </div>
         </div>
 
@@ -249,6 +297,35 @@
             <button id="btnNudgeFwd">+0.5s ▶</button>
             <span class="small">Tip: fine-tune with arrow keys in the inputs.</span>
           </div>
+          
+          <!-- AI Suggestions Panel -->
+          <div id="aiSuggestionsPanel" class="ai-suggestions-panel" style="display:none">
+            <div class="ai-suggestions-header">
+              <h3>🤖 AI Suggestions <span id="aiModelBadge" class="ai-model-badge"></span></h3>
+              <button id="btnRegenerateAI" class="ai-regenerate-btn" title="Generate new suggestions">↻ Regenerate</button>
+            </div>
+            
+            <!-- Title suggestions -->
+            <div class="ai-suggestion-group">
+              <div class="ai-suggestion-label">Title Options</div>
+              <div class="ai-suggestion-options" id="aiTitleOptions"></div>
+            </div>
+            
+            <!-- Hook suggestions -->
+            <div class="ai-suggestion-group">
+              <div class="ai-suggestion-label">Hook (Video Overlay)</div>
+              <div class="ai-suggestion-options" id="aiHookOptions"></div>
+            </div>
+            
+            <!-- Hashtags -->
+            <div class="ai-suggestion-group">
+              <div class="ai-suggestion-label">Hashtags</div>
+              <div class="ai-tags-row" id="aiHashtags"></div>
+            </div>
+            
+            <button id="btnApplyAISuggestions" class="ai-apply-btn">Apply Selected Suggestions</button>
+          </div>
+          
           </div>
         </div>
       </section>
@@ -271,6 +348,37 @@
             </label>
             <label style="font-size:0.85em"><input type="checkbox" id="chatAutoScroll" checked /> Auto-scroll</label>
           </div>
+          
+          <!-- Chat Mini-Timeline -->
+          <div id="chatMiniTimelineWrap" class="chat-mini-timeline" style="display:none" title="Click to seek, shows chat activity over time">
+            <canvas id="chatMiniTimeline"></canvas>
+            <div class="playhead" id="chatTimelinePlayhead"></div>
+          </div>
+          
+          <!-- Chat Filter Controls -->
+          <div id="chatFilterControls" class="chat-filter-controls" style="display:none">
+            <label>Filter:
+              <select id="chatFilterPreset">
+                <option value="">All messages</option>
+                <option value="laughter">😂 Laughter/LOL</option>
+                <option value="excitement">🔥 Excitement/Hype</option>
+                <option value="questions">❓ Questions</option>
+                <option value="emotes">✨ Emotes only</option>
+                <option value="custom">Custom...</option>
+              </select>
+            </label>
+            <label id="chatCustomFilterWrap" style="display:none">Keywords:
+              <input type="text" id="chatFilterKeywords" placeholder="word1, word2..." />
+            </label>
+            <label style="font-size:0.85em">
+              <input type="checkbox" id="chatFilterHighlightOnly" /> Highlight only
+            </label>
+            <span id="chatFilterCount" class="chat-filter-badge" style="display:none">
+              <span class="count">0</span> matches
+              <span class="remove-filter" title="Clear filter">✕</span>
+            </span>
+          </div>
+          
           <div class="small" id="chatStatus">No chat replay available.</div>
           <div class="chat-messages" id="chatMessages"></div>
           <p class="small" style="margin-top:8px;opacity:0.7">Click a message to seek. Use offset to sync chat with video.</p>
