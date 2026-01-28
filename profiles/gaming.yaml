@@ -33,6 +33,16 @@ analysis:
       max_pre_seconds: 12
       min_post_seconds: 4
       max_post_seconds: 28
+    # LLM-powered quality filtering
+    # This lets the LLM reject boring candidates even if they have high signal scores
+    llm_filter_enabled: true
+    llm_filter_min_quality: 5  # 1-10 scale, candidates below this are rejected
+    llm_filter_max_keep: 10    # Keep at most this many candidates (null = no limit)
+    content_type: gaming       # Helps LLM understand what "good content" means
+    # LLM semantic scoring (reranking weight, separate from filtering)
+    llm_semantic_enabled: true
+    llm_semantic_weight: 0.3   # 30% LLM influence on final score
+    llm_max_candidates: 15     # Max candidates to send to LLM for scoring
   speech:
     enabled: true
     # Backend selection:
@@ -200,8 +210,8 @@ ai:
     engine: llama_cpp_server
     endpoint: "http://127.0.0.1:11435"
     model_name: "local-gguf-vulkan"
-    timeout_s: 30
-    max_tokens: 256
+    timeout_s: 60
+    max_tokens: 2048  # Increased for highlight scoring (15 candidates × ~100 tokens each)
     temperature: 0.2
     platform: "shorts"
     fallback_to_rules: true

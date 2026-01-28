@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Generator, Optional
 
 import numpy as np
 
@@ -74,8 +77,44 @@ def load_json(path: Path) -> Dict[str, Any]:
 
 
 def save_json(path: Path, obj: Dict[str, Any]) -> None:
+    """Save JSON to file atomically (temp file + replace).
+
+    Notes on Windows:
+    - os.replace() fails with WinError 5/32 if another thread/process is replacing
+      the same target at the same time.
+    - We pair this with a higher-level lock in update_project(), and add a small
+      retry loop here to survive transient file locks (e.g., antivirus).
+    """
+    import tempfile
+
+    path = Path(path).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+    content = json.dumps(obj, indent=2, ensure_ascii=False)
+
+    # Write to temp file in same directory (ensures same filesystem for atomic replace)
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp", prefix=path.stem + "_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        # os.replace() is atomic, but can transiently fail on Windows if the
+        # destination is being swapped by another thread/process.
+        for attempt in range(10):
+            try:
+                os.replace(tmp_path, str(path))
+                break
+            except PermissionError:
+                if os.name == "nt" and attempt < 9:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                raise
+    finally:
+        # If replace succeeded, tmp_path no longer exists; if it failed, clean up.
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def save_npz(path: Path, **arrays: np.ndarray) -> None:
@@ -390,11 +429,103 @@ def set_project_video(proj: Project, video_path: Path) -> None:
     update_project(proj, _upd)
 
 
+@contextmanager
+def _file_lock(lock_file: Path, *, timeout_s: float = 10.0, poll_s: float = 0.02, stale_s: float = 5.0) -> Generator[None, None, None]:
+    """Very small file-based lock.
+
+    We use this for project.json updates because many analysis tasks run in parallel
+    and update_project() does a read-modify-write cycle. On Windows, concurrent
+    os.replace() calls can raise PermissionError (WinError 5).
+    
+    The lock times out quickly (10s default) and considers locks stale after 5s,
+    because save_json/load_json should be very fast operations.
+    """
+    lock_file = Path(lock_file).expanduser().resolve()
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+
+    start = time.time()
+    acquired = False
+    my_pid = os.getpid()
+
+    while time.time() - start < timeout_s:
+        try:
+            # Create lock file exclusively.
+            fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, f"{time.time()}:{my_pid}\n".encode("utf-8"))
+            finally:
+                os.close(fd)
+            acquired = True
+            break
+        except (FileExistsError, OSError) as e:
+            # OSError errno 17 is EEXIST on some platforms
+            if isinstance(e, OSError) and e.errno not in (17, None):
+                # Some other OS error, wait and retry
+                time.sleep(poll_s)
+                continue
+            
+            # Lock file exists - check if it's stale
+            try:
+                content = lock_file.read_text(encoding="utf-8").strip()
+                lock_time = float(content.split(":")[0])
+                if time.time() - lock_time > stale_s:
+                    # Stale lock - forcibly remove it
+                    try:
+                        lock_file.unlink()
+                    except OSError:
+                        pass
+                    continue
+            except Exception:
+                # Can't read lock file (corrupt, being written, etc.) - remove it
+                try:
+                    lock_file.unlink()
+                except OSError:
+                    pass
+                continue
+
+            time.sleep(poll_s)
+
+    if not acquired:
+        # Last-ditch attempt: force remove any lock and don't use locking
+        # This is better than failing the entire task
+        try:
+            lock_file.unlink()
+        except OSError:
+            pass
+        # Log warning but continue without lock
+        import logging
+        logging.getLogger("videopipeline.project").warning(
+            f"Lock timeout, proceeding without lock: {lock_file}"
+        )
+        yield
+        return
+
+    try:
+        yield
+    finally:
+        try:
+            lock_file.unlink()
+        except OSError:
+            pass
+
+
 def update_project(proj: Project, updater) -> Dict[str, Any]:
-    data = load_json(proj.project_json_path)
-    updater(data)
-    save_json(proj.project_json_path, data)
-    return data
+    """Safely update project.json (read-modify-write) with a lock.
+
+    This prevents concurrent task threads from clobbering each other's writes and
+    avoids WinError 5 on Windows when multiple os.replace() calls happen at once.
+    """
+    lock_file = proj.project_dir / ".locks" / "project_json.lock"
+    with _file_lock(lock_file):  # Use defaults: timeout_s=10, stale_s=5
+        data = load_json(proj.project_json_path)
+        updater(data)
+        save_json(proj.project_json_path, data)
+        return data
+
+
+# Backwards-compatible alias (some modules import this name)
+def update_project_json(proj: Project, updater) -> Dict[str, Any]:
+    return update_project(proj, updater)
 
 
 def get_project_data(proj: Project) -> Dict[str, Any]:

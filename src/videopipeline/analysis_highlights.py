@@ -15,6 +15,54 @@ from .peaks import moving_average, pick_top_peaks, robust_z
 from .project import Project, get_project_data, load_npz, save_npz, update_project
 
 
+def _coerce_llm_response_to_text(resp: Any) -> str:
+    """Coerce various LLM response formats to a string.
+    
+    Handles:
+    - Raw string (passthrough)
+    - bytes/bytearray (decode UTF-8)
+    - OpenAI-style response payload ({"choices": [{"message": {"content": ...}}]})
+    - Already-parsed JSON dict/list (re-serialize to JSON string)
+    - Anything else (str() coercion)
+    
+    This makes the highlight LLM code resilient to different backends/wrappers
+    that may return different response shapes.
+    """
+    if resp is None:
+        return ""
+    
+    if isinstance(resp, str):
+        return resp
+    
+    if isinstance(resp, (bytes, bytearray)):
+        return resp.decode("utf-8", errors="replace")
+    
+    if isinstance(resp, dict):
+        # OpenAI-style response payload
+        choices = resp.get("choices")
+        if isinstance(choices, list) and choices:
+            c0 = choices[0]
+            if isinstance(c0, dict):
+                msg = c0.get("message")
+                if isinstance(msg, dict) and "content" in msg:
+                    return str(msg.get("content") or "")
+                if "text" in c0:
+                    return str(c0.get("text") or "")
+        
+        # Check for cached text wrapper from llm_client
+        if "__text__" in resp:
+            return str(resp["__text__"])
+        
+        # Already-parsed JSON object - re-serialize
+        return json.dumps(resp, ensure_ascii=False)
+    
+    if isinstance(resp, list):
+        # Already-parsed JSON array - re-serialize
+        return json.dumps(resp, ensure_ascii=False)
+    
+    return str(resp)
+
+
 def _as_1d_f64(x: np.ndarray) -> np.ndarray:
     """Convert to 1D float64 array (no copy if possible)."""
     arr = np.asarray(x, dtype=np.float64).reshape(-1)
@@ -536,13 +584,15 @@ For each candidate, evaluate the transcript content and assign a semantic_score 
 Higher scores for: exciting reactions, funny moments, impressive plays, quotable phrases.
 Lower scores for: mundane commentary, incomplete thoughts, boring content.
 
-Output JSON array with one object per candidate:
-[
-  {{"rank": 1, "semantic_score": 0.8, "reason": "brief explanation", "best_quote": "short quotable phrase"}},
-  ...
-]
+Output JSON object with "scores" array:
+{{
+  "scores": [
+    {{"rank": 1, "semantic_score": 0.8, "reason": "brief explanation", "best_quote": "short quotable phrase"}},
+    {{"rank": 2, "semantic_score": 0.6, "reason": "brief explanation", "best_quote": "short quotable phrase"}}
+  ]
+}}
 
-Respond with ONLY the JSON array:"""
+Respond with ONLY the JSON object:"""
     
     return prompt
 
@@ -552,13 +602,196 @@ def _parse_llm_highlight_scores(
     num_candidates: int,
 ) -> Dict[int, Dict[str, Any]]:
     """Parse LLM response into semantic scores by rank.
+
+    The codebase originally expected a JSON **array** response, but when using
+    OpenAI-compatible servers with `response_format={"type":"json_object"}`, many
+    models will (correctly) return a top-level JSON **object** instead.
+
+    This parser accepts:
+    - JSON array: [{rank, semantic_score, reason, best_quote}, ...]
+    - JSON object mapping rank -> {...} (e.g. {"1": {...}, "2": {...}})
+    - Wrapper objects with one of: scores/results/items/candidates/data -> list
     
     Returns: Dict mapping rank -> {"semantic_score": float, "reason": str, "best_quote": str}
+    """
+    result: Dict[int, Dict[str, Any]] = {}
+
+    try:
+        text = response_text.strip()
+
+        # Handle markdown code blocks
+        if "```" in text:
+            match = _re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, _re.DOTALL)
+            if match:
+                text = match.group(1).strip()
+
+        # Try to extract a JSON object/array if the model included extra text
+        if not (text.startswith("{") or text.startswith("[")):
+            match = _re.search(r"(\{.*\}|\[.*\])", text, _re.DOTALL)
+            if match:
+                text = match.group(1).strip()
+
+        parsed = json.loads(text)
+
+        items: List[Dict[str, Any]] = []
+
+        if isinstance(parsed, list):
+            items = [it for it in parsed if isinstance(it, dict)]
+
+        elif isinstance(parsed, dict):
+            # Common wrappers - check for list values
+            for key in ("scores", "results", "items", "candidates", "data", "semantic_scores", "highlights"):
+                val = parsed.get(key)
+                if isinstance(val, list):
+                    items = [it for it in val if isinstance(it, dict)]
+                    break
+
+            # Dict-of-dicts: {"1": {...}, "2": {...}} or {"candidate_1": {...}}
+            # Check if we have dict values (allows for metadata keys like "model", "version" etc.)
+            if not items:
+                dict_values = [(k, v) for k, v in parsed.items() if isinstance(v, dict)]
+                if dict_values:
+                    for k, v in dict_values:
+                        item = dict(v)
+                        if "rank" not in item:
+                            # Try to extract rank from key like "1", "candidate_1", etc.
+                            try:
+                                digits = "".join(c for c in str(k) if c.isdigit())
+                                if digits:
+                                    item["rank"] = int(digits)
+                            except Exception:
+                                pass
+                        items.append(item)
+
+        for item in items:
+            if "rank" not in item:
+                continue
+
+            try:
+                rank = int(item["rank"])
+            except Exception:
+                continue
+
+            # Ignore nonsense/out-of-range ranks if we know the candidate count
+            if num_candidates and not (1 <= rank <= num_candidates):
+                continue
+
+            try:
+                semantic = float(item.get("semantic_score", 0.5))
+            except Exception:
+                semantic = 0.5
+            semantic = max(0.0, min(1.0, semantic))
+
+            result[rank] = {
+                "semantic_score": semantic,
+                "reason": str(item.get("reason", "")),
+                "best_quote": str(item.get("best_quote", "")),
+            }
+
+    except Exception as e:
+        _highlight_logger.warning(f"Failed to parse LLM highlight scores: {e}")
+
+    return result
+
+
+def _build_llm_filter_prompt(
+    candidates: List[Dict[str, Any]],
+    transcript_segments: List[Dict[str, Any]],
+    content_type: str = "gaming",
+) -> str:
+    """Build prompt for LLM to filter highlight candidates by content quality.
+    
+    This is a more aggressive filter than semantic scoring - it asks the LLM
+    to identify which candidates have actually interesting/entertaining content
+    vs those that just have high signal activity but boring content.
+    """
+    import bisect
+    
+    # Pre-sort segments by start time for faster lookup
+    sorted_segments = sorted(transcript_segments, key=lambda s: s.get("start", 0.0))
+    seg_starts = [s.get("start", 0.0) for s in sorted_segments]
+    
+    # Get transcript text for each candidate's time window
+    candidate_data = []
+    for cand in candidates:
+        start_s = cand.get("start_s", 0.0)
+        end_s = cand.get("end_s", 0.0)
+        
+        # Use binary search to find relevant segments
+        start_idx = bisect.bisect_left(seg_starts, start_s)
+        start_idx = max(0, start_idx - 5)
+        
+        relevant_text = []
+        for i in range(start_idx, len(sorted_segments)):
+            seg = sorted_segments[i]
+            seg_start = seg.get("start", 0.0)
+            seg_end = seg.get("end", 0.0)
+            
+            if seg_start > end_s:
+                break
+            
+            if seg_end >= start_s and seg_start <= end_s:
+                relevant_text.append(seg.get("text", "").strip())
+        
+        candidate_data.append({
+            "rank": cand.get("rank", 0),
+            "start_s": round(start_s, 1),
+            "end_s": round(end_s, 1),
+            "duration_s": round(end_s - start_s, 1),
+            "transcript": " ".join(relevant_text)[:600],  # Slightly more context for filtering
+        })
+    
+    prompt = f"""You are a content quality filter for {content_type} stream highlights.
+
+Your job is to REJECT clips that are boring or low quality, even if they had high audio/activity signals.
+Be STRICT - only KEEP clips that would genuinely entertain viewers.
+
+Candidates to evaluate:
+{json.dumps(candidate_data, indent=2)}
+
+For each candidate, decide:
+- "keep": genuinely entertaining, funny, exciting, or memorable moment
+- "reject": boring, mundane commentary, incomplete thought, nothing interesting happens
+
+REJECT if the transcript shows:
+- Just reading chat/donations without humor
+- Generic gameplay commentary ("okay let's go here")
+- Incomplete sentences or unclear context
+- Nothing quotable or shareable
+
+KEEP if the transcript shows:
+- Genuine reactions (surprise, excitement, frustration)
+- Funny moments or jokes
+- Impressive plays with good commentary
+- Quotable/memorable phrases
+- Strong emotional moments
+
+Output JSON object with "results" array:
+{
+  "results": [
+    {"rank": 1, "decision": "keep", "quality_score": 8, "reason": "brief reason"},
+    {"rank": 2, "decision": "reject", "quality_score": 3, "reason": "brief reason"}
+  ]
+}
+
+quality_score is 1-10 (10 = amazing clip, 1 = terrible).
+Be strict! It's better to have fewer great clips than many mediocre ones.
+
+Respond with ONLY the JSON object:"""
+    
+    return prompt
+
+
+def _parse_llm_filter_response(
+    response_text: str,
+) -> Dict[int, Dict[str, Any]]:
+    """Parse LLM filter response.
+    
+    Returns: Dict mapping rank -> {"decision": "keep"/"reject", "quality_score": int, "reason": str}
     """
     result = {}
     
     try:
-        # Try to parse as JSON
         text = response_text.strip()
         
         # Handle markdown code blocks
@@ -567,27 +800,196 @@ def _parse_llm_highlight_scores(
             if match:
                 text = match.group(1).strip()
         
-        # Try to find JSON array
-        if not text.startswith("["):
-            match = _re.search(r"\[.*\]", text, _re.DOTALL)
+        # Try to extract a JSON object/array if the model included extra text
+        if not (text.startswith("{") or text.startswith("[")):
+            match = _re.search(r"(\{.*\}|\[.*\])", text, _re.DOTALL)
             if match:
-                text = match.group(0)
-        
-        scores = json.loads(text)
-        
-        if isinstance(scores, list):
-            for item in scores:
-                if isinstance(item, dict) and "rank" in item:
-                    rank = int(item["rank"])
-                    result[rank] = {
-                        "semantic_score": float(item.get("semantic_score", 0.5)),
-                        "reason": str(item.get("reason", "")),
-                        "best_quote": str(item.get("best_quote", "")),
-                    }
-    except (json.JSONDecodeError, ValueError, KeyError) as e:
-        _highlight_logger.warning(f"Failed to parse LLM highlight scores: {e}")
-    
+                text = match.group(1).strip()
+
+        parsed = json.loads(text)
+
+        items: List[Dict[str, Any]] = []
+
+        if isinstance(parsed, list):
+            items = [it for it in parsed if isinstance(it, dict)]
+
+        elif isinstance(parsed, dict):
+            # Common wrappers - check for list values
+            for key in ("scores", "results", "items", "candidates", "data", "filter_results", "filtered"):
+                val = parsed.get(key)
+                if isinstance(val, list):
+                    items = [it for it in val if isinstance(it, dict)]
+                    break
+
+            # Dict-of-dicts: {"1": {...}, "2": {...}} or {"candidate_1": {...}}
+            # Check if we have dict values (allows for metadata keys)
+            if not items:
+                dict_values = [(k, v) for k, v in parsed.items() if isinstance(v, dict)]
+                if dict_values:
+                    for k, v in dict_values:
+                        item = dict(v)
+                        if "rank" not in item:
+                            # Try to extract rank from key like "1", "candidate_1", etc.
+                            try:
+                                digits = "".join(c for c in str(k) if c.isdigit())
+                                if digits:
+                                    item["rank"] = int(digits)
+                            except Exception:
+                                pass
+                        items.append(item)
+
+        for item in items:
+            if "rank" not in item:
+                continue
+
+            try:
+                rank = int(item["rank"])
+            except Exception:
+                continue
+
+            decision = str(item.get("decision", "keep")).strip().lower()
+            if decision not in ("keep", "reject"):
+                decision = "keep"
+
+            try:
+                quality = int(item.get("quality_score", 5))
+            except Exception:
+                quality = 5
+            quality = max(1, min(10, quality))
+
+            result[rank] = {
+                "decision": decision,
+                "quality_score": quality,
+                "reason": str(item.get("reason", "")),
+            }
+
+    except Exception as e:
+        _highlight_logger.warning(f"Failed to parse LLM filter response: {e}")
+        _highlight_logger.debug(f"Raw response was: {response_text[:500] if response_text else '(empty)'}...")
+
+    if not result:
+        _highlight_logger.warning(f"[llm_filter_parse] Parsed 0 items. Response preview: {response_text[:300] if response_text else '(empty)'}...")
+    else:
+        _highlight_logger.info(f"[llm_filter_parse] Parsed {len(result)} filter results")
+
     return result
+
+
+def compute_llm_filter(
+    candidates: List[Dict[str, Any]],
+    proj: "Project",
+    llm_complete: Callable[[str], str],
+    *,
+    min_quality_score: int = 5,
+    max_keep: Optional[int] = None,
+    content_type: str = "gaming",
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Use LLM to filter out low-quality candidates.
+    
+    This is more aggressive than semantic scoring - it actually removes candidates
+    that the LLM determines have boring/uninteresting content.
+    
+    Args:
+        candidates: List of candidate dicts
+        proj: Project instance for accessing transcript
+        llm_complete: Function that takes prompt string and returns response string
+        min_quality_score: Minimum score (1-10) to keep a candidate
+        max_keep: Maximum candidates to keep (None = no limit, just use threshold)
+        content_type: Type of content for prompt context (gaming, irl, etc.)
+        
+    Returns:
+        Tuple of (filtered_candidates, filter_stats)
+    """
+    from .analysis_transcript import load_transcript
+    
+    # Load transcript
+    transcript = load_transcript(proj)
+    if transcript is None:
+        _highlight_logger.info("[llm_filter] No transcript available, skipping filter")
+        return candidates, {"skipped": True, "reason": "no_transcript"}
+    
+    if not candidates:
+        return candidates, {"skipped": True, "reason": "no_candidates"}
+    
+    # Get transcript segments
+    transcript_segments = [
+        {"start": seg.start, "end": seg.end, "text": seg.text}
+        for seg in transcript.segments
+    ]
+    
+    # Build and send prompt
+    prompt = _build_llm_filter_prompt(candidates, transcript_segments, content_type)
+    
+    try:
+        _highlight_logger.info(f"[llm_filter] Sending {len(candidates)} candidates for quality filtering...")
+        
+        import time as _t
+        start = _t.time()
+        response = llm_complete(prompt)
+        elapsed = _t.time() - start
+        
+        # Coerce response to text (handles string, dict, list, OpenAI-style payloads)
+        response_text = _coerce_llm_response_to_text(response)
+        
+        _highlight_logger.info(f"[llm_filter] LLM responded in {elapsed:.1f}s ({len(response_text)} chars)")
+        
+        filter_results = _parse_llm_filter_response(response_text)
+        
+        if not filter_results:
+            _highlight_logger.warning("[llm_filter] No valid filter results, keeping all candidates")
+            return candidates, {"skipped": True, "reason": "parse_failed"}
+        
+        # Apply filtering
+        kept = []
+        rejected = []
+        
+        for cand in candidates:
+            rank = cand.get("rank", 0)
+            result = filter_results.get(rank, {"decision": "keep", "quality_score": 5, "reason": ""})
+            
+            # Add filter metadata to candidate
+            cand["llm_filter"] = result
+            cand["quality_score"] = result["quality_score"]
+            
+            if result["decision"] == "keep" and result["quality_score"] >= min_quality_score:
+                kept.append(cand)
+            else:
+                rejected.append(cand)
+        
+        # Sort kept by quality score (highest first)
+        kept.sort(key=lambda c: c.get("quality_score", 0), reverse=True)
+        
+        # Apply max_keep limit if specified
+        if max_keep is not None and len(kept) > max_keep:
+            extra_rejected = kept[max_keep:]
+            kept = kept[:max_keep]
+            rejected.extend(extra_rejected)
+        
+        # Re-rank kept candidates
+        for i, cand in enumerate(kept, start=1):
+            cand["rank_before_filter"] = cand["rank"]
+            cand["rank"] = i
+        
+        stats = {
+            "total_input": len(candidates),
+            "kept": len(kept),
+            "rejected": len(rejected),
+            "min_quality_score": min_quality_score,
+            "max_keep": max_keep,
+            "elapsed_s": round(elapsed, 2),
+            "rejected_ranks": [c.get("rank_before_filter", c.get("rank")) for c in rejected],
+        }
+        
+        _highlight_logger.info(
+            f"[llm_filter] Kept {len(kept)}/{len(candidates)} candidates "
+            f"(rejected {len(rejected)} below quality threshold)"
+        )
+        
+        return kept, stats
+        
+    except Exception as e:
+        _highlight_logger.warning(f"[llm_filter] Error: {e}, keeping all candidates")
+        return candidates, {"skipped": True, "reason": str(e)}
 
 
 def compute_llm_semantic_scores(
@@ -640,12 +1042,22 @@ def compute_llm_semantic_scores(
         response = llm_complete(prompt)
         elapsed = _t.time() - start
         
-        _highlight_logger.info(f"LLM responded in {elapsed:.1f}s ({len(response)} chars)")
-        scores = _parse_llm_highlight_scores(response, len(candidates_to_score))
-        _highlight_logger.info(f"LLM returned semantic scores for {len(scores)} candidates")
+        # Coerce response to text (handles string, dict, list, OpenAI-style payloads)
+        response_text = _coerce_llm_response_to_text(response)
+        
+        _highlight_logger.info(f"LLM responded in {elapsed:.1f}s ({len(response_text)} chars)")
+        _highlight_logger.debug(f"LLM raw response type: {type(response)}, text preview: {response_text[:500]}...")
+        
+        scores = _parse_llm_highlight_scores(response_text, len(candidates_to_score))
+        
+        if not scores:
+            _highlight_logger.warning(f"LLM response could not be parsed into scores. Response preview: {response_text[:1000]}")
+        else:
+            _highlight_logger.info(f"LLM returned semantic scores for {len(scores)} candidates")
+        
         return scores
     except Exception as e:
-        _highlight_logger.warning(f"LLM semantic scoring failed: {e}")
+        _highlight_logger.warning(f"LLM semantic scoring failed: {e}", exc_info=True)
         return {}
 
 
@@ -1873,16 +2285,19 @@ def compute_highlights_candidates(
     if on_progress:
         on_progress(0.65)
     
-    # LLM Semantic Scoring (optional)
+    # LLM Semantic Scoring (optional, controlled by config)
     llm_semantic_used = False
     llm_semantic_scores: Dict[int, Dict[str, Any]] = {}
+    llm_semantic_enabled = bool(highlights_cfg.get("llm_semantic_enabled", True))
     
-    if llm_complete is None:
+    if not llm_semantic_enabled:
+        _highlight_logger.info("[highlights_candidates] LLM semantic scoring disabled in config (llm_semantic_enabled=false)")
+    elif llm_complete is None:
         _highlight_logger.info("[highlights_candidates] LLM semantic scoring skipped (no llm_complete function provided)")
     elif not candidates:
         _highlight_logger.info("[highlights_candidates] LLM semantic scoring skipped (no candidates)")
     
-    if llm_complete is not None and candidates:
+    if llm_semantic_enabled and llm_complete is not None and candidates:
         if on_progress:
             on_progress(0.70)
         
@@ -1920,7 +2335,55 @@ def compute_highlights_candidates(
             _highlight_logger.warning(f"LLM semantic scoring failed: {e}")
     
     if on_progress:
-        on_progress(0.90)
+        on_progress(0.85)
+    
+    # LLM Quality Filter (optional, more aggressive than semantic scoring)
+    llm_filter_used = False
+    llm_filter_stats: Dict[str, Any] = {}
+    
+    llm_filter_enabled = bool(highlights_cfg.get("llm_filter_enabled", True))
+    
+    if not llm_filter_enabled:
+        _highlight_logger.info("[highlights_candidates] LLM quality filter disabled in config (llm_filter_enabled=false)")
+    elif llm_complete is None:
+        _highlight_logger.info("[highlights_candidates] LLM quality filter skipped (no llm_complete function provided)")
+    elif not candidates:
+        _highlight_logger.info("[highlights_candidates] LLM quality filter skipped (no candidates)")
+    
+    if llm_filter_enabled and llm_complete is not None and candidates:
+        if on_progress:
+            on_progress(0.87)
+        
+        try:
+            min_quality = int(highlights_cfg.get("llm_filter_min_quality", 5))
+            max_keep = highlights_cfg.get("llm_filter_max_keep")  # None = no limit
+            if max_keep is not None:
+                max_keep = int(max_keep)
+            content_type = str(highlights_cfg.get("content_type", "gaming"))
+            
+            candidates, llm_filter_stats = compute_llm_filter(
+                candidates=candidates,
+                proj=proj,
+                llm_complete=llm_complete,
+                min_quality_score=min_quality,
+                max_keep=max_keep,
+                content_type=content_type,
+            )
+            
+            if not llm_filter_stats.get("skipped", False):
+                llm_filter_used = True
+                _highlight_logger.info(
+                    f"[highlights_candidates] LLM filter: kept {llm_filter_stats.get('kept', 0)}/{llm_filter_stats.get('total_input', 0)} candidates"
+                )
+        except Exception as e:
+            _highlight_logger.warning(f"LLM quality filter failed: {e}")
+    elif llm_complete is None:
+        _highlight_logger.info("[highlights_candidates] LLM quality filter skipped (no llm_complete function)")
+    elif not llm_filter_enabled:
+        _highlight_logger.info("[highlights_candidates] LLM quality filter disabled in config")
+    
+    if on_progress:
+        on_progress(0.92)
     
     # Build and save payload
     payload: Dict[str, Any] = {
@@ -1928,6 +2391,7 @@ def compute_highlights_candidates(
         "signals_used": {
             "boundary_graph": boundary_graph is not None,
             "llm_semantic": llm_semantic_used,
+            "llm_filter": llm_filter_used,
         },
         "filtering": {
             "max_overlap_ratio": max_overlap_ratio,
@@ -1936,6 +2400,7 @@ def compute_highlights_candidates(
             "candidates_before_filter": len(raw_candidates),
             "candidates_after_filter": len(candidates),
         },
+        "llm_filter_stats": llm_filter_stats if llm_filter_used else None,
         "candidates": candidates,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }

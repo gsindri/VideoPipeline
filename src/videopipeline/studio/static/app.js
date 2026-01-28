@@ -1441,10 +1441,11 @@ function renderPipelineStatus() {
         const h = analysis.highlights;
         if (hasRun(h)) {
           const count = h.candidates?.length || 0;
-          const llmUsed = h.signals_used?.llm_semantic ? ' + LLM' : '';
+          const llmScoring = h.signals_used?.llm_semantic ? ' + LLM' : '';
+          const llmFilter = h.signals_used?.llm_filter ? ' (filtered)' : '';
           const speechUsed = h.signals_used?.speech ? ' + speech' : '';
           const reactionUsed = h.signals_used?.reaction ? ' + reaction' : '';
-          const extras = speechUsed + reactionUsed + llmUsed;
+          const extras = speechUsed + reactionUsed + llmScoring + llmFilter;
           const timeStr = h.elapsed_seconds ? ` • ${formatPipelineTime(h.elapsed_seconds)}` : '';
           return { state: 'done', detail: `${count} candidates${extras}${timeStr}` };
         }
@@ -1645,6 +1646,40 @@ function renderPipelineStatus() {
   
   html += '</div>';
   
+  // AI Enhancement section - show when highlights exist but LLM wasn't fully used
+  const highlights = analysis.highlights;
+  const hasHighlights = highlights?.candidates?.length > 0;
+  const llmScoringUsed = highlights?.signals_used?.llm_semantic;
+  const llmFilterUsed = highlights?.signals_used?.llm_filter;
+  const showAISection = hasHighlights && (!llmScoringUsed || !llmFilterUsed);
+  
+  if (showAISection) {
+    html += `
+      <div style="margin-top:16px;padding:12px;background:linear-gradient(135deg, rgba(139,92,246,0.15), rgba(59,130,246,0.15));border:1px solid rgba(139,92,246,0.3);border-radius:8px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+          <span style="font-size:16px">🤖</span>
+          <span style="color:#a78bfa;font-weight:600">AI Enhancement</span>
+        </div>
+        <div style="color:#888;font-size:11px;margin-bottom:10px">
+          ${!llmScoringUsed ? 'LLM semantic scoring not applied. ' : ''}
+          ${!llmFilterUsed ? 'LLM quality filter not applied.' : ''}
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          ${!llmScoringUsed ? `
+            <button id="pipelineLlmScoring" style="padding:6px 12px;background:#eab308;color:#000;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:4px" title="Apply LLM semantic scoring to existing candidates">
+              🎯 Apply LLM Scoring
+            </button>
+          ` : ''}
+          ${!llmFilterUsed ? `
+            <button id="pipelineLlmFilter" style="padding:6px 12px;background:#ef4444;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:4px" title="Filter out low-quality candidates using LLM">
+              🗑️ Filter Low Quality
+            </button>
+          ` : ''}
+        </div>
+      </div>
+    `;
+  }
+  
   // Summary line
   const total = stages.length;
   const summaryColor = doneCount === total ? '#22c55e' : (doneCount > 0 ? '#eab308' : '#666');
@@ -1656,6 +1691,55 @@ function renderPipelineStatus() {
   ` + html;
   
   container.innerHTML = html;
+  
+  // Wire up AI Enhancement button handlers
+  const llmScoringBtn = container.querySelector('#pipelineLlmScoring');
+  if (llmScoringBtn) {
+    llmScoringBtn.addEventListener('click', async () => {
+      llmScoringBtn.disabled = true;
+      llmScoringBtn.innerHTML = '⏳ Running...';
+      try {
+        const resp = await fetch(`/api/analyze/llm_semantic?project_id=${project.id}`, { method: 'POST' });
+        const data = await resp.json();
+        if (data.job_id) {
+          pollJobStatus(data.job_id, 'LLM Scoring', async () => {
+            await loadProjectData(project.id);
+            renderPipelineStatus();
+            renderCandidateList();
+          });
+        } else if (data.error) {
+          alert('Error: ' + data.error);
+        }
+      } catch (e) {
+        alert('Error applying LLM scoring: ' + e.message);
+      }
+    });
+  }
+  
+  const llmFilterBtn = container.querySelector('#pipelineLlmFilter');
+  if (llmFilterBtn) {
+    llmFilterBtn.addEventListener('click', async () => {
+      const count = highlights?.candidates?.length || 0;
+      if (!confirm(`Apply LLM quality filter to ${count} candidates?\n\nThis will score each candidate 1-10 and remove those below quality threshold.`)) return;
+      llmFilterBtn.disabled = true;
+      llmFilterBtn.innerHTML = '⏳ Filtering...';
+      try {
+        const resp = await fetch(`/api/analyze/llm_filter?project_id=${project.id}`, { method: 'POST' });
+        const data = await resp.json();
+        if (data.job_id) {
+          pollJobStatus(data.job_id, 'LLM Filter', async () => {
+            await loadProjectData(project.id);
+            renderPipelineStatus();
+            renderCandidateList();
+          });
+        } else if (data.error) {
+          alert('Error: ' + data.error);
+        }
+      } catch (e) {
+        alert('Error applying LLM filter: ' + e.message);
+      }
+    });
+  }
   
   // Wire up click handlers for completed stages
   container.querySelectorAll('.pipeline-stage[data-clickable="true"]').forEach(el => {
@@ -1794,12 +1878,12 @@ async function showTaskDetailsModal(taskId) {
       }
     }
     
-    // Add "Apply LLM Scoring" button for highlights task when llm_semantic is false
-    const showLlmButton = taskId === 'highlights' && 
+    // Add "Apply LLM Scoring" button for highlights task when llm_semantic is not true
+    const showLlmScoringBtn = taskId === 'highlights' && 
       data.summary?.signals_used && 
-      data.summary.signals_used.llm_semantic === false;
+      !data.summary.signals_used.llm_semantic;
     
-    if (showLlmButton) {
+    if (showLlmScoringBtn) {
       contentHtml += `
         <div style="background:rgba(234,179,8,0.1);border:1px solid rgba(234,179,8,0.3);padding:12px;border-radius:6px;margin-bottom:12px;">
           <div style="display:flex;align-items:center;gap:12px;">
@@ -1809,7 +1893,28 @@ async function showTaskDetailsModal(taskId) {
             </button>
           </div>
           <div style="color:#888;font-size:12px;margin-top:6px;">
-            This will use AI to re-rank candidates based on content quality.
+            This will use AI to re-rank candidates based on content quality (30% weight).
+          </div>
+        </div>
+      `;
+    }
+    
+    // Add "Apply LLM Filter" button when llm_filter is not true (more aggressive than scoring)
+    const showLlmFilterBtn = taskId === 'highlights' && 
+      data.summary?.signals_used && 
+      !data.summary.signals_used.llm_filter;
+    
+    if (showLlmFilterBtn) {
+      contentHtml += `
+        <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);padding:12px;border-radius:6px;margin-bottom:12px;">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <span style="color:#ef4444;">⚠️ LLM quality filter was not applied</span>
+            <button class="run-llm-filter" style="background:#ef4444;color:#fff;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-weight:600;">
+              🗑️ Filter Low Quality
+            </button>
+          </div>
+          <div style="color:#888;font-size:12px;margin-top:6px;">
+            This will use AI to REMOVE boring candidates, keeping only genuinely good clips.
           </div>
         </div>
       `;
@@ -1850,6 +1955,36 @@ async function showTaskDetailsModal(taskId) {
           llmBtn.disabled = false;
           llmBtn.textContent = '🤖 Apply LLM Scoring';
           alert(`Failed to start LLM scoring: ${e.message}`);
+        }
+      };
+    }
+    
+    // Handle LLM filter button click
+    const filterBtn = modal.querySelector('.run-llm-filter');
+    if (filterBtn) {
+      filterBtn.onclick = async () => {
+        filterBtn.disabled = true;
+        filterBtn.textContent = '⏳ Filtering...';
+        try {
+          const resp = await apiJson('POST', '/api/analyze/llm_filter', {});
+          if (resp.job_id) {
+            overlay.remove();
+            pollJobStatus(resp.job_id, (job) => {
+              const result = job.result || {};
+              const kept = result.kept || '?';
+              const rejected = result.rejected || '?';
+              alert(`✅ LLM filter complete!\n\nKept: ${kept} candidates\nRejected: ${rejected} low-quality candidates`);
+              if (typeof refreshProject === 'function') {
+                refreshProject();
+              }
+            }, (err) => {
+              alert(`❌ LLM filter failed: ${err}`);
+            });
+          }
+        } catch (e) {
+          filterBtn.disabled = false;
+          filterBtn.textContent = '🗑️ Filter Low Quality';
+          alert(`Failed to start LLM filter: ${e.message}`);
         }
       };
     }

@@ -927,66 +927,35 @@ def create_app(
         
         Returns videos sorted by most recently modified, with project status.
         Includes videos from both downloads folder AND project folders.
+        
+        De-duplication: If a video in downloads has a project, we only show the
+        project entry (not the download entry separately) to avoid confusion.
         """
         from ..ingest.ytdlp_runner import _default_downloads_dir
         from ..project import default_projects_root
         
         # Build lookup of video_path -> project info
         projects_by_path: Dict[str, Dict[str, Any]] = {}
+        projects_by_url: Dict[str, Dict[str, Any]] = {}  # Also track by URL for better dedup
         projects = list_recent_projects(limit=100)
         for p in projects:
             vp = p.get("video_path", "")
             if vp:
                 # Normalize path for comparison
                 projects_by_path[str(Path(vp).resolve())] = p
+            # Also track by source URL if available
+            url = p.get("source_url", "")
+            if url:
+                projects_by_url[url] = p
         
         # Scan downloads directory
         downloads_dir = _default_downloads_dir()
         video_exts = {".mp4", ".mkv", ".webm", ".m4v", ".avi", ".mov", ".ts"}
         videos: List[Dict[str, Any]] = []
         seen_paths: set = set()
+        seen_urls: set = set()  # Track URLs we've already added via project
         
-        if downloads_dir.exists():
-            for ext in video_exts:
-                for f in downloads_dir.glob(f"*{ext}"):
-                    resolved = str(f.resolve())
-                    if resolved in seen_paths:
-                        continue
-                    seen_paths.add(resolved)
-                    
-                    try:
-                        st = f.stat()
-                        info_json = f.with_suffix(".info.json")
-                        info = {}
-                        if info_json.exists():
-                            try:
-                                info = json.loads(info_json.read_text(encoding="utf-8"))
-                            except Exception:
-                                pass
-                        
-                        # Check if this video has a project
-                        project_info = projects_by_path.get(resolved)
-                        
-                        videos.append({
-                            "path": str(f),
-                            "filename": f.name,
-                            "title": info.get("title", f.stem),
-                            "size_bytes": st.st_size,
-                            "mtime": st.st_mtime,
-                            "duration_seconds": info.get("duration", project_info.get("duration_seconds", 0) if project_info else 0),
-                            "url": info.get("webpage_url", ""),
-                            "extractor": info.get("extractor", ""),
-                            # Project info
-                            "has_project": project_info is not None,
-                            "project_id": project_info.get("project_id") if project_info else None,
-                            "selections_count": project_info.get("selections_count", 0) if project_info else 0,
-                            "exports_count": project_info.get("exports_count", 0) if project_info else 0,
-                            "favorite": project_info.get("favorite", False) if project_info else False,
-                        })
-                    except Exception:
-                        continue
-        
-        # Also scan project folders for videos (self-contained projects)
+        # First pass: add all project videos (these take priority)
         projects_root = default_projects_root()
         if projects_root.exists():
             for proj_dir in projects_root.iterdir():
@@ -1014,6 +983,11 @@ def create_app(
                                     pass
                             
                             video_info = proj_data.get("video", {})
+                            source_url = proj_data.get("source_url", "")
+                            
+                            # Track URL to avoid duplicate from downloads
+                            if source_url:
+                                seen_urls.add(source_url)
                             
                             videos.append({
                                 "path": str(f),
@@ -1022,7 +996,7 @@ def create_app(
                                 "size_bytes": st.st_size,
                                 "mtime": st.st_mtime,
                                 "duration_seconds": video_info.get("duration_seconds", 0),
-                                "url": proj_data.get("source_url", ""),
+                                "url": source_url,
                                 "extractor": proj_data.get("extractor", ""),
                                 # Project info - always has project since it's in project folder
                                 "has_project": True,
@@ -1033,6 +1007,56 @@ def create_app(
                             })
                         except Exception:
                             continue
+        
+        # Second pass: add downloads that DON'T have projects yet
+        if downloads_dir.exists():
+            for ext in video_exts:
+                for f in downloads_dir.glob(f"*{ext}"):
+                    resolved = str(f.resolve())
+                    if resolved in seen_paths:
+                        continue
+                    
+                    try:
+                        st = f.stat()
+                        info_json = f.with_suffix(".info.json")
+                        info = {}
+                        if info_json.exists():
+                            try:
+                                info = json.loads(info_json.read_text(encoding="utf-8"))
+                            except Exception:
+                                pass
+                        
+                        # Check if this video has a project (by path or URL)
+                        project_info = projects_by_path.get(resolved)
+                        video_url = info.get("webpage_url", "")
+                        
+                        # Skip if we already added this video via its project
+                        if video_url and video_url in seen_urls:
+                            continue
+                        if project_info:
+                            # Also skip - project entry was already added
+                            continue
+                        
+                        seen_paths.add(resolved)
+                        
+                        videos.append({
+                            "path": str(f),
+                            "filename": f.name,
+                            "title": info.get("title", f.stem),
+                            "size_bytes": st.st_size,
+                            "mtime": st.st_mtime,
+                            "duration_seconds": info.get("duration_seconds", 0),
+                            "url": video_url,
+                            "extractor": info.get("extractor", ""),
+                            # No project yet
+                            "has_project": False,
+                            "project_id": None,
+                            "selections_count": 0,
+                            "exports_count": 0,
+                            "favorite": False,
+                        })
+                    except Exception:
+                        continue
         
         # Also list orphaned projects (projects without video files)
         # These are incomplete/failed downloads that left analysis artifacts
@@ -2381,9 +2405,13 @@ def create_app(
                 JOB_MANAGER._set(job, progress=frac, message="analyzing highlights")  # type: ignore[attr-defined]
 
             try:
-                # Set up LLM client for semantic scoring
+                # Set up LLM client for semantic scoring and/or filtering
                 llm_complete_fn = None
-                if ai_cfg.get("enabled", True) and highlights_cfg.get("llm_semantic_enabled", True):
+                llm_semantic_enabled = highlights_cfg.get("llm_semantic_enabled", True)
+                llm_filter_enabled = highlights_cfg.get("llm_filter_enabled", True)
+                llm_needed = llm_semantic_enabled or llm_filter_enabled
+                
+                if ai_cfg.get("enabled", True) and llm_needed:
                     llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
                 
                 # Use DAG runner for full analysis with proper dependency ordering
@@ -2481,7 +2509,10 @@ def create_app(
                 JOB_MANAGER._set(job, progress=0.8, message="Applying scores and re-ranking...")
                 
                 if not llm_semantic_scores:
-                    raise ValueError("LLM returned no scores")
+                    # LLM didn't return scores - log warning but don't fail
+                    log.warning("[llm_semantic] LLM returned no scores - check LLM server logs")
+                    JOB_MANAGER._set(job, status="failed", message="LLM returned no scores. Check if LLM server is responding correctly.")
+                    return
                 
                 # Apply semantic scores
                 semantic_weight = float(highlights_cfg.get("llm_semantic_weight", 0.3))
@@ -2541,6 +2572,132 @@ def create_app(
                 
             except Exception as e:
                 log.error(f"[llm_semantic] Error: {e}", exc_info=True)
+                JOB_MANAGER._set(job, status="failed", message=f"{type(e).__name__}: {e}")
+        
+        import threading
+        threading.Thread(target=runner, daemon=True).start()
+        return JSONResponse({"job_id": job.id})
+
+    @app.post("/api/analyze/llm_filter")
+    def api_analyze_llm_filter(body: Dict[str, Any] = Body(default={})):  # type: ignore[valid-type]
+        """Run LLM quality filter on existing highlight candidates.
+        
+        This is more aggressive than semantic scoring - it actually REMOVES
+        candidates that the LLM determines have boring/uninteresting content,
+        even if they had high signal scores.
+        
+        Use this when you have too many mediocre candidates and want the LLM
+        to filter down to only the genuinely good ones.
+        """
+        proj = ctx.require_project()
+        analysis_cfg = ctx.profile.get("analysis", {})
+        ai_cfg = ctx.profile.get("ai", {}).get("director", {})
+        body = body or {}
+        
+        highlights_cfg = {**analysis_cfg.get("highlights", {}), **(body.get("highlights") or {})}
+        ai_cfg = {**ai_cfg, **(body.get("ai") or {})}
+        
+        job = JOB_MANAGER.create("analyze_llm_filter")
+        
+        def runner() -> None:
+            import json
+            import logging
+            from datetime import datetime, timezone
+            
+            log = logging.getLogger("videopipeline.studio")
+            JOB_MANAGER._set(job, status="running", progress=0.0, message="Loading candidates...")
+            
+            try:
+                # Check for existing candidates
+                highlights_json_path = proj.analysis_dir / "highlights.json"
+                if not highlights_json_path.exists():
+                    raise ValueError("No highlights.json found - run highlights analysis first")
+                
+                payload = json.loads(highlights_json_path.read_text(encoding="utf-8"))
+                candidates = payload.get("candidates", [])
+                
+                if not candidates:
+                    raise ValueError("No candidates found in highlights.json")
+                
+                original_count = len(candidates)
+                JOB_MANAGER._set(job, progress=0.1, message=f"Found {original_count} candidates, starting LLM filter...")
+                
+                # Get LLM function
+                llm_complete = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
+                if llm_complete is None:
+                    raise ValueError("LLM not available - check server configuration")
+                
+                JOB_MANAGER._set(job, progress=0.2, message="LLM connected, filtering candidates...")
+                
+                # Run quality filter
+                from ..analysis_highlights import compute_llm_filter
+                
+                min_quality = int(highlights_cfg.get("llm_filter_min_quality", 5))
+                max_keep = highlights_cfg.get("llm_filter_max_keep")
+                if max_keep is not None:
+                    max_keep = int(max_keep)
+                content_type = str(highlights_cfg.get("content_type", "gaming"))
+                
+                filtered_candidates, filter_stats = compute_llm_filter(
+                    candidates=candidates,
+                    proj=proj,
+                    llm_complete=llm_complete,
+                    min_quality_score=min_quality,
+                    max_keep=max_keep,
+                    content_type=content_type,
+                )
+                
+                JOB_MANAGER._set(job, progress=0.8, message="Saving filtered results...")
+                
+                if filter_stats.get("skipped"):
+                    # Filter was skipped - log warning but don't fail hard
+                    reason = filter_stats.get('reason', 'unknown')
+                    log.warning(f"[llm_filter] Filter skipped: {reason}")
+                    JOB_MANAGER._set(job, status="failed", message=f"LLM filter skipped: {reason}. Check LLM server logs.")
+                    return
+                
+                # Update payload
+                payload["signals_used"]["llm_filter"] = True
+                payload["candidates"] = filtered_candidates
+                payload["llm_filter_stats"] = filter_stats
+                payload["llm_filter_updated_at"] = datetime.now(timezone.utc).isoformat()
+                
+                # Save updated highlights.json
+                highlights_json_path.write_text(
+                    json.dumps(payload, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                
+                # Update project.json
+                from ..project import update_project_json
+                def _upd(d: Dict[str, Any]) -> None:
+                    d.setdefault("analysis", {})
+                    if "highlights" in d["analysis"]:
+                        d["analysis"]["highlights"]["signals_used"]["llm_filter"] = True
+                        d["analysis"]["highlights"]["candidates"] = filtered_candidates
+                        d["analysis"]["highlights"]["llm_filter_stats"] = filter_stats
+                
+                update_project_json(proj, _upd)
+                
+                kept = filter_stats.get("kept", len(filtered_candidates))
+                rejected = filter_stats.get("rejected", 0)
+                
+                log.info(f"[llm_filter] Kept {kept}/{original_count} candidates (rejected {rejected})")
+                JOB_MANAGER._set(
+                    job, 
+                    status="succeeded", 
+                    progress=1.0, 
+                    message="done",
+                    result={
+                        "original_count": original_count,
+                        "kept": kept,
+                        "rejected": rejected,
+                        "min_quality_threshold": min_quality,
+                    }
+                )
+                
+            except Exception as e:
+                log.error(f"[llm_filter] Error: {e}", exc_info=True)
                 JOB_MANAGER._set(job, status="failed", message=f"{type(e).__name__}: {e}")
         
         import threading
@@ -3450,17 +3607,21 @@ def create_app(
             current_stage = {"name": "highlights", "started_at": highlights_start}
             JOB_MANAGER._set(job, progress=0.40, message="Stage 2: Computing highlight scores (with speech+reaction)...", result=update_timing_result())
             
-            # Set up LLM client for semantic scoring (optional enhancement)
+            # Set up LLM client for semantic scoring and/or filtering (optional enhancement)
             llm_complete_fn_highlights = None
-            if ai_cfg.get("enabled", True) and highlights_cfg.get("llm_semantic_enabled", True):
-                log.info(f"[analyze_full] Attempting to get LLM function for semantic scoring...")
+            llm_semantic_enabled = highlights_cfg.get("llm_semantic_enabled", True)
+            llm_filter_enabled = highlights_cfg.get("llm_filter_enabled", True)
+            llm_needed = llm_semantic_enabled or llm_filter_enabled
+            
+            if ai_cfg.get("enabled", True) and llm_needed:
+                log.info(f"[analyze_full] Attempting to get LLM function (semantic={llm_semantic_enabled}, filter={llm_filter_enabled})...")
                 llm_complete_fn_highlights = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
                 if llm_complete_fn_highlights:
                     log.info(f"[analyze_full] LLM function obtained successfully")
                 else:
                     log.warning(f"[analyze_full] LLM function not available (server not running?)")
             else:
-                log.info(f"[analyze_full] LLM semantic scoring disabled in config (ai.enabled={ai_cfg.get('enabled', True)}, highlights.llm_semantic_enabled={highlights_cfg.get('llm_semantic_enabled', True)})")
+                log.info(f"[analyze_full] LLM not needed (ai.enabled={ai_cfg.get('enabled', True)}, semantic={llm_semantic_enabled}, filter={llm_filter_enabled})")
             
             try:
                 def on_highlights_progress(p: float) -> None:
