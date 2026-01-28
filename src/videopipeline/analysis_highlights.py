@@ -767,12 +767,12 @@ KEEP if the transcript shows:
 - Strong emotional moments
 
 Output JSON object with "results" array:
-{
+{{
   "results": [
-    {"rank": 1, "decision": "keep", "quality_score": 8, "reason": "brief reason"},
-    {"rank": 2, "decision": "reject", "quality_score": 3, "reason": "brief reason"}
+    {{"rank": 1, "decision": "keep", "quality_score": 8, "reason": "brief reason"}},
+    {{"rank": 2, "decision": "reject", "quality_score": 3, "reason": "brief reason"}}
   ]
-}
+}}
 
 quality_score is 1-10 (10 = amazing clip, 1 = terrible).
 Be strict! It's better to have fewer great clips than many mediocre ones.
