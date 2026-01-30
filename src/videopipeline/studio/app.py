@@ -1216,6 +1216,8 @@ def create_app(
         
         # Parse whisper verbose option (defaults to True)
         whisper_verbose = bool(opts.get("whisper_verbose", True))
+        # Parse diarize option (defaults to False)
+        diarize_enabled = bool(opts.get("diarize", False))
 
         job = JOB_MANAGER.create("download_url")
 
@@ -1253,6 +1255,7 @@ def create_app(
             # Track early audio analysis status (initialized early so on_video_progress can access)
             audio_rms_status = {"status": "pending", "progress": 0}
             audio_events_status = {"status": "pending", "progress": 0}
+            diarization_status = {"status": "pending", "progress": 0}
 
             def on_video_progress(frac: float, msg: str) -> None:
                 # Check for cancellation
@@ -1311,10 +1314,22 @@ def create_app(
                 elif events_stat == "failed":
                     audio_events_info = " | 🎭 Events: ✗"
                 
+                # Build diarization info for message
+                diarization_info = ""
+                diar_stat = diarization_status.get("status", "pending")
+                if diar_stat == "analyzing":
+                    dp = diarization_status.get("progress", 0)
+                    diarization_info = f" | 🗣️ Speakers: {int(dp * 100)}%"
+                elif diar_stat == "complete":
+                    speakers = diarization_status.get("speakers", [])
+                    diarization_info = f" | 🗣️ Speakers: ✓ ({len(speakers)})"
+                elif diar_stat == "failed":
+                    diarization_info = " | 🗣️ Speakers: ✗"
+                
                 JOB_MANAGER._set(
                     job, 
                     progress=frac * 0.9, 
-                    message=f"{msg}{chat_info}{transcript_info}{audio_rms_info}{audio_events_info}",
+                    message=f"{msg}{chat_info}{transcript_info}{audio_rms_info}{audio_events_info}{diarization_info}",
                     result={
                         "video_status": "downloading",
                         "video_progress": frac,
@@ -1332,6 +1347,9 @@ def create_app(
                         "audio_rms_progress": audio_rms_status.get("progress", 0),
                         "audio_events_status": audio_events_status.get("status", "pending"),
                         "audio_events_progress": audio_events_status.get("progress", 0),
+                        "diarization_status": diarization_status.get("status", "pending"),
+                        "diarization_progress": diarization_status.get("progress", 0),
+                        "diarization_speakers": diarization_status.get("speakers", []),
                     }
                 )
 
@@ -1536,7 +1554,7 @@ def create_app(
             
             def run_early_transcription(audio_path: Path):
                 """Run transcription on downloaded audio while video downloads."""
-                nonlocal transcript_result, transcript_status
+                nonlocal transcript_result, transcript_status, diarization_status
                 import logging
                 log = logging.getLogger("videopipeline.studio")
                 
@@ -1544,6 +1562,9 @@ def create_app(
                     from ..analysis_transcript import TranscriptConfig, compute_transcript_analysis_from_audio
                     
                     speech_cfg = ctx.profile.get("analysis", {}).get("speech", {})
+                    # Use diarize from download options (UI checkbox) or fall back to profile
+                    should_diarize = diarize_enabled or bool(speech_cfg.get("diarize", False))
+                    
                     transcript_config = TranscriptConfig(
                         backend=str(speech_cfg.get("backend", "auto")),
                         model_size=str(speech_cfg.get("model_size", "small.en")),
@@ -1558,10 +1579,16 @@ def create_app(
                         n_processors=int(speech_cfg.get("n_processors", 1)),
                         strict=bool(speech_cfg.get("strict", False)),
                         verbose=whisper_verbose,  # From download options
+                        diarize=should_diarize,
+                        diarize_min_speakers=speech_cfg.get("diarize_min_speakers"),
+                        diarize_max_speakers=speech_cfg.get("diarize_max_speakers"),
+                        hf_token=speech_cfg.get("hf_token"),
                     )
                     
-                    log.info(f"[TRANSCRIPT] Starting early transcription from audio...")
+                    log.info(f"[TRANSCRIPT] Starting early transcription from audio... (diarize={should_diarize})")
                     transcript_status["status"] = "transcribing"
+                    if should_diarize:
+                        diarization_status["status"] = "pending"
                     
                     def on_transcript_progress(frac: float) -> None:
                         # Check for cancellation
@@ -1579,6 +1606,18 @@ def create_app(
                     transcript_status["status"] = "complete"
                     transcript_status["progress"] = 1.0
                     transcript_result = {"status": "success", "data": result}
+                    
+                    # Update diarization status from result
+                    if result.get("diarization_used"):
+                        diarization_status["status"] = "complete"
+                        diarization_status["progress"] = 1.0
+                        diarization_status["speakers"] = result.get("speakers", [])
+                        log.info(f"[TRANSCRIPT] Diarization complete: {len(result.get('speakers', []))} speakers")
+                    elif should_diarize:
+                        # Diarization was requested but didn't run (likely pyannote not installed)
+                        diarization_status["status"] = "failed"
+                        diarization_status["progress"] = 0
+                    
                     log.info(f"[TRANSCRIPT] Early transcription complete: {result.get('segment_count', 0)} segments")
                     return result
                     
@@ -1591,6 +1630,8 @@ def create_app(
                     log.warning(f"[TRANSCRIPT] Early transcription failed: {e}")
                     transcript_status["status"] = "failed"
                     transcript_result = {"status": "failed", "error": str(e)}
+                    if should_diarize:
+                        diarization_status["status"] = "failed"
                     return None
             
             # Track early project for DAG-based analysis
@@ -1744,9 +1785,17 @@ def create_app(
                     if task_results.get("audio_features") == "completed":
                         audio_rms_status["status"] = "complete"
                         audio_rms_status["progress"] = 1.0
+                    elif task_results.get("audio_features") == "skipped":
+                        log.info(f"[DAG] Audio features task skipped - already exists (cached)")
+                        audio_rms_status["status"] = "complete"
+                        audio_rms_status["progress"] = 1.0
                     
                     if analysis_cfg.get("audio_events", {}).get("enabled", True):
                         if task_results.get("audio_events") == "completed":
+                            audio_events_status["status"] = "complete"
+                            audio_events_status["progress"] = 1.0
+                        elif task_results.get("audio_events") == "skipped":
+                            log.info(f"[DAG] Audio events task skipped - already exists (cached)")
                             audio_events_status["status"] = "complete"
                             audio_events_status["progress"] = 1.0
                     
@@ -2499,11 +2548,13 @@ def create_app(
                 # Run semantic scoring
                 from ..analysis_highlights import compute_llm_semantic_scores
                 
+                content_type = str(highlights_cfg.get("content_type", "gaming"))
                 llm_semantic_scores = compute_llm_semantic_scores(
                     candidates=candidates,
                     proj=proj,
                     llm_complete=llm_complete,
                     max_candidates=int(highlights_cfg.get("llm_max_candidates", 15)),
+                    content_type=content_type,
                 )
                 
                 JOB_MANAGER._set(job, progress=0.8, message="Applying scores and re-ranking...")
@@ -2786,6 +2837,10 @@ def create_app(
                         threads=int(speech_cfg.get("threads", 0)),
                         n_processors=int(speech_cfg.get("n_processors", 1)),
                         strict=bool(speech_cfg.get("strict", False)),
+                        diarize=bool(speech_cfg.get("diarize", False)),
+                        diarize_min_speakers=speech_cfg.get("diarize_min_speakers"),
+                        diarize_max_speakers=speech_cfg.get("diarize_max_speakers"),
+                        hf_token=speech_cfg.get("hf_token"),
                     )
                     
                     def on_transcript_progress(frac: float) -> None:
@@ -3261,6 +3316,10 @@ def create_app(
                     threads=int(speech_cfg.get("threads", 0)),
                     n_processors=int(speech_cfg.get("n_processors", 1)),
                     strict=bool(speech_cfg.get("strict", False)),
+                    diarize=bool(speech_cfg.get("diarize", False)),
+                    diarize_min_speakers=speech_cfg.get("diarize_min_speakers"),
+                    diarize_max_speakers=speech_cfg.get("diarize_max_speakers"),
+                    hf_token=speech_cfg.get("hf_token"),
                 )
                 compute_transcript_analysis(proj, cfg=transcript_config, on_progress=transcript_progress)
                 return ("transcript", False)  # computed

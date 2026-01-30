@@ -747,6 +747,7 @@ async function startUrlDownload(url) {
     speed_mode: $('#dlSpeedMode')?.value ?? 'auto',
     quality_cap: $('#dlQualityCap')?.value ?? 'source',
     whisper_verbose: $('#dlWhisperVerbose')?.checked ?? true,
+    diarize: $('#diarizeEnabled')?.checked ?? false,
   };
 
   try {
@@ -1287,6 +1288,65 @@ function updateParallelTasks(tasksEl, job) {
     eventsLabel.textContent = 'Audio Events waiting...';
     eventsPctEl.textContent = '';
     eventsProgress.style.display = 'none';
+  }
+  
+  // Get or create Diarization row (only show if diarization is being used)
+  const diarStatus = job.result?.diarization_status;
+  const diarPct = job.result?.diarization_progress || 0;
+  const diarSpeakers = job.result?.diarization_speakers || [];
+  
+  let diarRow = tasksEl.querySelector('[data-task="diarization"]');
+  if (diarStatus && diarStatus !== 'pending') {
+    if (!diarRow) {
+      diarRow = document.createElement('div');
+      diarRow.className = 'task-row';
+      diarRow.dataset.task = 'diarization';
+      diarRow.style.cssText = 'padding:6px 8px;border-radius:6px;margin-bottom:6px';
+      diarRow.innerHTML = `
+        <div class="small" style="display:flex;align-items:center;gap:6px">
+          <span data-role="icon">🗣️</span>
+          <span style="flex:1" data-role="label">Speaker Diarization</span>
+          <span data-role="pct"></span>
+        </div>
+        <div class="progress" style="margin-top:4px;height:3px"><div data-role="bar" style="width:0%;transition:width 0.2s"></div></div>
+      `;
+      tasksEl.appendChild(diarRow);
+    }
+    
+    const diarIcon = diarRow.querySelector('[data-role="icon"]');
+    const diarLabel = diarRow.querySelector('[data-role="label"]');
+    const diarPctEl = diarRow.querySelector('[data-role="pct"]');
+    const diarBar = diarRow.querySelector('[data-role="bar"]');
+    const diarProgress = diarRow.querySelector('.progress');
+    
+    if (diarStatus === 'analyzing') {
+      diarRow.style.background = 'rgba(251,191,36,0.1)';
+      diarRow.querySelector('.small').style.color = '#fbbf24';
+      diarIcon.textContent = '🗣️';
+      diarLabel.textContent = 'Speaker Diarization';
+      const diarPctDisplay = Math.round(diarPct * 100);
+      diarPctEl.textContent = `${diarPctDisplay}%`;
+      diarBar.style.width = `${diarPctDisplay}%`;
+      diarBar.style.background = '#fbbf24';
+      diarProgress.style.display = '';
+    } else if (diarStatus === 'complete') {
+      diarRow.style.background = 'rgba(34,197,94,0.1)';
+      diarRow.querySelector('.small').style.color = '#22c55e';
+      diarIcon.textContent = '✓';
+      diarLabel.textContent = `Speakers identified (${diarSpeakers.length})`;
+      diarPctEl.textContent = '';
+      diarProgress.style.display = 'none';
+    } else if (diarStatus === 'failed') {
+      diarRow.style.background = 'rgba(239,68,68,0.1)';
+      diarRow.querySelector('.small').style.color = '#ef4444';
+      diarIcon.textContent = '⚠️';
+      diarLabel.textContent = 'Diarization failed';
+      diarPctEl.textContent = '';
+      diarProgress.style.display = 'none';
+    }
+  } else if (diarRow) {
+    // Remove diarization row if not being used
+    diarRow.remove();
   }
 }
 
@@ -3421,7 +3481,12 @@ function setupFacecamCanvas() {
 
 async function startAnalyzeJob() {
   $('#analysisStatus').textContent = 'Starting analysis...';
-  const res = await apiJson('POST', '/api/analyze/highlights', {});
+  const contentType = $('#contentType')?.value || 'gaming';
+  const res = await apiJson('POST', '/api/analyze/highlights', {
+    highlights: {
+      content_type: contentType
+    }
+  });
   const jobId = res.job_id;
   watchJob(jobId);
   $('#analysisStatus').textContent = `Analysis running (job ${jobId.slice(0,8)})...`;
@@ -3446,16 +3511,20 @@ async function startAnalyzeAudioEventsJob() {
 async function startAnalyzeFullJob() {
   $('#analysisStatus').textContent = 'Starting full parallel analysis (DAG)...';
   const motionMode = $('#motionWeightMode')?.value || 'low';
+  const contentType = $('#contentType')?.value || 'gaming';
   const whisperBackend = $('#whisperBackend')?.value || 'auto';
   const whisperVerbose = $('#whisperVerbose')?.checked || false;
+  const diarizeEnabled = $('#diarizeEnabled')?.checked || false;
   const res = await apiJson('POST', '/api/analyze/full', {
     highlights: {
-      motion_weight_mode: motionMode
+      motion_weight_mode: motionMode,
+      content_type: contentType
     },
     speech: {
       backend: whisperBackend,
       strict: whisperBackend !== 'auto',  // Strict mode when explicitly choosing a backend
-      verbose: whisperVerbose
+      verbose: whisperVerbose,
+      diarize: diarizeEnabled
     }
   });
   const jobId = res.job_id;
@@ -3467,11 +3536,13 @@ async function startAnalyzeSpeechJob() {
   $('#analysisStatus').textContent = 'Starting speech analysis (Whisper transcription)...';
   const whisperBackend = $('#whisperBackend')?.value || 'auto';
   const whisperVerbose = $('#whisperVerbose')?.checked || false;
+  const diarizeEnabled = $('#diarizeEnabled')?.checked || false;
   const res = await apiJson('POST', '/api/analyze/speech', {
     speech: {
       backend: whisperBackend,
       strict: whisperBackend !== 'auto',  // Strict mode when explicitly choosing a backend
-      verbose: whisperVerbose
+      verbose: whisperVerbose,
+      diarize: diarizeEnabled
     }
   });
   const jobId = res.job_id;

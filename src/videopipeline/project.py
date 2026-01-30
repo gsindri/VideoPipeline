@@ -145,6 +145,11 @@ class Project:
         return self.analysis_dir / "audio_features.npz"
 
     @property
+    def audio_vad_path(self) -> Path:
+        """Path to the computed voice activity detection (VAD) features."""
+        return self.analysis_dir / "audio_vad.npz"
+
+    @property
     def motion_features_path(self) -> Path:
         return self.analysis_dir / "motion_features.npz"
 

@@ -143,6 +143,16 @@
           <div class="panel-content">
           <div class="row">
             <button class="success" id="btnAnalyzeFull" title="Run all analysis stages in parallel (recommended)">⚡ Analyze (Full)</button>
+            <label title="What type of content is this? Helps the AI understand what makes a good clip.">Content:
+              <select id="contentType">
+                <option value="gaming" selected>Gaming/Streaming</option>
+                <option value="reaction">Reaction/Commentary</option>
+                <option value="podcast">Podcast/Interview</option>
+                <option value="irl">IRL/Vlog</option>
+                <option value="music">Music/Performance</option>
+                <option value="educational">Educational/Tutorial</option>
+              </select>
+            </label>
             <label title="How much motion (frame changes) affects highlight detection. 'Off' is best for podcasts/chatting, 'Low' is recommended for gaming.">Motion:
               <select id="motionWeightMode">
                 <option value="off" selected>Off</option>
@@ -158,6 +168,9 @@
                 <option value="whispercpp">whisper.cpp</option>
                 <option value="auto">auto</option>
               </select>
+            </label>
+            <label title="Identify different speakers in the transcript (requires pyannote-audio and HuggingFace token)">
+              <input type="checkbox" id="diarizeEnabled" /> Speakers
             </label>
             <label title="Print transcript to server console as it's transcribed (useful for monitoring progress)">
               <input type="checkbox" id="whisperVerbose" /> Verbose

@@ -8,6 +8,20 @@ analysis:
     pre_seconds: 8.0
     post_seconds: 22.0
     skip_start_seconds: 10.0
+  # Voice Activity Detection (VAD) - primary speech boundary signal
+  # More robust than silence detection for gaming/streaming content
+  vad:
+    enabled: true
+    sample_rate: 16000
+    hop_seconds: 0.5
+    threshold: 0.5
+    min_silence_duration_ms: 250
+    speech_pad_ms: 60
+    min_speech_duration_ms: 250
+    use_onnx: false
+    opset_version: 16
+    torch_threads: 1
+    device: cpu  # Use "cuda" if you have GPU
   motion:
     sample_fps: 3.0
     scale_width: 160
@@ -81,6 +95,12 @@ analysis:
     # Disable if you only need segment timing (faster, less overhead)
     word_timestamps: true
     
+    # Speaker diarization (who is talking):
+    #   Requires pyannote-audio: pip install pyannote-audio
+    #   Adds speaker labels (SPEAKER_00, SPEAKER_01, etc.) to transcript
+    diarize: true  # Enable via UI checkbox or set true here
+    # hf_token: Use HF_TOKEN environment variable instead (security best practice)
+    
     hop_seconds: 0.5
   reaction_audio:
     enabled: true
@@ -99,6 +119,17 @@ analysis:
       applause: 0.5
       screaming: 0.8
       shouting: 0.6
+  # Boundary graph configuration - controls clip start/end snapping
+  boundaries:
+    prefer_vad: true           # Use VAD speech boundaries (primary)
+    vad_boundary_score: 1.0    # Weight for VAD boundaries
+    prefer_silence: true       # Also use silence as fallback
+    prefer_sentences: true     # Snap to sentence boundaries
+    prefer_scene_cuts: true    # Snap to visual scene cuts
+    prefer_chapters: true      # Respect semantic chapter boundaries
+    prefer_chat_valleys: true  # Consider chat activity lulls
+    snap_tolerance_s: 1.0      # How close a boundary needs to be
+    chapter_boundary_score: 2.0  # Higher weight for chapter boundaries
   # Enrichment: extract hook/quote text for candidates (score fusion is in highlights)
   enrich:
     enabled: true

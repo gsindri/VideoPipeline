@@ -516,13 +516,132 @@ Score each candidate from 0.0 to 1.0 based on:
 Output ONLY valid JSON. No explanations outside the JSON."""
 
 
+# Content type descriptions for LLM prompt customization
+CONTENT_TYPE_GUIDANCE = {
+    "gaming": {
+        "description": "gaming/streaming content",
+        "high_value": [
+            "Genuine hype moments - real excitement, not just loud noises",
+            "Clutch plays with authentic reactions",
+            "Funny fails or unexpected moments",
+            "Rage moments that are entertaining (not just angry)",
+            "Victory celebrations with quotable phrases",
+            "Genuine surprise or shock at game events",
+        ],
+        "low_value": [
+            "Generic gameplay commentary ('okay let me just...')",
+            "Reading donations/chat without interesting reaction",
+            "Routine play-by-play that isn't exciting",
+            "Incomplete sentences or cut-off thoughts",
+            "Background noise without clear content",
+        ],
+    },
+    "reaction": {
+        "description": "reaction/commentary content",
+        "high_value": [
+            "Strong emotional reactions (laughing, shocked, moved)",
+            "Insightful or funny commentary",
+            "Memorable quotes or hot takes",
+            "Genuine surprise at content being watched",
+            "Relatable reactions viewers would share",
+        ],
+        "low_value": [
+            "Silent watching without commentary",
+            "Vague reactions ('that's interesting')",
+            "Just describing what's on screen",
+            "Mid-thought interruptions",
+        ],
+    },
+    "podcast": {
+        "description": "podcast/interview/discussion content",
+        "high_value": [
+            "Controversial or surprising statements",
+            "Funny stories or anecdotes",
+            "Emotional or vulnerable moments",
+            "Sharp comebacks or witty exchanges",
+            "Quotable insights or hot takes",
+            "Heated debates with good points",
+        ],
+        "low_value": [
+            "Administrative talk ('so anyway...')",
+            "Long-winded setup without payoff",
+            "Unclear inside jokes",
+            "Topic transitions without content",
+        ],
+    },
+    "irl": {
+        "description": "IRL/vlog content",
+        "high_value": [
+            "Unexpected events or encounters",
+            "Funny interactions with people",
+            "Genuine emotional moments",
+            "Fails or embarrassing situations",
+            "Wholesome or heartwarming moments",
+        ],
+        "low_value": [
+            "Walking without events",
+            "Mundane logistics talk",
+            "Unclear audio or crowd noise",
+            "Incomplete interactions",
+        ],
+    },
+    "music": {
+        "description": "music/performance content",
+        "high_value": [
+            "Impressive musical moments or riffs",
+            "Crowd reactions during performance",
+            "Emotional song moments",
+            "Funny banter between songs",
+            "Technical skill showcase",
+        ],
+        "low_value": [
+            "Tuning or setup",
+            "Incomplete song fragments",
+            "Technical difficulties",
+        ],
+    },
+    "educational": {
+        "description": "educational/tutorial content",
+        "high_value": [
+            "Key insights or 'aha' moments",
+            "Surprising facts or revelations",
+            "Clear explanations of complex topics",
+            "Demonstrations with visible results",
+            "Memorable analogies or examples",
+        ],
+        "low_value": [
+            "Setup or context without payoff",
+            "Reading from notes/slides",
+            "Incomplete explanations",
+        ],
+    },
+}
+
+
 def _build_llm_highlight_prompt(
     candidates: List[Dict[str, Any]],
     transcript_segments: List[Dict[str, Any]],
     chat_context: Optional[str] = None,
+    content_type: str = "gaming",
 ) -> str:
-    """Build prompt for LLM to semantically score highlight candidates."""
+    """Build prompt for LLM to semantically score highlight candidates.
+    
+    Args:
+        candidates: List of candidate dicts with timing and score info
+        transcript_segments: Transcript segments with start/end/text
+        chat_context: Optional chat activity summary
+        content_type: Type of content (gaming, reaction, podcast, irl, music, educational)
+    """
     import bisect
+    
+    # Get content-specific guidance
+    guidance = CONTENT_TYPE_GUIDANCE.get(
+        content_type.lower(), 
+        CONTENT_TYPE_GUIDANCE["gaming"]  # fallback
+    )
+    content_desc = guidance["description"]
+    high_value_items = "\n".join(f"  - {item}" for item in guidance["high_value"])
+    low_value_items = "\n".join(f"  - {item}" for item in guidance["low_value"])
     
     # Pre-sort segments by start time for faster lookup
     sorted_segments = sorted(transcript_segments, key=lambda s: s.get("start", 0.0))
@@ -535,9 +654,7 @@ def _build_llm_highlight_prompt(
         end_s = cand.get("end_s", 0.0)
         
         # Use binary search to find relevant segments (much faster for large transcripts)
-        # Find first segment that could overlap (starts before end_s)
         start_idx = bisect.bisect_left(seg_starts, start_s)
-        # Go back a bit to catch segments that started before but extend into our window
         start_idx = max(0, start_idx - 5)
         
         relevant_text = []
@@ -546,11 +663,9 @@ def _build_llm_highlight_prompt(
             seg_start = seg.get("start", 0.0)
             seg_end = seg.get("end", 0.0)
             
-            # If segment starts after our window ends, we're done
             if seg_start > end_s:
                 break
             
-            # Check for overlap
             if seg_end >= start_s and seg_start <= end_s:
                 relevant_text.append(seg.get("text", "").strip())
         
@@ -560,7 +675,7 @@ def _build_llm_highlight_prompt(
             "end_s": round(end_s, 1),
             "duration_s": round(end_s - start_s, 1),
             "signal_score": round(cand.get("score", 0.0), 2),
-            "transcript": " ".join(relevant_text)[:500],  # Limit length
+            "transcript": " ".join(relevant_text)[:500],
             "breakdown": {
                 k: round(v, 2) if isinstance(v, (int, float)) else v 
                 for k, v in cand.get("breakdown", {}).items()
@@ -568,21 +683,32 @@ def _build_llm_highlight_prompt(
         })
     
     prompt_data = {
-        "task": "Score highlight candidates by semantic/entertainment value",
+        "task": f"Score {content_desc} highlight candidates",
         "candidates": candidate_data,
     }
     
     if chat_context:
         prompt_data["chat_context"] = chat_context[:300]
     
-    prompt = f"""Analyze these highlight candidates and score them by entertainment value.
+    prompt = f"""You are scoring highlight candidates from {content_desc}.
+
+IMPORTANT: The signal_score already measures audio energy, chat activity, and motion.
+High signal_score = loud/active moment. Your job is to evaluate CONTENT QUALITY.
+
+Only give LOW semantic scores if the transcript is genuinely boring DESPITE the activity.
+If a moment has high signal_score AND good content, give it a HIGH semantic score.
+Trust the signals - they detected this moment for a reason.
 
 Input:
 {json.dumps(prompt_data, indent=2)}
 
-For each candidate, evaluate the transcript content and assign a semantic_score (0.0-1.0).
-Higher scores for: exciting reactions, funny moments, impressive plays, quotable phrases.
-Lower scores for: mundane commentary, incomplete thoughts, boring content.
+For {content_desc}, give HIGH semantic scores (0.7-1.0) for:
+{high_value_items}
+
+Give LOW semantic scores (0.0-0.4) for:
+{low_value_items}
+
+Medium scores (0.4-0.7) for decent content that's not exceptional.
 
 Output JSON object with "scores" array:
 {{
@@ -998,6 +1124,7 @@ def compute_llm_semantic_scores(
     llm_complete: Callable[[str], str],
     *,
     max_candidates: int = 20,
+    content_type: str = "gaming",
 ) -> Dict[int, Dict[str, Any]]:
     """Use LLM to compute semantic scores for highlight candidates.
     
@@ -1006,6 +1133,7 @@ def compute_llm_semantic_scores(
         proj: Project instance for accessing transcript
         llm_complete: Function that takes prompt string and returns response string
         max_candidates: Maximum candidates to send to LLM (for token limits)
+        content_type: Type of content for prompt customization (gaming, reaction, podcast, irl, music, educational)
         
     Returns:
         Dict mapping candidate rank -> {"semantic_score": float, "reason": str, "best_quote": str}
@@ -1030,8 +1158,9 @@ def compute_llm_semantic_scores(
     if not candidates_to_score:
         return {}
     
-    # Build prompt
-    prompt = _build_llm_highlight_prompt(candidates_to_score, transcript_segments)
+    # Build prompt with content type
+    _highlight_logger.info(f"Using content_type='{content_type}' for semantic scoring prompt")
+    prompt = _build_llm_highlight_prompt(candidates_to_score, transcript_segments, content_type=content_type)
     
     try:
         prompt_len = len(prompt)
@@ -1566,11 +1695,13 @@ def compute_highlights_analysis(
         
         try:
             _highlight_logger.info(f"[highlights] Starting LLM semantic scoring for {len(candidates)} candidates...")
+            content_type = str(highlights_cfg.get("content_type", "gaming"))
             llm_semantic_scores = compute_llm_semantic_scores(
                 candidates=candidates,
                 proj=proj,
                 llm_complete=llm_complete,
                 max_candidates=int(highlights_cfg.get("llm_max_candidates", 15)),
+                content_type=content_type,
             )
             
             if on_progress:
@@ -2302,11 +2433,13 @@ def compute_highlights_candidates(
             on_progress(0.70)
         
         try:
+            content_type = str(highlights_cfg.get("content_type", "gaming"))
             llm_semantic_scores = compute_llm_semantic_scores(
                 candidates=candidates,
                 proj=proj,
                 llm_complete=llm_complete,
                 max_candidates=int(highlights_cfg.get("llm_max_candidates", 15)),
+                content_type=content_type,
             )
             
             if llm_semantic_scores:
