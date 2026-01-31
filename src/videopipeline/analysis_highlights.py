@@ -316,32 +316,39 @@ def shape_clip_bounds_with_boundaries(
     
     peak_time = peak_idx * hop_s
     
+    # Use an "ideal" pre/post time that provides good context, not just the minimum
+    # This ensures we search for boundaries that give proper setup before the peak
+    ideal_pre_seconds = min(clip_cfg.max_pre_seconds, max(clip_cfg.min_pre_seconds, 6.0))
+    ideal_post_seconds = min(clip_cfg.max_post_seconds, max(clip_cfg.min_post_seconds, 10.0))
+    
     # Get ranked candidates for start boundaries
+    # Search centered on ideal_pre, with flexibility to go earlier (more context) or later (tighter)
     start_candidates = find_start_boundary_candidates(
         boundary_graph,
-        target_s=peak_time - clip_cfg.min_pre_seconds,
-        max_before_s=clip_cfg.max_pre_seconds - clip_cfg.min_pre_seconds,
-        max_after_s=clip_cfg.min_pre_seconds,
-        prefer_before=True,
+        target_s=peak_time - ideal_pre_seconds,
+        max_before_s=clip_cfg.max_pre_seconds - ideal_pre_seconds,  # Can go further back
+        max_after_s=ideal_pre_seconds - clip_cfg.min_pre_seconds,   # Can come closer to peak
+        prefer_before=True,  # Prefer more context over less
     )
     
     # If no start candidates, try expanding the search window significantly
     if not start_candidates:
         start_candidates = find_start_boundary_candidates(
             boundary_graph,
-            target_s=peak_time - clip_cfg.min_pre_seconds,
+            target_s=peak_time - ideal_pre_seconds,
             max_before_s=clip_cfg.max_pre_seconds * 2,  # Double the window
-            max_after_s=clip_cfg.min_pre_seconds * 2,
+            max_after_s=ideal_pre_seconds,
             prefer_before=True,
         )
     
     # Get ranked candidates for end boundaries
+    # Search centered on ideal_post, with flexibility
     end_candidates = find_end_boundary_candidates(
         boundary_graph,
-        target_s=peak_time + clip_cfg.min_post_seconds,
-        max_before_s=clip_cfg.min_post_seconds,
-        max_after_s=clip_cfg.max_post_seconds - clip_cfg.min_post_seconds,
-        prefer_after=True,
+        target_s=peak_time + ideal_post_seconds,
+        max_before_s=ideal_post_seconds - clip_cfg.min_post_seconds,  # Can end sooner
+        max_after_s=clip_cfg.max_post_seconds - ideal_post_seconds,   # Can extend further
+        prefer_after=True,  # Prefer completing the moment
     )
     
     # If no end candidates, try expanding the search window significantly
