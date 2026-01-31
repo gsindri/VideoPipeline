@@ -35,12 +35,23 @@ analysis:
     top: 20
     min_gap_seconds: 15.0
     skip_start_seconds: 10.0
+    smooth_seconds: 1.5
+    # Step 4: Speech gating - strongly prefer moments with speech
+    # This prevents picking "loud gameplay" moments where nobody is talking
+    require_speech: true
+    min_peak_speech_fraction: 0.15   # Drop peaks that aren't mostly speech
+    speech_gate_min_fraction: 0.05   # Below this = no speech
+    speech_gate_floor: 0.08          # Keep some score even when no speech
+    speech_gate_power: 1.0           # Gate power (1.0 = linear)
+    # Signal fusion weights (Step 4: speech-aware + reaction-aware + conversation-aware)
     weights:
-      audio: 0.20
-      motion: 0.25
-      chat: 0.15
-      audio_events: 0.10
-      reaction: 0.30  # Voice excitement/arousal (yelling, hype, intensity)
+      audio: 0.25           # Baseline RMS loudness
+      motion: 0.25          # Visual motion intensity
+      chat: 0.18            # Twitch chat activity spikes
+      audio_events: 0.10    # Laughter, cheering, applause
+      reaction: 0.18        # Voice excitement/arousal (prosody)
+      turn_rate: 0.03       # Banter/rapid exchanges (diarization)
+      overlap: 0.01         # Interruptions/chaotic moments (diarization)
     clip:
       min_seconds: 12
       max_seconds: 60

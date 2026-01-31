@@ -2007,7 +2007,83 @@ def compute_highlights_scores(
     if on_progress:
         on_progress(0.55)
     
-    # Get weights
+    # Load VAD speech fraction for gating (Step 4)
+    speech_fraction = None
+    vad_used = False
+    vad_path = proj.analysis_dir / "audio_vad.npz"
+    if vad_path.exists():
+        try:
+            vad_data = load_npz(vad_path)
+            vad_raw = vad_data.get("speech_fraction")
+            if vad_raw is None:
+                vad_raw = vad_data.get("scores") or vad_data.get("values")
+            vad_hop_arr = vad_data.get("hop_seconds")
+            if vad_raw is not None:
+                vad_hop_s = float(vad_hop_arr[0]) if vad_hop_arr is not None and len(vad_hop_arr) > 0 else hop_s
+                speech_fraction = resample_series(
+                    vad_raw.astype(np.float64),
+                    src_hop_s=vad_hop_s,
+                    target_hop_s=hop_s,
+                    target_len=len(audio_scores),
+                    fill_value=0.0,
+                )
+                # Clamp to [0, 1]
+                speech_fraction = np.clip(speech_fraction, 0.0, 1.0)
+                vad_used = True
+        except Exception:
+            pass
+    
+    # Load diarization-derived signals: turn_rate and overlap (Step 4)
+    turn_rate_scores = np.zeros_like(audio_scores)
+    overlap_scores = np.zeros_like(audio_scores)
+    turn_rate_used = False
+    overlap_used = False
+    diar_path = proj.analysis_dir / "diarization.json"
+    if diar_path.exists():
+        try:
+            import json as _json
+            diar = _json.loads(diar_path.read_text(encoding="utf-8"))
+            
+            # Turn rate timeline
+            tr = diar.get("turn_rate") or {}
+            if tr and "times" in tr and "turns_per_minute" in tr:
+                tr_times = np.asarray(tr["times"], dtype=np.float64)
+                tr_values = np.asarray(tr["turns_per_minute"], dtype=np.float64)
+                if len(tr_times) > 0 and len(tr_values) > 0:
+                    tr_hop_s = float(np.median(np.diff(tr_times))) if len(tr_times) > 1 else 1.0
+                    turn_rate_scores = resample_series(
+                        tr_values,
+                        src_hop_s=tr_hop_s,
+                        target_hop_s=hop_s,
+                        target_len=len(audio_scores),
+                        fill_value=0.0,
+                    )
+                    turn_rate_scores = robust_z(turn_rate_scores)
+                    turn_rate_used = True
+            
+            # Overlap fraction timeline
+            ov = diar.get("overlap_fraction") or {}
+            if ov and "times" in ov and "fraction" in ov:
+                ov_times = np.asarray(ov["times"], dtype=np.float64)
+                ov_values = np.asarray(ov["fraction"], dtype=np.float64)
+                if len(ov_times) > 0 and len(ov_values) > 0:
+                    ov_hop_s = float(np.median(np.diff(ov_times))) if len(ov_times) > 1 else 1.0
+                    overlap_scores = resample_series(
+                        ov_values,
+                        src_hop_s=ov_hop_s,
+                        target_hop_s=hop_s,
+                        target_len=len(audio_scores),
+                        fill_value=0.0,
+                    )
+                    overlap_scores = robust_z(overlap_scores)
+                    overlap_used = True
+        except Exception:
+            pass
+    
+    if on_progress:
+        on_progress(0.60)
+    
+    # Get weights (including new Step 4 signals)
     weights = highlights_cfg.get("weights", {})
     w_audio = float(weights.get("audio", 0.45))
     w_motion = float(weights.get("motion", 0.15)) if motion_used else 0.0
@@ -2015,9 +2091,12 @@ def compute_highlights_scores(
     w_audio_events = float(weights.get("audio_events", 0.20)) if audio_events_used else 0.0
     w_speech = float(weights.get("speech", 0.15)) if speech_used else 0.0
     w_reaction = float(weights.get("reaction", 0.15)) if reaction_used else 0.0
+    # Diarization-derived weights (small defaults, only if signal present)
+    w_turn_rate = float(weights.get("turn_rate", 0.05)) if turn_rate_used else 0.0
+    w_overlap = float(weights.get("overlap", 0.03)) if overlap_used else 0.0
     
     # Normalize weights
-    w_total = w_audio + w_motion + w_chat + w_audio_events + w_speech + w_reaction
+    w_total = w_audio + w_motion + w_chat + w_audio_events + w_speech + w_reaction + w_turn_rate + w_overlap
     if w_total > 0 and abs(w_total - 1.0) > 0.001:
         w_audio /= w_total
         w_motion /= w_total
@@ -2025,6 +2104,8 @@ def compute_highlights_scores(
         w_audio_events /= w_total
         w_speech /= w_total
         w_reaction /= w_total
+        w_turn_rate /= w_total
+        w_overlap /= w_total
     
     # Signal processing config
     use_relu = bool(highlights_cfg.get("relu_zscores", True))
@@ -2076,6 +2157,8 @@ def compute_highlights_scores(
         term_chat = w_chat * chat_scores_pos
         term_speech = w_speech * speech_scores_pos
         term_reaction = w_reaction * reaction_scores_pos
+        term_turn_rate = w_turn_rate * _pos_transform(turn_rate_scores, clip_z=signal_clip_z, mode=signal_softclip)
+        term_overlap = w_overlap * _pos_transform(overlap_scores, clip_z=signal_clip_z, mode=signal_softclip)
     else:
         if use_motion_gating and w_motion > 0:
             motion_gate = _linear_gate(
@@ -2101,23 +2184,48 @@ def compute_highlights_scores(
         term_chat = w_chat * chat_scores
         term_speech = w_speech * speech_scores
         term_reaction = w_reaction * reaction_scores
+        term_turn_rate = w_turn_rate * turn_rate_scores
+        term_overlap = w_overlap * overlap_scores
     
     combined_raw = (
         term_audio + term_motion + term_chat + 
-        term_audio_events + term_speech + term_reaction
+        term_audio_events + term_speech + term_reaction +
+        term_turn_rate + term_overlap
     )
     
     if on_progress:
         on_progress(0.70)
     
-    # Smooth and z-score
+    # Speech gating (Step 4): strongly prefer moments with speech
+    # This prevents picking "loud gameplay" moments where nobody is talking
+    speech_gated = combined_raw.copy()
+    require_speech = bool(highlights_cfg.get("require_speech", True))
+    min_peak_speech_fraction = float(highlights_cfg.get("min_peak_speech_fraction", 0.15))
+    speech_gate_min_fraction = float(highlights_cfg.get("speech_gate_min_fraction", 0.05))
+    speech_gate_floor = float(highlights_cfg.get("speech_gate_floor", 0.08))
+    speech_gate_power = float(highlights_cfg.get("speech_gate_power", 1.0))
+    
+    if speech_fraction is not None:
+        # Compute gate: scales score by speech presence
+        gate = np.clip((speech_fraction - speech_gate_min_fraction) / max(1e-9, 1.0 - speech_gate_min_fraction), 0.0, 1.0)
+        gate = np.power(gate, speech_gate_power)
+        # Apply gate with floor (keep some score even when no speech)
+        speech_gated = combined_raw * (speech_gate_floor + (1.0 - speech_gate_floor) * gate)
+    
+    combined_raw_gated = speech_gated
+    
+    # Smooth and z-score (use speech-gated signal)
     smooth_s = float(highlights_cfg.get("smooth_seconds", max(1.0, 2.0 * hop_s)))
     smooth_frames = max(1, int(round(smooth_s / hop_s)))
-    combined_smoothed = moving_average(combined_raw, smooth_frames) if len(combined_raw) > 0 else combined_raw
+    combined_smoothed = moving_average(combined_raw_gated, smooth_frames) if len(combined_raw_gated) > 0 else combined_raw_gated
     combined_scores = robust_z(combined_smoothed) if len(combined_smoothed) > 0 else combined_smoothed
     
-    # Peak selection
+    # Apply hard speech requirement for peak selection (if enabled)
     scores_for_peaks = combined_scores.copy()
+    if require_speech and speech_fraction is not None:
+        # Mark non-speech frames as invalid for peak picking
+        scores_for_peaks = np.where(speech_fraction >= min_peak_speech_fraction, scores_for_peaks, -np.inf)
+    
     skip_start_frames = int(round(float(highlights_cfg.get("skip_start_seconds", 10.0)) / hop_s))
     if skip_start_frames > 0 and skip_start_frames < len(scores_for_peaks):
         scores_for_peaks[:skip_start_frames] = -np.inf
@@ -2148,14 +2256,21 @@ def compute_highlights_scores(
         audio_events_scores=audio_events_scores,
         speech_scores=speech_scores,
         reaction_scores=reaction_scores,
+        turn_rate_scores=turn_rate_scores,
+        overlap_scores=overlap_scores,
         term_audio=term_audio,
         term_motion=term_motion,
         term_chat=term_chat,
         term_audio_events=term_audio_events,
         term_speech=term_speech,
         term_reaction=term_reaction,
+        term_turn_rate=term_turn_rate,
+        term_overlap=term_overlap,
         motion_gate=motion_gate,
         audio_events_gate=audio_events_gate,
+        # Step 4: speech gating data
+        speech_fraction=speech_fraction if speech_fraction is not None else np.ones_like(audio_scores),
+        combined_raw_ungated=combined_raw,
         hop_seconds=np.array([hop_s], dtype=np.float64),
     )
     
@@ -2172,6 +2287,8 @@ def compute_highlights_scores(
             "audio_events": w_audio_events,
             "speech": w_speech,
             "reaction": w_reaction,
+            "turn_rate": w_turn_rate,
+            "overlap": w_overlap,
         },
         "signals_used": {
             "motion": motion_used,
@@ -2179,6 +2296,15 @@ def compute_highlights_scores(
             "audio_events": audio_events_used,
             "speech": speech_used,
             "reaction": reaction_used,
+            "vad": vad_used,
+            "turn_rate": turn_rate_used,
+            "overlap": overlap_used,
+        },
+        "speech_gating": {
+            "enabled": speech_fraction is not None,
+            "require_speech": require_speech,
+            "min_peak_speech_fraction": min_peak_speech_fraction,
+            "speech_gate_floor": speech_gate_floor,
         },
     }
 
