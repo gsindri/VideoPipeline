@@ -92,6 +92,9 @@ def create_app(
     video_path: Optional[Path] = None,
     profile_path: Optional[Path] = None,
 ) -> FastAPI:
+    from ..logging_config import setup_logging
+    setup_logging()
+
     ctx = StudioContext(video_path=video_path, profile_path=profile_path)
 
     app = FastAPI(title="VideoPipeline Studio")
@@ -432,6 +435,8 @@ def create_app(
             proj.analysis_dir / "boundaries.json",
             proj.analysis_dir / "chat_boundaries.json",
             proj.analysis_dir / "clip_variants.json",
+            # AI Director (new + legacy filenames)
+            proj.analysis_dir / "ai_director.json",
             proj.analysis_dir / "director_results.json",
         ]
         
@@ -3066,12 +3071,20 @@ def create_app(
                     temperature=float(ai_cfg.get("temperature", 0.2)),
                     platform=str(ai_cfg.get("platform", "shorts")),
                     fallback_to_rules=bool(ai_cfg.get("fallback_to_rules", True)),
+                    auto_start=bool(ai_cfg.get("auto_start", True)),
+                    server_path=str(ai_cfg.get("server_path", "C:/llama.cpp/llama-server.exe")),
+                    model_path=str(ai_cfg.get("model_path", "C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf")),
+                    startup_timeout_s=float(ai_cfg.get("startup_timeout_s", 120)),
+                    auto_stop_idle_s=float(ai_cfg.get("auto_stop_idle_s", 600)),
                 )
                 
                 def on_director_progress(frac: float) -> None:
                     JOB_MANAGER._set(job, progress=0.70 + 0.25 * frac, message="Running AI Director...")
                 
-                result = compute_director_analysis(proj, cfg=director_cfg, top_n=top_n, on_progress=on_director_progress)
+                def on_director_status(msg: str) -> None:
+                    JOB_MANAGER._set(job, message=msg)
+                
+                result = compute_director_analysis(proj, cfg=director_cfg, top_n=top_n, on_progress=on_director_progress, on_status=on_director_status)
 
                 JOB_MANAGER._set(
                     job,
@@ -3683,7 +3696,7 @@ def create_app(
                 log.info(f"[analyze_full] LLM not needed (ai.enabled={ai_cfg.get('enabled', True)}, semantic={llm_semantic_enabled}, filter={llm_filter_enabled})")
             
             try:
-                def on_highlights_progress(p: float) -> None:
+                def on_highlights_progress(p: float, detail: Optional[str] = None) -> None:
                     # Map 0-1 progress to stage 2 range (0.40-0.65)
                     scaled = 0.40 + p * 0.25
                     if p < 0.25:
@@ -3696,6 +3709,14 @@ def create_app(
                         msg = "Stage 2: LLM semantic scoring..."
                     else:
                         msg = "Stage 2: Finalizing highlights..."
+                    
+                    # Append detail from DAG if available
+                    if detail and not detail.startswith("Running "):
+                        msg = f"{msg} — {detail}"
+                    elif detail:
+                        # Extract task name from "Running X..." or "X: message"
+                        msg = f"{msg} ({detail})"
+                    
                     JOB_MANAGER._set(job, progress=scaled, message=msg, result=update_timing_result())
                 
                 # Use DAG runner for highlights with proper boundary graph ordering
@@ -3711,7 +3732,7 @@ def create_app(
                 }
                 
                 def on_dag_progress(frac: float, msg: str) -> None:
-                    on_highlights_progress(frac)
+                    on_highlights_progress(frac, msg)
                 
                 log.info(f"[analyze_full] Running DAG with targets: highlights_candidates, boundary_graph")
                 dag_result = run_analysis(
@@ -3905,9 +3926,18 @@ def create_app(
                         temperature=float(ai_cfg.get("temperature", 0.2)),
                         platform=str(ai_cfg.get("platform", "shorts")),
                         fallback_to_rules=bool(ai_cfg.get("fallback_to_rules", True)),
+                        auto_start=bool(ai_cfg.get("auto_start", True)),
+                        server_path=str(ai_cfg.get("server_path", "C:/llama.cpp/llama-server.exe")),
+                        model_path=str(ai_cfg.get("model_path", "C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf")),
+                        startup_timeout_s=float(ai_cfg.get("startup_timeout_s", 120)),
+                        auto_stop_idle_s=float(ai_cfg.get("auto_stop_idle_s", 600)),
                     )
                     top_n = int(context_cfg.get("top_n", 25))
-                    compute_director_analysis(proj, cfg=director_cfg, top_n=top_n)
+                    
+                    def on_director_status(msg: str) -> None:
+                        JOB_MANAGER._set(job, message=msg, result=update_timing_result())
+                    
+                    compute_director_analysis(proj, cfg=director_cfg, top_n=top_n, on_status=on_director_status)
                     completed_stages.append("director")
                     stage_times["director"] = _time.time() - director_start
                 except Exception as e:

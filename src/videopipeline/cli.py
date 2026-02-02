@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 import sys
 import threading
 import time
@@ -16,6 +18,7 @@ from .analysis_highlights import compute_highlights_analysis
 from .doctor import run_doctor
 from .exporter import ExportSpec, HookTextSpec, LayoutPipSpec, run_ffmpeg_export
 from .layouts import get_facecam_rect
+from .logging_config import setup_logging
 from .metadata import build_metadata, derive_hook_text, write_metadata
 from .profile import load_profile
 from .project import add_selection_from_candidate, create_or_load_project, get_project_data
@@ -30,6 +33,8 @@ from .publisher.presets import AccountPreset
 
 class UserFacingError(RuntimeError):
     """Errors safe to present directly in CLI output."""
+
+logger = logging.getLogger(__name__)
 
 
 def _fmt_time(seconds: float) -> str:
@@ -68,6 +73,25 @@ def cmd_suggest(args: argparse.Namespace) -> None:
 
     print(f"Wrote: {out_path}")
     print(f"Project: {proj.project_dir}")
+    signals_used = payload.get("signals_used")
+    if isinstance(signals_used, dict) and signals_used:
+        ordered_keys = [
+            "chat",
+            "audio_events",
+            "speech",
+            "reaction",
+            "boundary_graph",
+            "llm_semantic",
+        ]
+        parts = []
+        for k in ordered_keys:
+            if k in signals_used:
+                parts.append(f"{k}={'yes' if signals_used.get(k) else 'no'}")
+        # Include any extra keys we didn't anticipate.
+        for k in sorted(signals_used.keys()):
+            if k not in ordered_keys:
+                parts.append(f"{k}={'yes' if signals_used.get(k) else 'no'}")
+        print("Signals:", ", ".join(parts))
     print()
     print(f"{'Rank':>4}  {'Peak':>10}  {'Start':>10}  {'End':>10}  {'Score':>7}  {'Audio':>7}  {'Motion':>7}  {'Chat':>7}")
     for c in candidates:
@@ -86,8 +110,8 @@ def cmd_studio(args: argparse.Namespace) -> None:
     if not args.no_open:
         try:
             webbrowser.open(url)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to open browser to %s: %s", url, exc)
 
     import uvicorn
 
@@ -482,6 +506,19 @@ def cmd_jobs_retry(args: argparse.Namespace) -> None:
 
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(prog="vp", description="VideoPipeline CLI")
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default=os.getenv("VP_LOG_LEVEL", "INFO").upper(),
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Logging verbosity for videopipeline.* logs (default: INFO).",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=Path(os.getenv("VP_LOG_FILE", "")).expanduser() if os.getenv("VP_LOG_FILE") else None,
+        help="Optional path to write logs to (also logs to stderr).",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("suggest", help="Suggest highlight candidates from combined signals.")
@@ -584,6 +621,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     jobs_retry.set_defaults(func=cmd_jobs_retry)
 
     args = parser.parse_args(argv)
+    setup_logging(level=getattr(logging, str(args.log_level).upper(), logging.INFO), log_file=args.log_file)
     try:
         args.func(args)
     except UserFacingError as exc:

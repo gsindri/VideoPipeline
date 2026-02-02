@@ -2079,7 +2079,7 @@ function renderCandidates() {
 
   const highlights = project?.analysis?.highlights;
   const audio = project?.analysis?.audio;
-  const director = project?.analysis?.director;
+  const aiDirector = project?.analysis?.ai_director;
   const candidates = highlights?.candidates || audio?.candidates || [];
   if (candidates.length === 0) {
     container.innerHTML = `<div class="small">No candidates yet. Click "Analyze highlights".</div>`;
@@ -2104,24 +2104,31 @@ function renderCandidates() {
       if (Number(c.breakdown.reaction || 0) !== 0) breakdown += ` / reaction ${reaction}`;
     }
     
-    // Get AI metadata if available
-    const aiResult = director?.results?.find(r => r.rank === c.rank);
-    const aiTitle = aiResult?.title || '';
-    const aiHook = aiResult?.hook || '';
-    const aiVariant = aiResult?.chosen_variant || '';
-    const hasAI = !!aiResult;
+    // Get AI metadata if available (stored directly on candidate by backend)
+    const ai = c.ai;
+    const aiTitle = ai?.title || '';
+    const aiHook = ai?.hook || '';
+    const aiVariant = ai?.chosen_variant_id || '';
+    const aiReason = ai?.reason || '';
+    const aiConfidence = typeof ai?.confidence === 'number' ? ai.confidence : null;
+    const aiUsedFallback = !!ai?.used_fallback;
+    const hasAI = !!ai && (aiTitle || aiHook || aiVariant || aiReason);
     
     let aiHtml = '';
     if (hasAI) {
-      const aiTags = (aiResult?.tags || []).slice(0, 5);
-      const tagsHtml = aiTags.length > 0 ? `<div class="ai-tags">${aiTags.map(t => `<span class="ai-tag">#${escapeHtml(t)}</span>`).join('')}</div>` : '';
+      const aiTags = (ai?.hashtags || ai?.tags || []).slice(0, 5);
+      const tagsHtml = aiTags.length > 0 ? `<div class="ai-tags">${aiTags.map(t => `<span class="ai-tag">#${escapeHtml(String(t).replace(/^#/, ''))}</span>`).join('')}</div>` : '';
+      const modelName = aiDirector?.config?.model_name || aiDirector?.config?.model || '';
+      const modelBadge = modelName ? `<span class="badge" style="margin-left:6px;opacity:0.85">${escapeHtml(modelName)}</span>` : '';
+      const confBadge = aiConfidence !== null ? `<span class="badge" style="margin-left:6px;opacity:0.85">conf ${(aiConfidence * 100).toFixed(0)}%</span>` : '';
       aiHtml = `
         <div class="candidate-ai-section">
-          <span class="ai-badge">AI Generated</span>
+          <span class="ai-badge">AI Generated</span>${modelBadge}${aiUsedFallback ? '<span class="badge" style="margin-left:6px;background:#334155;color:#cbd5e1" title="LLM unavailable; rule-based fallback">fallback</span>' : ''}${confBadge}
           <div class="ai-title">${escapeHtml(aiTitle)}</div>
           ${aiHook ? `<div class="ai-hook">"${escapeHtml(aiHook)}"</div>` : ''}
           ${tagsHtml}
-          <div class="small" style="margin-top:4px;">Best variant: <span class="badge">${aiVariant}</span></div>
+          ${aiReason ? `<div class="small" style="margin-top:4px;opacity:0.9">${escapeHtml(aiReason)}</div>` : ''}
+          ${aiVariant ? `<div class="small" style="margin-top:4px;">Best variant: <span class="badge">${escapeHtml(aiVariant)}</span></div>` : ''}
         </div>
       `;
     }
@@ -2166,30 +2173,42 @@ function renderCandidates() {
       v.currentTime = c.peak_time_s;
       v.play();
     };
-    if (btnApplyAI && aiResult) {
+    if (btnApplyAI && hasAI) {
       btnApplyAI.onclick = () => {
-        // Apply AI-suggested variant times and title
-        const variant = aiResult.chosen_variant_data;
-        if (variant) {
-          setBuilder(variant.start_s, variant.end_s, aiTitle, $('#template').value);
-          const v = $('#video');
-          v.currentTime = variant.start_s;
-        } else {
+        // Apply AI-suggested variant times and title (fetch variant window)
+        const variantId = aiVariant;
+        if (!variantId) {
           setBuilder(c.start_s, c.end_s, aiTitle, $('#template').value);
+          updateTimelineOverlays();
+          return;
         }
-        // Update timeline overlays
-        updateTimelineOverlays();
+
+        apiGet(`/api/clip_variants/${c.rank}`).then(data => {
+          const variants = data.variants || [];
+          const chosen = variants.find(v => v.variant_id === variantId) || null;
+          const start = chosen ? chosen.start_s : c.start_s;
+          const end = chosen ? chosen.end_s : c.end_s;
+          setBuilder(start, end, aiTitle, $('#template').value);
+          const v = $('#video');
+          v.currentTime = start;
+          // Update timeline overlays
+          updateTimelineOverlays();
+        }).catch(() => {
+          // Fallback if variants are missing
+          setBuilder(c.start_s, c.end_s, aiTitle, $('#template').value);
+          updateTimelineOverlays();
+        });
       };
     }
-    if (btnVariants && aiResult) {
-      btnVariants.onclick = () => showVariantsModal(c.rank, aiResult);
+    if (btnVariants && hasAI) {
+      btnVariants.onclick = () => showVariantsModal(c.rank, ai);
     }
     container.appendChild(el);
   }
 }
 
 // Modal for showing clip variants
-function showVariantsModal(rank, aiResult) {
+function showVariantsModal(rank, ai) {
   // Remove existing modal if any
   const existing = document.querySelector('.variants-modal-overlay');
   if (existing) existing.remove();
@@ -2207,7 +2226,7 @@ function showVariantsModal(rank, aiResult) {
     overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);z-index:1000;display:flex;align-items:center;justify-content:center;';
     
     let variantsHtml = variants.map((v, i) => {
-      const isChosen = v.variant_id === aiResult?.chosen_variant;
+      const isChosen = v.variant_id === ai?.chosen_variant_id;
       return `
         <div class="variant-item ${isChosen ? 'chosen' : ''}" data-idx="${i}" style="padding:12px;margin:8px 0;background:${isChosen ? 'rgba(79,140,255,0.2)' : 'rgba(255,255,255,0.05)'};border-radius:6px;cursor:pointer;">
           <div style="font-weight:600;">${v.variant_id} ${isChosen ? '✓ AI choice' : ''}</div>
@@ -2234,7 +2253,7 @@ function showVariantsModal(rank, aiResult) {
     modal.querySelectorAll('.variant-item').forEach((el, i) => {
       el.onclick = () => {
         const v = variants[i];
-        setBuilder(v.start_s, v.end_s, aiResult?.title || '', $('#template').value);
+        setBuilder(v.start_s, v.end_s, ai?.title || '', $('#template').value);
         const video = $('#video');
         video.currentTime = v.start_s;
         overlay.remove();
@@ -4785,14 +4804,12 @@ let aiSuggestionsState = {
 };
 
 function showAISuggestionsPanel(candidateRank) {
-  const director = project?.analysis?.director;
-  if (!director?.results) {
-    hideAISuggestionsPanel();
-    return;
-  }
-  
-  const result = director.results.find(r => r.rank === candidateRank);
-  if (!result) {
+  const highlights = project?.analysis?.highlights;
+  const audio = project?.analysis?.audio;
+  const candidates = highlights?.candidates || audio?.candidates || [];
+  const cand = candidates.find(c => c.rank === candidateRank);
+  const ai = cand?.ai;
+  if (!ai) {
     hideAISuggestionsPanel();
     return;
   }
@@ -4802,30 +4819,31 @@ function showAISuggestionsPanel(candidateRank) {
   
   // Build multiple title/hook options
   // Primary suggestion from AI director
-  const titles = [result.title];
-  const hooks = [result.hook];
+  const titles = [ai.title].filter(Boolean);
+  const hooks = [ai.hook].filter(Boolean);
   
   // Add variations based on the original
-  if (result.title) {
+  if (ai.title) {
     // Generate some variations
-    titles.push(result.title.toUpperCase());
-    if (result.title.length > 30) {
-      titles.push(result.title.slice(0, 30) + '...');
+    titles.push(ai.title.toUpperCase());
+    if (ai.title.length > 30) {
+      titles.push(ai.title.slice(0, 30) + '...');
     }
     // Add a question variant if it's not already a question
-    if (!result.title.endsWith('?') && !result.title.includes('?')) {
-      titles.push('Did this really happen? ' + result.title);
+    if (!ai.title.endsWith('?') && !ai.title.includes('?')) {
+      titles.push('Did this really happen? ' + ai.title);
     }
   }
   
-  if (result.hook) {
-    hooks.push(result.hook.toUpperCase());
-    hooks.push('🔥 ' + result.hook);
-    hooks.push(result.hook + ' 👀');
+  if (ai.hook) {
+    hooks.push(ai.hook.toUpperCase());
+    hooks.push('🔥 ' + ai.hook);
+    hooks.push(ai.hook + ' 👀');
   }
   
   // Add hashtags
-  const hashtags = result.hashtags || result.tags || [];
+  const hashtags = ai.hashtags || ai.tags || [];
+  const modelName = project?.analysis?.ai_director?.config?.model_name || project?.analysis?.ai_director?.config?.model || '';
   
   aiSuggestionsState = {
     candidateRank,
@@ -4835,7 +4853,7 @@ function showAISuggestionsPanel(candidateRank) {
     selectedTitleIdx: 0,
     selectedHookIdx: 0,
     selectedHashtags: new Set(hashtags.slice(0, 5)),
-    model: director.model || 'AI',
+    model: modelName || 'AI',
   };
   
   renderAISuggestionsPanel();

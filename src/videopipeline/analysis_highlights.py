@@ -1841,6 +1841,26 @@ def json_load(path: Path) -> Dict[str, Any]:
 
 
 # =============================================================================
+# Progress reporting helper
+# =============================================================================
+
+def _report_progress(
+    on_progress: Optional[Callable[..., None]],
+    frac: float,
+    msg: Optional[str] = None
+) -> None:
+    """Report progress with optional message, handling both old and new signatures."""
+    if not on_progress:
+        return
+    try:
+        # Try new signature with message
+        on_progress(frac, msg)
+    except TypeError:
+        # Fall back to old signature (fraction only)
+        on_progress(frac)
+
+
+# =============================================================================
 # Split functions for DAG runner
 # =============================================================================
 
@@ -1882,8 +1902,7 @@ def compute_highlights_scores(
     proj_data = get_project_data(proj)
     hop_s = float(audio_cfg.get("hop_seconds", 0.5))
     
-    if on_progress:
-        on_progress(0.05)
+    _report_progress(on_progress, 0.05, "Loading audio features")
     
     # Load audio features (required)
     if not proj.audio_features_path.exists():
@@ -1895,8 +1914,7 @@ def compute_highlights_scores(
         raise ValueError("audio_features.npz missing scores")
     audio_scores = audio_scores.astype(np.float64)
     
-    if on_progress:
-        on_progress(0.10)
+    _report_progress(on_progress, 0.10, "Loading motion features")
     
     # Load motion features (optional)
     motion_resampled = np.zeros_like(audio_scores)
@@ -1917,8 +1935,7 @@ def compute_highlights_scores(
             )
             motion_used = True
     
-    if on_progress:
-        on_progress(0.20)
+    _report_progress(on_progress, 0.20, "Loading chat features")
     
     # Load chat features (optional)
     chat_scores = np.zeros_like(audio_scores)
@@ -1937,8 +1954,7 @@ def compute_highlights_scores(
             )
             chat_used = True
     
-    if on_progress:
-        on_progress(0.30)
+    _report_progress(on_progress, 0.30, "Loading audio events features")
     
     # Load audio events (optional)
     audio_events_scores = np.zeros_like(audio_scores)
@@ -1960,8 +1976,7 @@ def compute_highlights_scores(
         except Exception:
             pass
     
-    if on_progress:
-        on_progress(0.40)
+    _report_progress(on_progress, 0.40, "Loading speech features")
     
     # Load speech features (optional)
     speech_scores = np.zeros_like(audio_scores)
@@ -1988,8 +2003,7 @@ def compute_highlights_scores(
         except Exception:
             pass
     
-    if on_progress:
-        on_progress(0.50)
+    _report_progress(on_progress, 0.50, "Loading reaction audio features")
     
     # Load reaction audio (optional)
     reaction_scores = np.zeros_like(audio_scores)
@@ -2011,8 +2025,7 @@ def compute_highlights_scores(
         except Exception:
             pass
     
-    if on_progress:
-        on_progress(0.55)
+    _report_progress(on_progress, 0.55, "Loading VAD speech fraction")
     
     # Load VAD speech fraction for gating (Step 4)
     speech_fraction = None
@@ -2128,8 +2141,7 @@ def compute_highlights_scores(
     motion_gate = np.ones_like(audio_scores)
     audio_events_gate = np.ones_like(audio_scores)
     
-    if on_progress:
-        on_progress(0.60)
+    _report_progress(on_progress, 0.60, "Fusing signals with weights")
     
     # Compute weighted terms
     if use_relu:
@@ -2200,8 +2212,7 @@ def compute_highlights_scores(
         term_turn_rate + term_overlap
     )
     
-    if on_progress:
-        on_progress(0.70)
+    _report_progress(on_progress, 0.70, "Applying speech gating")
     
     # Speech gating (Step 4): strongly prefer moments with speech
     # This prevents picking "loud gameplay" moments where nobody is talking
@@ -2246,8 +2257,7 @@ def compute_highlights_scores(
         min_score=min_peak_score,
     )
     
-    if on_progress:
-        on_progress(0.85)
+    _report_progress(on_progress, 0.85, "Saving highlights_features.npz")
     
     # Save features NPZ with peak indices
     save_npz(
@@ -2281,8 +2291,7 @@ def compute_highlights_scores(
         hop_seconds=np.array([hop_s], dtype=np.float64),
     )
     
-    if on_progress:
-        on_progress(1.0)
+    _report_progress(on_progress, 1.0, "Done")
     
     return {
         "peak_count": len(peak_idxs),
@@ -2353,8 +2362,7 @@ def compute_highlights_candidates(
     
     proj_data = get_project_data(proj)
     
-    if on_progress:
-        on_progress(0.05)
+    _report_progress(on_progress, 0.05, "Loading highlights_features.npz")
     
     # Load scores and peaks
     if not proj.highlights_features_path.exists():
@@ -2418,8 +2426,7 @@ def compute_highlights_candidates(
     speech_scores = features.get("speech_scores", np.zeros_like(combined_smoothed))
     reaction_scores = features.get("reaction_scores", np.zeros_like(combined_smoothed))
     
-    if on_progress:
-        on_progress(0.15)
+    _report_progress(on_progress, 0.15, "Loading scene cuts")
     
     # Load scene cuts
     scene_cuts = []
@@ -2432,8 +2439,7 @@ def compute_highlights_candidates(
         except Exception:
             pass
     
-    if on_progress:
-        on_progress(0.20)
+    _report_progress(on_progress, 0.20, "Loading boundary graph")
     
     # Load boundary graph (key for quality)
     # Note: boundary_graph may not exist during pre-download analysis (expected)
@@ -2450,8 +2456,7 @@ def compute_highlights_candidates(
     except Exception as e:
         _highlight_logger.error(f"[Highlights] Failed to load boundary graph: {e}")
     
-    if on_progress:
-        on_progress(0.25)
+    _report_progress(on_progress, 0.25, "Configuring clip parameters")
     
     # Clip config
     clip_cfg_dict = highlights_cfg.get("clip", {})
@@ -2471,8 +2476,7 @@ def compute_highlights_candidates(
     max_overlap_seconds = float(highlights_cfg.get("max_overlap_seconds", 0.0))
     overlap_denom = str(highlights_cfg.get("overlap_denominator", "shorter"))
     
-    if on_progress:
-        on_progress(0.30)
+    _report_progress(on_progress, 0.30, "Shaping clip boundaries")
     
     # Build raw candidates
     raw_candidates: List[Dict[str, Any]] = []
@@ -2527,8 +2531,7 @@ def compute_highlights_candidates(
             },
         })
     
-    if on_progress:
-        on_progress(0.50)
+    _report_progress(on_progress, 0.50, "Filtering overlapping candidates")
     
     # Non-overlap filtering
     raw_candidates.sort(key=lambda c: c.get("score", 0.0), reverse=True)
@@ -2546,8 +2549,7 @@ def compute_highlights_candidates(
             cand["rank"] = len(candidates) + 1
             candidates.append(cand)
     
-    if on_progress:
-        on_progress(0.65)
+    _report_progress(on_progress, 0.65, f"Filtered to {len(candidates)} candidates")
     
     # LLM Semantic Scoring (optional, controlled by config)
     llm_semantic_used = False
@@ -2562,8 +2564,7 @@ def compute_highlights_candidates(
         _highlight_logger.info("[highlights_candidates] LLM semantic scoring skipped (no candidates)")
     
     if llm_semantic_enabled and llm_complete is not None and candidates:
-        if on_progress:
-            on_progress(0.70)
+        _report_progress(on_progress, 0.70, "Starting LLM semantic scoring")
         
         try:
             content_type = str(highlights_cfg.get("content_type", "gaming"))
@@ -2600,8 +2601,7 @@ def compute_highlights_candidates(
         except Exception as e:
             _highlight_logger.warning(f"LLM semantic scoring failed: {e}")
     
-    if on_progress:
-        on_progress(0.85)
+    _report_progress(on_progress, 0.85, "Checking LLM quality filter")
     
     # LLM Quality Filter (optional, more aggressive than semantic scoring)
     llm_filter_used = False
@@ -2617,8 +2617,7 @@ def compute_highlights_candidates(
         _highlight_logger.info("[highlights_candidates] LLM quality filter skipped (no candidates)")
     
     if llm_filter_enabled and llm_complete is not None and candidates:
-        if on_progress:
-            on_progress(0.87)
+        _report_progress(on_progress, 0.87, "Running LLM quality filter")
         
         try:
             min_quality = int(highlights_cfg.get("llm_filter_min_quality", 5))
@@ -2648,8 +2647,7 @@ def compute_highlights_candidates(
     elif not llm_filter_enabled:
         _highlight_logger.info("[highlights_candidates] LLM quality filter disabled in config")
     
-    if on_progress:
-        on_progress(0.92)
+    _report_progress(on_progress, 0.92, "Saving highlights.json")
     
     # Build and save payload
     payload: Dict[str, Any] = {
@@ -2688,7 +2686,6 @@ def compute_highlights_candidates(
     
     update_project(proj, _upd)
     
-    if on_progress:
-        on_progress(1.0)
+    _report_progress(on_progress, 1.0, "Done")
     
     return payload

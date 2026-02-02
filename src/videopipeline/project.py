@@ -269,8 +269,70 @@ class Project:
         return self.video_path
 
 
+def find_project_for_video(video_path: Path, projects_root: Optional[Path] = None) -> Optional[Path]:
+    """Find an existing project directory that contains a given video file.
+    
+    This handles the case where a project was created via URL download (using content_id hash)
+    and we later want to open it by video path.
+    
+    Checks:
+    1. If video_path is already inside a project's video/ folder -> return that project
+    2. Scan all projects for matching video path in project.json
+    
+    Args:
+        video_path: Path to the video file
+        projects_root: Optional custom projects directory
+        
+    Returns:
+        Path to the project directory if found, None otherwise
+    """
+    video_path = Path(video_path).expanduser().resolve()
+    projects_root = projects_root or default_projects_root()
+    
+    if not projects_root.exists():
+        return None
+    
+    # Check if video_path is already inside a project's video/ folder
+    # e.g., outputs/projects/<hash>/video/video.mp4
+    try:
+        for parent in video_path.parents:
+            if parent.parent == projects_root:
+                # This is a project directory
+                if (parent / "project.json").exists():
+                    return parent
+    except Exception:
+        pass
+    
+    # Scan all projects to find one that references this video
+    for proj_dir in projects_root.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        
+        project_json = proj_dir / "project.json"
+        if not project_json.exists():
+            continue
+        
+        try:
+            data = load_json(project_json)
+            stored_path = data.get("video", {}).get("path")
+            if stored_path and Path(stored_path).resolve() == video_path:
+                return proj_dir
+        except Exception:
+            continue
+    
+    return None
+
+
 def create_or_load_project(video_path: Path, projects_root: Optional[Path] = None) -> Project:
     video_path = Path(video_path).expanduser().resolve()
+    
+    # First, check if there's already a project for this video
+    # (handles projects created via URL download with different hash)
+    existing_pdir = find_project_for_video(video_path, projects_root)
+    if existing_pdir:
+        return Project(project_dir=existing_pdir, video_path=video_path)
+    
+    # No existing project found, create new one based on file fingerprint
     pdir = project_dir_for_video(video_path, projects_root)
     pdir.mkdir(parents=True, exist_ok=True)
 

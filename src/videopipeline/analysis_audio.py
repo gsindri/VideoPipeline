@@ -47,17 +47,23 @@ def compute_audio_rms_from_file(
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
     
+    # Helper for progress reporting with optional message
+    def _report(frac: float, msg: str = "") -> None:
+        if on_progress:
+            try:
+                on_progress(frac, msg)
+            except TypeError:
+                on_progress(frac)
+    
     duration_s = ffprobe_duration_seconds(audio_path)
     
-    if on_progress:
-        on_progress(0.1)
+    _report(0.1, "Extracting audio RMS timeline")
     
     # Compute RMS timeline (works on any audio/video file)
     cfg = AudioFeatureConfig(sample_rate=sample_rate, hop_seconds=hop_s)
     timeline_db = audio_rms_db_timeline(audio_path, cfg)
     
-    if on_progress:
-        on_progress(0.7)
+    _report(0.7, "Smoothing and computing z-scores")
     
     x = np.array(timeline_db, dtype=np.float64)
     times = np.arange(len(x)) * hop_s
@@ -67,8 +73,7 @@ def compute_audio_rms_from_file(
     xs = moving_average(x, smooth_frames)
     scores = robust_z(xs)
     
-    if on_progress:
-        on_progress(0.9)
+    _report(0.9, "Building results")
     
     elapsed_seconds = _time.time() - start_time
     
@@ -85,8 +90,7 @@ def compute_audio_rms_from_file(
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     
-    if on_progress:
-        on_progress(1.0)
+    _report(1.0, "Done")
     
     return result
 
@@ -190,13 +194,20 @@ def compute_audio_analysis(
     start_time = _time.time()
     video_path = Path(proj.audio_source)  # Use audio_source for fallback during early analysis
     duration_s = ffprobe_duration_seconds(video_path)
+    
+    # Helper for progress reporting with optional message
+    def _report(frac: float, msg: str = "") -> None:
+        if on_progress:
+            try:
+                on_progress(frac, msg)
+            except TypeError:
+                on_progress(frac)
 
     # Use shared RMS timeline computation
     cfg = AudioFeatureConfig(sample_rate=sample_rate, hop_seconds=hop_s)
     timeline_db = audio_rms_db_timeline(video_path, cfg)
     
-    if on_progress:
-        on_progress(0.5)  # Mark audio processing complete
+    _report(0.5, "Audio extraction complete, computing scores")
 
     x = np.array(timeline_db, dtype=np.float64)
     
@@ -276,7 +287,6 @@ def compute_audio_analysis(
 
     update_project(proj, _upd)
 
-    if on_progress:
-        on_progress(1.0)
+    _report(1.0, "Done")
 
     return payload

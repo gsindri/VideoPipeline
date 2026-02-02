@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -11,6 +12,8 @@ from typing import Any, Callable, Optional
 from .ffmpeg import _require_cmd, ffprobe_video_stream_info
 from .layouts import RectNorm
 from .utils import subprocess_flags as _subprocess_flags
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -104,15 +107,24 @@ def measure_loudness(
             text=True,
             **_subprocess_flags(),
         )
+        if result.returncode != 0:
+            err = (result.stderr or "").strip()
+            logger.warning("ffmpeg loudnorm (pass 1) failed (exit=%s): %s", result.returncode, err[:800])
+            return None
         # loudnorm outputs JSON to stderr
         stderr = result.stderr
         
         # Find JSON block in output (it's embedded in other ffmpeg output)
         json_match = re.search(r'\{[^{}]*"input_i"[^{}]*\}', stderr, re.DOTALL)
         if not json_match:
+            logger.warning("ffmpeg loudnorm (pass 1) did not emit parseable JSON. stderr: %s", (stderr or "")[:800])
             return None
         
-        data = json.loads(json_match.group())
+        try:
+            data = json.loads(json_match.group())
+        except json.JSONDecodeError as exc:
+            logger.warning("Failed to parse loudnorm JSON: %s", exc)
+            return None
         
         # Extract the values we need for second pass
         measured = {
@@ -127,7 +139,8 @@ def measure_loudness(
             on_progress(1.0, "loudness measured")
         
         return measured
-    except Exception:
+    except Exception as exc:
+        logger.warning("Loudness measurement failed, falling back to single-pass loudnorm: %s", exc, exc_info=True)
         return None
 
 
@@ -413,6 +426,10 @@ def run_ffmpeg_export(
             # Attach measured values to spec for build_ffmpeg_command
             # Using object.__setattr__ since ExportSpec is frozen
             object.__setattr__(spec, '_loudness_measured', measured)
+        else:
+            logger.warning(
+                "Two-pass loudnorm requested but pass 1 failed; using single-pass loudnorm for this export."
+            )
     
     cmd = build_ffmpeg_command(spec)
 

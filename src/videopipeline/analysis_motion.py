@@ -32,6 +32,14 @@ def compute_motion_analysis(
 
     total_frames = max(1, int(duration_s * sample_fps))
     processed = 0
+    
+    # Helper for progress reporting with optional message
+    def _report(frac: float, msg: str = "") -> None:
+        if on_progress:
+            try:
+                on_progress(frac, msg)
+            except TypeError:
+                on_progress(frac)
 
     prev: Optional[np.ndarray] = None
     diffs: list[float] = []
@@ -48,8 +56,9 @@ def compute_motion_analysis(
         prev = frame
         frame_count += 1
         processed += 1
-        if on_progress and processed % 20 == 0:
-            on_progress(min(0.95, processed / total_frames))
+        if processed % 20 == 0:
+            pct = 100 * processed / total_frames
+            _report(min(0.95, processed / total_frames), f"Processing frames: {processed}/{total_frames} ({pct:.0f}%)")
 
     x = np.array(diffs, dtype=np.float64)
     # Create explicit times array aligned with diffs
@@ -92,7 +101,6 @@ def compute_motion_analysis(
 
     update_project(proj, _upd)
 
-    if on_progress:
-        on_progress(1.0)
+    _report(1.0, "Done")
 
     return payload
