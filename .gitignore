@@ -87,3 +87,4 @@ logs/
 # Allow small tracked samples under samples/
 !samples/
 !samples/**/*
+/_shots
