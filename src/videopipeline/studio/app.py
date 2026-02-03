@@ -1653,7 +1653,7 @@ def create_app(
                 3. Import chat if available
                 4. Run DAG analysis - incremental, so safe to call multiple times
                 """
-                nonlocal early_proj, early_dag_result, early_dag_status, audio_rms_status, audio_events_status, transcript_status
+                nonlocal early_proj, early_dag_result, early_dag_status, audio_rms_status, audio_events_status, transcript_status, diarization_status
                 import logging
                 import shutil
                 log = logging.getLogger("videopipeline.studio")
@@ -1699,8 +1699,11 @@ def create_app(
                     if chat_temp_path and chat_temp_path.exists():
                         try:
                             from ..chat.downloader import import_chat_to_project
-                            import_chat_to_project(early_proj, chat_temp_path)
-                            log.info(f"[DAG] Imported chat to early project")
+                            if getattr(early_proj, "chat_db_path", None) and early_proj.chat_db_path.exists():
+                                log.info("[DAG] Chat already present in early project (chat.sqlite exists)")
+                            else:
+                                import_chat_to_project(early_proj, chat_temp_path)
+                                log.info(f"[DAG] Imported chat to early project")
                         except Exception as e:
                             log.warning(f"[DAG] Chat import failed: {e}")
                     
@@ -1735,18 +1738,34 @@ def create_app(
                         early_dag_status["progress"] = frac
                         early_dag_status["message"] = msg
                         
+                        # Prefer task-local percentages (runner emits e.g. "transcript: 42%").
+                        pct = None
+                        try:
+                            import re as _re
+
+                            m = _re.search(r"(\d{1,3})%", msg)
+                            if m:
+                                v = int(m.group(1))
+                                v = max(0, min(100, v))
+                                pct = v / 100.0
+                        except Exception:
+                            pct = None
+
                         # Update sub-status based on what DAG is doing
                         # Handle both single task ("Running transcript...") and parallel ("Running X, Y in parallel...")
                         msg_lower = msg.lower()
                         if "transcript" in msg_lower:
                             transcript_status["status"] = "transcribing"
-                            transcript_status["progress"] = frac
+                            transcript_status["progress"] = pct if pct is not None else frac
                         if "audio_features" in msg_lower:
                             audio_rms_status["status"] = "analyzing"
-                            audio_rms_status["progress"] = frac
+                            audio_rms_status["progress"] = pct if pct is not None else frac
                         if "audio_events" in msg_lower:
                             audio_events_status["status"] = "analyzing"
-                            audio_events_status["progress"] = frac
+                            audio_events_status["progress"] = pct if pct is not None else frac
+                        if "diarization" in msg_lower:
+                            diarization_status["status"] = "analyzing"
+                            diarization_status["progress"] = pct if pct is not None else frac
                         
                         # For parallel execution, mark all mentioned tasks as running
                         if "parallel" in msg_lower:
@@ -1763,10 +1782,14 @@ def create_app(
                         config=dag_config,
                         on_progress=on_dag_progress,
                     )
-                    
-                    early_dag_status["status"] = "complete"
-                    early_dag_status["progress"] = 1.0
+
                     early_dag_result = result
+                    early_dag_status["progress"] = 1.0
+                    if getattr(result, "success", True):
+                        early_dag_status["status"] = "complete"
+                    else:
+                        early_dag_status["status"] = "failed"
+                        early_dag_status["message"] = getattr(result, "error", "") or "DAG analysis failed"
                     
                     # Update sub-statuses based on actual task results
                     # Build a dict of task_name -> status for easy lookup
@@ -1803,8 +1826,45 @@ def create_app(
                             log.info(f"[DAG] Audio events task skipped - already exists (cached)")
                             audio_events_status["status"] = "complete"
                             audio_events_status["progress"] = 1.0
+
+                    diar_tr = next((tr for tr in result.tasks_run if tr.task_name == "diarization"), None)
+                    if diar_tr is not None:
+                        diar_out = early_proj.analysis_dir / "diarization.json"
+                        if diar_tr.status == "completed" or (diar_tr.status == "skipped" and diar_out.exists()):
+                            diarization_status["status"] = "complete"
+                            diarization_status["progress"] = 1.0
+                            try:
+                                from ..analysis_diarization import load_diarization
+
+                                diar = load_diarization(early_proj) or {}
+                                speakers = diar.get("speakers")
+                                if isinstance(speakers, list):
+                                    diarization_status["speakers"] = speakers
+                            except Exception:
+                                pass
+                        elif diar_tr.status == "failed":
+                            diarization_status["status"] = "failed"
+                            diarization_status["progress"] = 0
+                        else:
+                            # Task ran but produced no output (optional/unavailable) or was disabled.
+                            diarization_status["status"] = "failed"
+                            diarization_status["progress"] = 0
                     
-                    log.info(f"[DAG] Pre-download analysis complete: {len(result.tasks_run)} tasks in {result.total_elapsed_seconds:.1f}s")
+                    # Summary log that reflects partial failures.
+                    _counts: Dict[str, int] = {}
+                    for tr in result.tasks_run:
+                        _counts[tr.status] = _counts.get(tr.status, 0) + 1
+                    _summary = ", ".join(f"{k}={v}" for k, v in sorted(_counts.items()))
+                    if getattr(result, "success", True):
+                        log.info(
+                            f"[DAG] Pre-download analysis complete: {len(result.tasks_run)} tasks "
+                            f"in {result.total_elapsed_seconds:.1f}s ({_summary})"
+                        )
+                    else:
+                        log.warning(
+                            f"[DAG] Pre-download analysis completed with failures: {len(result.tasks_run)} tasks "
+                            f"in {result.total_elapsed_seconds:.1f}s ({_summary}); error={getattr(result, 'error', '')}"
+                        )
                     return result
                     
                 except Exception as e:
@@ -1825,9 +1885,12 @@ def create_app(
                     
                     dag_future = None
                     dag_rerun_future = None  # For incremental re-run when chat arrives
+                    chat_analysis_future = None  # Runs chat-only analysis when chat arrives mid-DAG
                     audio_path_for_transcript = None
                     chat_temp_for_dag = None
+                    dag_started_with_chat = False
                     chat_arrived_after_dag_started = False
+                    chat_imported_to_early_proj = False
                     
                     # Wait for all to complete, checking for cancellation
                     # and starting analysis tasks when audio is ready
@@ -1840,23 +1903,24 @@ def create_app(
                         # Check if audio and chat are done and we haven't started DAG yet
                         audio_done = audio_future and audio_future.done()
                         chat_done_early = chat_future and chat_future.done()
+
+                        # Capture chat temp path as soon as chat finishes (even if DAG already started)
+                        if chat_done_early and chat_temp_for_dag is None:
+                            try:
+                                chat_result_early = chat_future.result()
+                                if chat_result_early and chat_result_early.get("status") == "success":
+                                    chat_temp_for_dag = Path(chat_result_early.get("temp_path", ""))
+                            except Exception:
+                                pass
                         
                         if audio_done and dag_future is None:
                             try:
                                 audio_path_for_transcript = audio_future.result()
                                 
-                                # Get chat temp path if available
-                                if chat_done_early:
-                                    try:
-                                        chat_result_early = chat_future.result()
-                                        if chat_result_early and chat_result_early.get("status") == "success":
-                                            chat_temp_for_dag = Path(chat_result_early.get("temp_path", ""))
-                                    except Exception:
-                                        pass
-                                
                                 if audio_path_for_transcript:
                                     log.info(f"[DOWNLOAD] Audio ready, starting DAG analysis...")
                                     # Use the new DAG-based early analysis
+                                    dag_started_with_chat = bool(chat_temp_for_dag and chat_temp_for_dag.exists())
                                     dag_future = executor.submit(
                                         run_early_dag_analysis,
                                         audio_path_for_transcript,
@@ -1871,65 +1935,154 @@ def create_app(
                         dag_started = dag_future is not None
                         dag_running = dag_started and not dag_future.done()
                         dag_finished = dag_started and dag_future.done()
-                        chat_just_finished = chat_done_early and not chat_arrived_after_dag_started
-                        
-                        if dag_finished and chat_just_finished and chat_temp_for_dag is None and dag_rerun_future is None:
-                            # Chat arrived after DAG finished without it - do incremental re-run
+
+                        # If chat arrives while the main DAG is still running, import it and compute
+                        # chat-derived artifacts ASAP (so we don't need a delayed full rerun).
+                        if (
+                            dag_running
+                            and chat_done_early
+                            and (chat_temp_for_dag is not None)
+                            and chat_temp_for_dag.exists()
+                            and early_proj
+                            and (not dag_started_with_chat)
+                            and (not chat_imported_to_early_proj)
+                        ):
                             try:
-                                chat_result_late = chat_future.result()
-                                if chat_result_late and chat_result_late.get("status") == "success":
-                                    late_chat_path = Path(chat_result_late.get("temp_path", ""))
-                                    if late_chat_path.exists() and early_proj:
-                                        log.info(f"[DOWNLOAD] Chat arrived after initial DAG, doing incremental re-run...")
-                                        chat_arrived_after_dag_started = True
+                                from ..chat.downloader import import_chat_to_project
+
+                                if getattr(early_proj, "chat_db_path", None) and early_proj.chat_db_path.exists():
+                                    log.info("[DAG] Late chat already present in early project (chat.sqlite exists)")
+                                else:
+                                    import_chat_to_project(early_proj, chat_temp_for_dag)
+                                    log.info("[DAG] Imported late chat to project (while DAG running)")
+
+                                chat_imported_to_early_proj = True
+                                chat_arrived_after_dag_started = True
+
+                                if chat_analysis_future is None:
+                                    from ..analysis import run_analysis
+
+                                    def run_chat_only_analysis():
+                                        nonlocal early_dag_result, early_dag_status
+                                        try:
+                                            analysis_cfg = ctx.profile.get("analysis", {})
+                                            dag_config = {
+                                                "audio": analysis_cfg.get("audio", {}),
+                                                "silence": analysis_cfg.get("silence", {}),
+                                                "speech": analysis_cfg.get("speech", {}),
+                                                "sentences": analysis_cfg.get("sentences", {}),
+                                                "speech_features": analysis_cfg.get("speech_features", {}),
+                                                "highlights": analysis_cfg.get("highlights", {}),
+                                                "audio_events": analysis_cfg.get("audio_events", {}),
+                                                "include_chat": True,
+                                                "include_audio_events": bool(analysis_cfg.get("audio_events", {}).get("enabled", True)),
+                                            }
+
+                                            def on_chat_progress(frac: float, msg: str) -> None:
+                                                # Keep the main DAG progress intact; just update message for visibility.
+                                                check_cancel()
+                                                early_dag_status["message"] = msg
+
+                                            # Only run chat-derived targets; this is safe to run concurrently with
+                                            # the main DAG because of per-task file locks.
+                                            return run_analysis(
+                                                early_proj,
+                                                targets={"chat_boundaries"},
+                                                config=dag_config,
+                                                on_progress=on_chat_progress,
+                                            )
+                                        except Exception as e:
+                                            log.warning(f"[DAG] Chat-only analysis failed: {e}")
+                                            return None
+
+                                    chat_analysis_future = executor.submit(run_chat_only_analysis)
+                            except Exception as e:
+                                log.warning(f"[DAG] Late chat import during DAG failed: {e}")
+                        
+                        if (
+                            dag_finished
+                            and chat_done_early
+                            and (chat_temp_for_dag is not None)
+                            and chat_temp_for_dag.exists()
+                            and (not dag_started_with_chat)
+                            and (not chat_imported_to_early_proj)
+                            and (not chat_arrived_after_dag_started)
+                            and dag_rerun_future is None
+                        ):
+                            # Chat arrived after the main DAG started (or we couldn't import while it was running).
+                            # Do a post-DAG incremental re-run so chat-dependent tasks can compute.
+                            try:
+                                late_chat_path = chat_temp_for_dag
+                                if early_proj:
+                                    log.info(f"[DOWNLOAD] Chat arrived after initial DAG, doing incremental re-run...")
+                                    chat_arrived_after_dag_started = True
                                         
-                                        # Import chat and re-run DAG (will only compute chat-dependent tasks)
-                                        def incremental_dag_with_chat():
-                                            nonlocal early_dag_result, early_dag_status
-                                            try:
-                                                from ..chat.downloader import import_chat_to_project
-                                                from ..analysis import run_analysis
-                                                
+                                    # Import chat and re-run DAG (cached tasks are skipped)
+                                    def incremental_dag_with_chat():
+                                        nonlocal early_dag_result, early_dag_status, chat_imported_to_early_proj
+                                        try:
+                                            from ..chat.downloader import import_chat_to_project
+                                            from ..analysis import run_analysis
+
+                                            if getattr(early_proj, "chat_db_path", None) and early_proj.chat_db_path.exists():
+                                                log.info("[DAG] Late chat already present in early project (chat.sqlite exists)")
+                                            else:
                                                 import_chat_to_project(early_proj, late_chat_path)
                                                 log.info(f"[DAG] Imported late chat to project")
+                                            chat_imported_to_early_proj = True
                                                 
-                                                early_dag_status["status"] = "analyzing"
-                                                early_dag_status["message"] = "Adding chat features..."
+                                            early_dag_status["status"] = "analyzing"
+                                            early_dag_status["message"] = "Adding chat features..."
                                                 
-                                                analysis_cfg = ctx.profile.get("analysis", {})
-                                                dag_config = {
-                                                    "audio": analysis_cfg.get("audio", {}),
-                                                    "silence": analysis_cfg.get("silence", {}),
-                                                    "speech": analysis_cfg.get("speech", {}),
-                                                    "sentences": analysis_cfg.get("sentences", {}),
-                                                    "speech_features": analysis_cfg.get("speech_features", {}),
-                                                    "highlights": analysis_cfg.get("highlights", {}),
-                                                    "audio_events": analysis_cfg.get("audio_events", {}),
-                                                    "include_chat": True,
-                                                    "include_audio_events": bool(analysis_cfg.get("audio_events", {}).get("enabled", True)),
-                                                }
+                                            analysis_cfg = ctx.profile.get("analysis", {})
+                                            dag_config = {
+                                                "audio": analysis_cfg.get("audio", {}),
+                                                "silence": analysis_cfg.get("silence", {}),
+                                                "speech": analysis_cfg.get("speech", {}),
+                                                "sentences": analysis_cfg.get("sentences", {}),
+                                                "speech_features": analysis_cfg.get("speech_features", {}),
+                                                "highlights": analysis_cfg.get("highlights", {}),
+                                                "audio_events": analysis_cfg.get("audio_events", {}),
+                                                "include_chat": True,
+                                                "include_audio_events": bool(analysis_cfg.get("audio_events", {}).get("enabled", True)),
+                                            }
                                                 
-                                                def on_rerun_progress(frac: float, msg: str) -> None:
-                                                    check_cancel()
-                                                    early_dag_status["progress"] = frac
-                                                    early_dag_status["message"] = msg
+                                            def on_rerun_progress(frac: float, msg: str) -> None:
+                                                check_cancel()
+                                                early_dag_status["progress"] = frac
+                                                early_dag_status["message"] = msg
                                                 
-                                                result = run_analysis(
-                                                    early_proj,
-                                                    bundle="pre_download",
-                                                    config=dag_config,
-                                                    on_progress=on_rerun_progress,
-                                                )
-                                                
+                                            result = run_analysis(
+                                                early_proj,
+                                                bundle="pre_download",
+                                                config=dag_config,
+                                                on_progress=on_rerun_progress,
+                                            )
+
+                                            early_dag_status["progress"] = 1.0
+                                            if getattr(result, "success", True):
                                                 early_dag_status["status"] = "complete"
-                                                early_dag_result = result
-                                                log.info(f"[DAG] Incremental re-run complete: {len(result.tasks_run)} tasks")
-                                                return result
-                                            except Exception as e:
-                                                log.warning(f"[DAG] Incremental re-run failed: {e}")
-                                                return None
+                                            else:
+                                                early_dag_status["status"] = "failed"
+                                                early_dag_status["message"] = getattr(result, "error", "") or "DAG analysis failed"
+                                            early_dag_result = result
+                                            _counts: Dict[str, int] = {}
+                                            for tr in result.tasks_run:
+                                                _counts[tr.status] = _counts.get(tr.status, 0) + 1
+                                            _summary = ", ".join(f"{k}={v}" for k, v in sorted(_counts.items()))
+                                            if getattr(result, "success", True):
+                                                log.info(f"[DAG] Incremental re-run complete: {len(result.tasks_run)} tasks ({_summary})")
+                                            else:
+                                                log.warning(
+                                                    f"[DAG] Incremental re-run completed with failures: {len(result.tasks_run)} tasks "
+                                                    f"({ _summary}); error={getattr(result, 'error', '')}"
+                                                )
+                                            return result
+                                        except Exception as e:
+                                            log.warning(f"[DAG] Incremental re-run failed: {e}")
+                                            return None
                                         
-                                        dag_rerun_future = executor.submit(incremental_dag_with_chat)
+                                    dag_rerun_future = executor.submit(incremental_dag_with_chat)
                             except Exception:
                                 pass
                         
@@ -1938,8 +2091,9 @@ def create_app(
                         chat_done = chat_future.done()
                         dag_done = dag_future is None or dag_future.done()
                         rerun_done = dag_rerun_future is None or dag_rerun_future.done()
+                        chat_analysis_done = chat_analysis_future is None or chat_analysis_future.done()
                         
-                        if video_done and chat_done and dag_done and rerun_done:
+                        if video_done and chat_done and dag_done and rerun_done and chat_analysis_done:
                             break
                         
                         # Update UI with current analysis progress while waiting
@@ -1983,6 +2137,15 @@ def create_app(
                                     "dag_status": early_dag_status.get("status", "pending"),
                                     "dag_progress": early_dag_status.get("progress", 0),
                                     "dag_message": early_dag_status.get("message", ""),
+                                    "transcript_status": transcript_status.get("status", "pending"),
+                                    "transcript_progress": transcript_status.get("progress", 0),
+                                    "audio_rms_status": audio_rms_status.get("status", "pending"),
+                                    "audio_rms_progress": audio_rms_status.get("progress", 0),
+                                    "audio_events_status": audio_events_status.get("status", "pending"),
+                                    "audio_events_progress": audio_events_status.get("progress", 0),
+                                    "diarization_status": diarization_status.get("status", "pending"),
+                                    "diarization_progress": diarization_status.get("progress", 0),
+                                    "diarization_speakers": diarization_status.get("speakers", []),
                                 }
                             )
                         
@@ -2013,7 +2176,12 @@ def create_app(
                         try:
                             early_dag_result = dag_future.result()
                             if early_dag_result:
-                                log.info(f"[DOWNLOAD] Early DAG analysis completed successfully")
+                                _success = bool(getattr(early_dag_result, "success", True))
+                                _error = getattr(early_dag_result, "error", "") or ""
+                                if _success:
+                                    log.info("[DOWNLOAD] Early DAG analysis completed")
+                                else:
+                                    log.warning(f"[DOWNLOAD] Early DAG analysis completed with failures: {_error}")
                         except CancelledError:
                             raise  # Re-raise cancellation
                         except DownloadCancelled:
@@ -2027,7 +2195,12 @@ def create_app(
                             rerun_result = dag_rerun_future.result()
                             if rerun_result:
                                 early_dag_result = rerun_result  # Use the more complete result
-                                log.info(f"[DOWNLOAD] Incremental DAG rerun completed successfully")
+                                _success = bool(getattr(early_dag_result, "success", True))
+                                _error = getattr(early_dag_result, "error", "") or ""
+                                if _success:
+                                    log.info("[DOWNLOAD] Incremental DAG rerun completed")
+                                else:
+                                    log.warning(f"[DOWNLOAD] Incremental DAG rerun completed with failures: {_error}")
                         except CancelledError:
                             raise
                         except DownloadCancelled:
@@ -2080,52 +2253,74 @@ def create_app(
                     set_source_url(proj, url)
                     
                     # If chat was downloaded and NOT already imported by DAG, import it
-                    chat_already_imported = early_proj is not None and chat_temp_for_dag is not None
+                    chat_already_imported = bool(getattr(proj, "chat_db_path", None) and proj.chat_db_path.exists())
                     log.info(f"[CHAT DEBUG] Checking chat_result: status={chat_result.get('status')}, already_imported={chat_already_imported}")
-                    if chat_result.get("status") == "success" and chat_result.get("temp_path") and not chat_already_imported:
+                    if chat_result.get("status") == "success" and chat_result.get("temp_path"):
                         chat_temp = Path(chat_result["temp_path"])
                         log.info(f"[CHAT DEBUG] Chat temp file exists: {chat_temp.exists()}")
                         if chat_temp.exists():
                             log.info(f"[CHAT DEBUG] Chat temp file size: {chat_temp.stat().st_size} bytes")
-                        
-                        JOB_MANAGER._set(
-                            job, 
-                            progress=0.95, 
-                            message="Importing chat into project...",
-                            result={
-                                "video_status": "complete",
-                                "chat_status": "importing",
-                                "chat_message": "Reading chat file...",
-                                "dag_status": early_dag_status.get("status", "pending"),
-                                "dag_progress": early_dag_status.get("progress", 0),
-                            }
-                        )
-                        try:
-                            from ..chat.downloader import import_chat_to_project
-                            
-                            # Update progress during import
+
+                        # Import once (DAG may have already imported into chat.sqlite)
+                        if chat_already_imported:
+                            log.info(f"[CHAT DEBUG] Chat already imported (chat.sqlite exists)")
+                            chat_result["imported"] = True
+                            from ..project import set_chat_config
+                            set_chat_config(proj, download_status="success")
+                        elif chat_temp.exists():
                             JOB_MANAGER._set(
                                 job,
-                                progress=0.96,
-                                message="Importing chat: parsing messages...",
+                                progress=0.95,
+                                message="Importing chat into project...",
                                 result={
                                     "video_status": "complete",
                                     "chat_status": "importing",
-                                    "chat_message": "Parsing messages...",
+                                    "chat_message": "Reading chat file...",
                                     "dag_status": early_dag_status.get("status", "pending"),
                                     "dag_progress": early_dag_status.get("progress", 0),
                                 }
                             )
-                            
-                            log.info(f"[CHAT DEBUG] Calling import_chat_to_project...")
-                            import_chat_to_project(proj, chat_temp)
-                            log.info(f"[CHAT DEBUG] import_chat_to_project completed successfully")
-                            
-                            # Verify the chat.sqlite was created
-                            chat_db = proj.chat_db_path
-                            log.info(f"[CHAT DEBUG] chat_db_path: {chat_db}, exists: {chat_db.exists()}")
-                            
-                            # Now compute chat features with LLM
+                            try:
+                                from ..chat.downloader import import_chat_to_project
+
+                                # Update progress during import
+                                JOB_MANAGER._set(
+                                    job,
+                                    progress=0.96,
+                                    message="Importing chat: parsing messages...",
+                                    result={
+                                        "video_status": "complete",
+                                        "chat_status": "importing",
+                                        "chat_message": "Parsing messages...",
+                                        "dag_status": early_dag_status.get("status", "pending"),
+                                        "dag_progress": early_dag_status.get("progress", 0),
+                                    }
+                                )
+
+                                log.info(f"[CHAT DEBUG] Calling import_chat_to_project...")
+                                import_chat_to_project(proj, chat_temp)
+                                log.info(f"[CHAT DEBUG] import_chat_to_project completed successfully")
+
+                                # Verify the chat.sqlite was created
+                                chat_db = proj.chat_db_path
+                                log.info(f"[CHAT DEBUG] chat_db_path: {chat_db}, exists: {chat_db.exists()}")
+
+                                chat_result["imported"] = True
+
+                                # Record successful chat download in project
+                                from ..project import set_chat_config
+                                set_chat_config(proj, download_status="success")
+                            except Exception as e:
+                                import traceback
+                                log.error(f"[CHAT DEBUG] Import exception: {e}\n{traceback.format_exc()}")
+                                chat_result["import_error"] = str(e)
+                                from ..project import set_chat_config
+                                set_chat_config(proj, download_status="failed", download_error=str(e))
+                        else:
+                            log.warning(f"[CHAT DEBUG] Chat temp file missing: {chat_temp}")
+
+                        # Compute LLM-based chat features if chat is available in project
+                        if getattr(proj, "chat_db_path", None) and proj.chat_db_path.exists():
                             JOB_MANAGER._set(
                                 job,
                                 progress=0.97,
@@ -2138,30 +2333,30 @@ def create_app(
                                     "transcript_progress": transcript_status.get("progress", 0),
                                 }
                             )
-                            
+
                             try:
                                 from ..chat.features import compute_and_save_chat_features
-                                
+
                                 hop_s = float(ctx.profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
                                 smooth_s = float(ctx.profile.get("analysis", {}).get("highlights", {}).get("chat_smooth_seconds", 3.0))
-                                
+
                                 # Get LLM for laugh emote learning
                                 ai_cfg = ctx.profile.get("ai", {}).get("director", {})
-                                
+
                                 def on_llm_status(msg: str) -> None:
                                     JOB_MANAGER._set(job, message=msg)
-                                
+
                                 llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir, on_status=on_llm_status)
-                                
+
                                 def on_feature_status(msg: str) -> None:
                                     JOB_MANAGER._set(job, message=msg)
-                                
+
                                 # Extract channel info from URL for global emote persistence
                                 from ..chat.emote_db import get_channel_for_project
                                 channel_info = get_channel_for_project(proj, source_url=url)
                                 channel_id = channel_info[0] if channel_info else None
                                 platform = channel_info[1] if channel_info else "twitch"
-                                
+
                                 compute_and_save_chat_features(
                                     proj,
                                     hop_s=hop_s,
@@ -2175,7 +2370,8 @@ def create_app(
                             except Exception as e:
                                 log.warning(f"[CHAT DEBUG] Chat feature computation failed: {e}")
                                 # Non-fatal - features can be computed later during analysis
-                            
+
+                        if chat_result.get("imported"):
                             JOB_MANAGER._set(
                                 job,
                                 progress=0.99,
@@ -2188,30 +2384,14 @@ def create_app(
                                     "transcript_progress": transcript_status.get("progress", 0),
                                 }
                             )
-                            chat_result["imported"] = True
-                            
-                            # Record successful chat download in project
-                            from ..project import set_chat_config
-                            set_chat_config(proj, download_status="success")
-                            
-                            # Clean up temp file after successful import
+
+                        # Clean up temp file once it has been imported (or if it was imported earlier).
+                        if (chat_result.get("imported") or chat_already_imported) and chat_temp.exists():
                             try:
                                 chat_temp.unlink()
                                 log.info(f"[CHAT DEBUG] Cleaned up temp file")
                             except Exception:
                                 pass
-                        except Exception as e:
-                            import traceback
-                            log.error(f"[CHAT DEBUG] Import exception: {e}\n{traceback.format_exc()}")
-                            chat_result["import_error"] = str(e)
-                            # Record failed import status
-                            from ..project import set_chat_config
-                            set_chat_config(proj, download_status="failed", download_error=str(e))
-                    elif chat_already_imported:
-                        log.info(f"[CHAT DEBUG] Chat already imported by DAG analysis")
-                        chat_result["imported"] = True
-                        from ..project import set_chat_config
-                        set_chat_config(proj, download_status="success")
                     else:
                         log.info(f"[CHAT DEBUG] Skipping import - condition not met")
                         # Record the chat download status
@@ -2225,7 +2405,17 @@ def create_app(
                     # Early analysis is already saved to project by DAG runner
                     # Just log what was computed
                     if early_dag_result:
-                        log.info(f"[DOWNLOAD] DAG analysis completed: {len(early_dag_result.tasks_run)} tasks")
+                        _counts: Dict[str, int] = {}
+                        for tr in early_dag_result.tasks_run:
+                            _counts[tr.status] = _counts.get(tr.status, 0) + 1
+                        _summary = ", ".join(f"{k}={v}" for k, v in sorted(_counts.items()))
+                        if getattr(early_dag_result, "success", True):
+                            log.info(f"[DOWNLOAD] DAG analysis completed: {len(early_dag_result.tasks_run)} tasks ({_summary})")
+                        else:
+                            log.warning(
+                                f"[DOWNLOAD] DAG analysis completed with failures: {len(early_dag_result.tasks_run)} tasks "
+                                f"({_summary}); error={getattr(early_dag_result, 'error', '')}"
+                            )
                     
                     result_dict["project"] = get_project_data(proj)
                     result_dict["auto_opened"] = True
@@ -2234,9 +2424,12 @@ def create_app(
                     # Include DAG analysis status in result
                     if early_dag_result:
                         result_dict["dag_analysis"] = {
-                            "status": "complete",
+                            "status": "complete" if getattr(early_dag_result, "success", True) else "failed",
+                            "success": bool(getattr(early_dag_result, "success", True)),
                             "tasks_run": len(early_dag_result.tasks_run),
                             "elapsed_seconds": early_dag_result.total_elapsed_seconds,
+                            "error": getattr(early_dag_result, "error", None),
+                            "missing_targets": sorted(getattr(early_dag_result, "missing_targets", set()) or []),
                         }
                     elif early_dag_status.get("status") == "failed":
                         result_dict["dag_analysis"] = {"status": "failed", "error": early_dag_status.get("message")}
@@ -2244,7 +2437,13 @@ def create_app(
                 # Build final message
                 final_msg = "Download complete!"
                 if early_dag_result:
-                    final_msg = f"Download complete! Analysis ready ({len(early_dag_result.tasks_run)} tasks)."
+                    if getattr(early_dag_result, "success", True):
+                        final_msg = f"Download complete! Analysis ready ({len(early_dag_result.tasks_run)} tasks)."
+                    else:
+                        final_msg = (
+                            f"Download complete. Analysis completed with errors ({len(early_dag_result.tasks_run)} tasks): "
+                            f"{getattr(early_dag_result, 'error', '') or 'see logs'}"
+                        )
                 if chat_result.get("imported"):
                     final_msg += " Chat imported."
                 elif chat_result.get("import_error"):
