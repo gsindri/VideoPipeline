@@ -1235,6 +1235,9 @@ def create_app(
             # Shared state for progress tracking
             current_chat_status = {"status": "pending", "message": "Waiting..."}
             transcript_status = {"status": "pending", "progress": 0, "audio_path": None}
+            # Throttled logging for yt-dlp progress (keeps server logs readable).
+            video_log_next_pct = 0
+            video_log_last_phase_msg: Optional[str] = None
             
             # Cancellation support - raise this exception from callbacks to abort
             class CancelledError(Exception):
@@ -1263,9 +1266,42 @@ def create_app(
             diarization_status = {"status": "pending", "progress": 0}
 
             def on_video_progress(frac: float, msg: str) -> None:
+                nonlocal video_log_next_pct, video_log_last_phase_msg
                 # Check for cancellation
                 check_cancel()
                 
+                # Structured progress logging (avoid yt-dlp progress output interleaving).
+                # We log download progress at 10% steps + phase changes.
+                try:
+                    import re as _re
+
+                    if msg.startswith("Downloading"):
+                        m = _re.search(r"(\d{1,3})%", msg)
+                        if m:
+                            pct = max(0, min(100, int(m.group(1))))
+                            if pct >= video_log_next_pct:
+                                log.info("[DOWNLOAD] %s", msg)
+                                video_log_next_pct = min(100, ((pct // 10) + 1) * 10)
+                    else:
+                        if msg and msg != video_log_last_phase_msg:
+                            # Log key non-download phases once.
+                            if any(
+                                msg.startswith(prefix)
+                                for prefix in (
+                                    "Detecting",
+                                    "Detected:",
+                                    "Retrying",
+                                    "Throttled",
+                                    "Finding",
+                                    "Post-processing",
+                                    "Download complete",
+                                )
+                            ):
+                                log.info("[DOWNLOAD] %s", msg)
+                                video_log_last_phase_msg = msg
+                except Exception:
+                    pass
+
                 # Video download is 0-90%, chat is 90-100%
                 # Build combined message for main status line
                 chat_info = ""
@@ -1660,7 +1696,7 @@ def create_app(
                 
                 try:
                     from ..project import create_project_early, set_source_url
-                    from ..analysis import run_analysis, BUNDLE_PRE_DOWNLOAD
+                    from ..analysis import run_analysis
                     
                     # Extract content ID from URL
                     import re
@@ -1696,9 +1732,11 @@ def create_app(
                     log.info(f"[DAG] Copied audio to project: {audio_dest}")
                     
                     # Import chat if available
+                    chat_available = False
                     if chat_temp_path and chat_temp_path.exists():
                         try:
                             from ..chat.downloader import import_chat_to_project
+
                             if getattr(early_proj, "chat_db_path", None) and early_proj.chat_db_path.exists():
                                 log.info("[DAG] Chat already present in early project (chat.sqlite exists)")
                             else:
@@ -1706,6 +1744,15 @@ def create_app(
                                 log.info(f"[DAG] Imported chat to early project")
                         except Exception as e:
                             log.warning(f"[DAG] Chat import failed: {e}")
+
+                    # Determine whether chat is available (db or raw json) before starting analysis.
+                    # This controls whether we include chat-derived tasks in the initial DAG run.
+                    try:
+                        chat_db = early_proj.analysis_dir / "chat.sqlite"
+                        chat_json = early_proj.analysis_dir / "chat_raw.json"
+                        chat_available = chat_db.exists() or chat_json.exists()
+                    except Exception:
+                        chat_available = False
                     
                     # Build config from profile
                     analysis_cfg = ctx.profile.get("analysis", {})
@@ -1776,12 +1823,10 @@ def create_app(
                             if "audio_events" in msg_lower:
                                 audio_events_status["status"] = "analyzing"
                     
-                    result = run_analysis(
-                        early_proj,
-                        bundle="pre_download",
-                        config=dag_config,
-                        on_progress=on_dag_progress,
-                    )
+                    bundle_name = "pre_download" if chat_available else "pre_download_no_chat"
+                    if not chat_available:
+                        log.info("[DAG] Chat not available yet; deferring chat-derived tasks")
+                    result = run_analysis(early_proj, bundle=bundle_name, config=dag_config, on_progress=on_dag_progress)
 
                     early_dag_result = result
                     early_dag_status["progress"] = 1.0
@@ -2321,55 +2366,62 @@ def create_app(
 
                         # Compute LLM-based chat features if chat is available in project
                         if getattr(proj, "chat_db_path", None) and proj.chat_db_path.exists():
-                            JOB_MANAGER._set(
-                                job,
-                                progress=0.97,
-                                message="Learning chat emotes with AI...",
-                                result={
-                                    "video_status": "complete",
-                                    "chat_status": "ai_learning",
-                                    "chat_message": "Learning channel-specific emotes...",
-                                    "transcript_status": transcript_status.get("status", "pending"),
-                                    "transcript_progress": transcript_status.get("progress", 0),
-                                }
-                            )
-
-                            try:
-                                from ..chat.features import compute_and_save_chat_features
-
-                                hop_s = float(ctx.profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
-                                smooth_s = float(ctx.profile.get("analysis", {}).get("highlights", {}).get("chat_smooth_seconds", 3.0))
-
-                                # Get LLM for laugh emote learning
-                                ai_cfg = ctx.profile.get("ai", {}).get("director", {})
-
-                                def on_llm_status(msg: str) -> None:
-                                    JOB_MANAGER._set(job, message=msg)
-
-                                llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir, on_status=on_llm_status)
-
-                                def on_feature_status(msg: str) -> None:
-                                    JOB_MANAGER._set(job, message=msg)
-
-                                # Extract channel info from URL for global emote persistence
-                                from ..chat.emote_db import get_channel_for_project
-                                channel_info = get_channel_for_project(proj, source_url=url)
-                                channel_id = channel_info[0] if channel_info else None
-                                platform = channel_info[1] if channel_info else "twitch"
-
-                                compute_and_save_chat_features(
-                                    proj,
-                                    hop_s=hop_s,
-                                    smooth_s=smooth_s,
-                                    on_status=on_feature_status,
-                                    llm_complete=llm_complete_fn,
-                                    channel_id=channel_id,
-                                    platform=platform,
+                            # Avoid recomputing chat_features if the DAG (or a chat-only analysis run)
+                            # already produced it. This keeps logs clean and prevents confusing
+                            # "AI learning" messages when nothing is actually learned.
+                            if getattr(proj, "chat_features_path", None) and proj.chat_features_path.exists():
+                                log.info("[CHAT DEBUG] Chat features already exist (chat_features.npz); skipping recompute")
+                            else:
+                                JOB_MANAGER._set(
+                                    job,
+                                    progress=0.97,
+                                    message="Learning chat emotes with AI...",
+                                    result={
+                                        "video_status": "complete",
+                                        "chat_status": "ai_learning",
+                                        "chat_message": "Learning channel-specific emotes...",
+                                        "transcript_status": transcript_status.get("status", "pending"),
+                                        "transcript_progress": transcript_status.get("progress", 0),
+                                    },
                                 )
-                                log.info(f"[CHAT DEBUG] Chat features computed")
-                            except Exception as e:
-                                log.warning(f"[CHAT DEBUG] Chat feature computation failed: {e}")
-                                # Non-fatal - features can be computed later during analysis
+
+                                try:
+                                    from ..chat.features import compute_and_save_chat_features
+
+                                    hop_s = float(ctx.profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
+                                    smooth_s = float(ctx.profile.get("analysis", {}).get("highlights", {}).get("chat_smooth_seconds", 3.0))
+
+                                    # Get LLM for laugh emote learning
+                                    ai_cfg = ctx.profile.get("ai", {}).get("director", {})
+
+                                    def on_llm_status(msg: str) -> None:
+                                        JOB_MANAGER._set(job, message=msg)
+
+                                    llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir, on_status=on_llm_status)
+
+                                    def on_feature_status(msg: str) -> None:
+                                        JOB_MANAGER._set(job, message=msg)
+
+                                    # Extract channel info from URL for global emote persistence
+                                    from ..chat.emote_db import get_channel_for_project
+
+                                    channel_info = get_channel_for_project(proj, source_url=url)
+                                    channel_id = channel_info[0] if channel_info else None
+                                    platform = channel_info[1] if channel_info else "twitch"
+
+                                    compute_and_save_chat_features(
+                                        proj,
+                                        hop_s=hop_s,
+                                        smooth_s=smooth_s,
+                                        on_status=on_feature_status,
+                                        llm_complete=llm_complete_fn,
+                                        channel_id=channel_id,
+                                        platform=platform,
+                                    )
+                                    log.info(f"[CHAT DEBUG] Chat features computed")
+                                except Exception as e:
+                                    log.warning(f"[CHAT DEBUG] Chat feature computation failed: {e}")
+                                    # Non-fatal - features can be computed later during analysis
 
                         if chat_result.get("imported"):
                             JOB_MANAGER._set(
