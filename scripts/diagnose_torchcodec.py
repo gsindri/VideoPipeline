@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import ctypes
 import os
 import platform
@@ -11,6 +12,31 @@ from pathlib import Path
 
 def _print_kv(key: str, value: object) -> None:
     print(f"{key}: {value}")
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Diagnose TorchCodec DLL loading on Windows.")
+    ap.add_argument(
+        "--require-core",
+        action="append",
+        default=[],
+        help="Require specific core DLL major versions to load (e.g. 7 or 8). Can be repeated or comma-separated.",
+    )
+    return ap.parse_args(argv)
+
+
+def _parse_required_cores(raw: list[str]) -> list[int]:
+    out: set[int] = set()
+    for item in raw:
+        for token in item.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                out.add(int(token))
+            except ValueError as exc:
+                raise ValueError(f"Invalid --require-core value: {token!r}") from exc
+    return sorted(out)
 
 
 def _find_ffmpeg_bin_dir() -> Path | None:
@@ -48,6 +74,17 @@ def _try_load_dll(path: Path) -> tuple[bool, str]:
 class _TorchCodecLayout:
     package_dir: Path
     core_dlls: list[Path]
+
+
+def _major_from_core_dll(path: Path) -> int | None:
+    # libtorchcodec_core7.dll -> 7
+    digits = "".join(ch for ch in path.stem if ch.isdigit())
+    if not digits:
+        return None
+    try:
+        return int(digits)
+    except ValueError:
+        return None
 
 
 def _find_torchcodec_layout() -> _TorchCodecLayout | None:
@@ -89,11 +126,15 @@ def _print_ffmpeg_shared_dir_evidence(bin_dir: Path) -> None:
 
 
 def main() -> int:
+    args = _parse_args(sys.argv[1:])
+    require_cores = _parse_required_cores(args.require_core)
+
     _print_kv("python", sys.version.replace("\n", " "))
     _print_kv("executable", sys.executable)
     _print_kv("platform", platform.platform())
     _print_kv("cwd", os.getcwd())
     _print_kv("PATH_contains_ffmpeg", bool(shutil.which("ffmpeg")))
+    _print_kv("require_cores", require_cores)
 
     try:
         import torch
@@ -166,10 +207,20 @@ def main() -> int:
 
         print("torchcodec_core_dll_load_attempts:")
         any_ok = False
+        ok_by_major: dict[int, bool] = {}
         for dll in sorted(layout.core_dlls, reverse=True):
             ok, msg = _try_load_dll(dll)
             any_ok = any_ok or ok
+            major = _major_from_core_dll(dll)
+            if major is not None:
+                ok_by_major[major] = ok_by_major.get(major, False) or ok
             print(f"  - {dll.name}: {msg}")
+
+        if require_cores:
+            missing = [m for m in require_cores if not ok_by_major.get(m, False)]
+            if missing:
+                print(f"\nMissing required TorchCodec core DLL loads: {missing}")
+                return 4
 
         if not any_ok:
             return 4
@@ -184,17 +235,27 @@ def main() -> int:
     # Try load in the same order as TorchCodec: newest FFmpeg core first.
     def _sort_key(p: Path) -> tuple[int, str]:
         # libtorchcodec_core7.dll -> 7
-        digits = "".join(ch for ch in p.stem if ch.isdigit())
-        n = int(digits) if digits else -1
+        n = _major_from_core_dll(p)
+        n = n if n is not None else -1
         return (n, p.name)
 
     core_dlls = sorted(core_dlls, key=_sort_key, reverse=True)
     print("torchcodec_core_dll_load_attempts:")
     any_ok = False
+    ok_by_major: dict[int, bool] = {}
     for dll in core_dlls:
         ok, msg = _try_load_dll(dll)
         any_ok = any_ok or ok
+        major = _major_from_core_dll(dll)
+        if major is not None:
+            ok_by_major[major] = ok_by_major.get(major, False) or ok
         print(f"  - {dll.name}: {msg}")
+
+    if require_cores:
+        missing = [m for m in require_cores if not ok_by_major.get(m, False)]
+        if missing:
+            print(f"\nMissing required TorchCodec core DLL loads: {missing}")
+            return 4
 
     if not any_ok:
         print(
