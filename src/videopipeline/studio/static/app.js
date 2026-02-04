@@ -189,17 +189,58 @@ function initAnalysisButtonToggles() {
 // =========================================================================
 
 function fmtTime(sec) {
-  sec = Math.max(0, Number(sec) || 0);
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = (sec % 60);
-  const ss = s.toFixed(2).padStart(5, '0');
-  if (h > 0) return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${ss}`;
-  return `${String(m).padStart(2,'0')}:${ss}`;
+  // Use centisecond rounding to avoid displaying "01:60.00" due to float rounding.
+  const totalCs = Math.max(0, Math.round((Number(sec) || 0) * 100));
+  const cs = totalCs % 100;
+  const totalSeconds = Math.floor(totalCs / 100);
+
+  const seconds = totalSeconds % 60;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const minutes = totalMinutes % 60;
+  const hours = Math.floor(totalMinutes / 60);
+
+  const ss = `${String(seconds).padStart(2, '0')}.${String(cs).padStart(2, '0')}`;
+  if (hours > 0) return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${ss}`;
+  return `${String(totalMinutes).padStart(2, '0')}:${ss}`;
 }
 
 function clamp(val, lo, hi) {
   return Math.max(lo, Math.min(hi, val));
+}
+
+function fmtDuration(seconds, opts = {}) {
+  // seconds can be a number OR string markers like "cached"/"skipped"
+  if (seconds === "cached") return "cached";
+  if (seconds === "skipped") return "skipped";
+  if (seconds == null) return "";
+
+  const n = Number(seconds);
+  if (!Number.isFinite(n)) return String(seconds);
+
+  const decimalsUnderMinute = Number.isFinite(opts.decimalsUnderMinute) ? Math.max(0, opts.decimalsUnderMinute) : 1;
+  const sign = n < 0 ? "-" : "";
+  const abs = Math.abs(n);
+
+  const totalMs = Math.round(abs * 1000);
+  const totalSeconds = Math.floor(totalMs / 1000);
+  const ms = totalMs % 1000;
+
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutesTotal = Math.floor(totalSeconds / 60);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const secs = totalSeconds % 60;
+
+  if (hours > 0) return `${sign}${hours}h ${minutes}m ${secs}s`;
+  if (totalSeconds >= 60) return `${sign}${minutesTotal}m ${secs}s`;
+
+  if (decimalsUnderMinute === 0) return `${sign}${totalSeconds}s`;
+
+  // Under 60 seconds: include fractional seconds, but never show "60.0s".
+  const value = totalSeconds + ms / 1000;
+  const factor = 10 ** decimalsUnderMinute;
+  const rounded = Math.round(value * factor) / factor;
+  if (rounded >= 60) return `${sign}1m 0s`;
+  return `${sign}${rounded.toFixed(decimalsUnderMinute)}s`;
 }
 
 async function apiGet(path) {
@@ -657,6 +698,26 @@ function wireHomeUI() {
       }
     };
   }
+
+  // Persist "Verbose logs" for URL downloads
+  const dlVerboseLogs = $('#dlVerboseLogs');
+  if (dlVerboseLogs) {
+    const saved = localStorage.getItem('vp_dl_verbose_logs');
+    dlVerboseLogs.checked = saved === null ? true : saved === '1';
+    dlVerboseLogs.onchange = () => {
+      localStorage.setItem('vp_dl_verbose_logs', dlVerboseLogs.checked ? '1' : '0');
+    };
+  }
+}
+
+function initTraceTfImportsToggle() {
+  const cb = $('#traceTfImports');
+  if (!cb) return;
+  const saved = localStorage.getItem('vp_trace_tf_imports');
+  cb.checked = saved === '1';
+  cb.onchange = () => {
+    localStorage.setItem('vp_trace_tf_imports', cb.checked ? '1' : '0');
+  };
 }
 
 // =========================================================================
@@ -747,6 +808,7 @@ async function startUrlDownload(url) {
     speed_mode: $('#dlSpeedMode')?.value ?? 'auto',
     quality_cap: $('#dlQualityCap')?.value ?? 'source',
     whisper_verbose: $('#dlWhisperVerbose')?.checked ?? true,
+    verbose_logs: $('#dlVerboseLogs')?.checked ?? false,
     diarize: $('#diarizeEnabled')?.checked ?? false,
   };
 
@@ -1381,15 +1443,6 @@ function renderPipelineStatus() {
   if (!container || !project) return;
 
   const analysis = project.analysis || {};
-  
-  // Helper to format elapsed time for pipeline stages
-  const formatPipelineTime = (seconds) => {
-    if (seconds == null) return '';
-    if (seconds < 60) return `${seconds.toFixed(1)}s`;
-    const mins = Math.floor(seconds / 60);
-    const secs = Math.round(seconds % 60);
-    return `${mins}m ${secs}s`;
-  };
 
   // Helper: treat either generated_at or created_at as "complete"
   const hasRun = (obj) => !!(obj && (obj.generated_at || obj.created_at));
@@ -1404,34 +1457,92 @@ function renderPipelineStatus() {
   //   Stage 4: chapters, boundaries, clip_variants, director
   const stages = [
     // === Stage 1: Parallel input analysis ===
-    {
-      id: 'transcript',
-      name: 'Transcription',
-      icon: '🎙️',
-      check: () => {
+	    {
+	      id: 'transcript',
+	      name: 'Transcription',
+	      icon: '🎙️',
+	      check: () => {
         const t = analysis.transcript;
         if (t?.segment_count > 0) {
           const backend = t.backend_used || 'auto';
-          const gpu = t.gpu_used ? ' (GPU)' : '';
-          const lang = t.detected_language ? ` [${t.detected_language}]` : '';
-          const elapsed = t.elapsed_seconds;
-          const timeStr = elapsed ? ` • ${formatPipelineTime(elapsed)}` : '';
-          return { state: 'done', detail: `${t.segment_count} segments • ${backend}${gpu}${lang}${timeStr}` };
-        }
-        return { state: 'pending', detail: 'Not yet run' };
-      }
-    },
-    {
-      id: 'audio',
-      name: 'Audio RMS',
-      icon: '🔊',
+	          const gpu = t.gpu_used ? ' (GPU)' : '';
+	          const lang = t.detected_language ? ` [${t.detected_language}]` : '';
+	          const elapsed = t.elapsed_seconds;
+	          const timeStr = elapsed != null ? ` • ${fmtDuration(elapsed)}` : '';
+	          return { state: 'done', detail: `${t.segment_count} segments • ${backend}${gpu}${lang}${timeStr}` };
+	        }
+	        return { state: 'pending', detail: 'Not yet run' };
+	      }
+	    },
+	    {
+	      id: 'diarization',
+	      name: 'Speaker Diarization',
+	      icon: '👥',
+	      check: () => {
+	        const d = analysis.diarization;
+	        if (hasRun(d)) {
+	          const speakers = d.speaker_count || 0;
+	          const segments = d.segment_count || 0;
+	          const timeStr = d.elapsed_seconds != null ? ` • ${fmtDuration(d.elapsed_seconds)}` : '';
+	          
+	          // Hardware + batch info (best-effort; older projects won't have these fields)
+	          let hw = '';
+	          const fp = d.device_fingerprint || '';
+	          if (fp) {
+	            const parts = String(fp).split(':');
+	            const backend = parts[0] || '';
+	            let deviceName = '';
+	            const torchI = parts.findIndex(p => String(p).startsWith('torch='));
+	            if (torchI > 1) deviceName = parts.slice(1, torchI).join(':');
+	            else if (parts.length > 1) deviceName = parts.slice(1).join(':');
+	            
+	            if (backend === 'rocm') hw = 'GPU (ROCm)';
+	            else if (backend === 'cuda') hw = 'GPU (CUDA)';
+	            else if (backend === 'mps') hw = 'GPU (MPS)';
+	            else if (backend === 'cpu') hw = 'CPU';
+	            else hw = backend ? backend.toUpperCase() : 'unknown';
+	            
+	            if (deviceName) hw += ` • ${deviceName}`;
+	          }
+	          
+	          let bs = '';
+	          const b = d.batching || {};
+	          const segBs = b.segmentation_batch_size ?? null;
+	          const embBs = b.embedding_batch_size ?? null;
+	          if (segBs != null || embBs != null) {
+	            if (segBs != null && embBs != null && segBs === embBs) bs = `bs=${segBs}`;
+	            else bs = `bs=${segBs ?? '∅'}/${embBs ?? '∅'}`;
+	            if (b.auto_probe_used) bs += b.auto_probe_from_cache ? ' (auto,cached)' : ' (auto)';
+	          } else if (b && Object.keys(b).length > 0) {
+	            bs = 'bs=default';
+	          }
+
+	          const decode = d.used_waveform_input ? 'decode=ffmpeg' : '';
+	          
+	          const extras = [hw, bs, decode].filter(Boolean).map(s => ` • ${s}`).join('');
+	          return { state: 'done', detail: `${speakers} speakers • ${segments} segments${extras}${timeStr}` };
+	        }
+
+	        // If diarization isn't enabled, treat as skipped (it is optional).
+	        const diarizeEnabled = profile?.analysis?.speech?.diarize === true;
+	        if (!diarizeEnabled) {
+	          return { state: 'skipped', detail: 'Disabled (speech.diarize=false)' };
+	        }
+
+	        return { state: 'pending', detail: 'Not yet run' };
+	      }
+	    },
+	    {
+	      id: 'audio',
+	      name: 'Audio RMS',
+	      icon: '🔊',
       check: () => {
         const a = analysis.audio;
-        if (hasRun(a)) {
-          const peakCount = a.candidates?.length || 0;
-          const timeStr = a.elapsed_seconds ? ` • ${formatPipelineTime(a.elapsed_seconds)}` : '';
-          return { state: 'done', detail: `${peakCount} peaks found${timeStr}` };
-        }
+	        if (hasRun(a)) {
+	          const peakCount = a.candidates?.length || 0;
+	          const timeStr = a.elapsed_seconds != null ? ` • ${fmtDuration(a.elapsed_seconds)}` : '';
+	          return { state: 'done', detail: `${peakCount} peaks found${timeStr}` };
+	        }
         return { state: 'pending', detail: 'Not yet run' };
       }
     },
@@ -1440,11 +1551,11 @@ function renderPipelineStatus() {
       name: 'Motion Analysis',
       icon: '🎬',
       check: () => {
-        const m = analysis.motion;
-        if (hasRun(m)) {
-          const timeStr = m.elapsed_seconds ? ` • ${formatPipelineTime(m.elapsed_seconds)}` : '';
-          return { state: 'done', detail: `Analyzed${timeStr}` };
-        }
+	        const m = analysis.motion;
+	        if (hasRun(m)) {
+	          const timeStr = m.elapsed_seconds != null ? ` • ${fmtDuration(m.elapsed_seconds)}` : '';
+	          return { state: 'done', detail: `Analyzed${timeStr}` };
+	        }
         const motionMode = $('#motionWeightMode')?.value || 'off';
         if (motionMode === 'off') {
           return { state: 'skipped', detail: 'Disabled (Motion=Off)' };
@@ -1457,12 +1568,12 @@ function renderPipelineStatus() {
       name: 'Audio Events',
       icon: '🎉',
       check: () => {
-        const ae = analysis.audio_events;
-        if (hasRun(ae)) {
-          const candidateCount = ae.candidates?.length || 0;
-          const timeStr = ae.elapsed_seconds ? ` • ${formatPipelineTime(ae.elapsed_seconds)}` : '';
-          return { state: 'done', detail: `${candidateCount} candidates${timeStr}` };
-        }
+	        const ae = analysis.audio_events;
+	        if (hasRun(ae)) {
+	          const candidateCount = ae.candidates?.length || 0;
+	          const timeStr = ae.elapsed_seconds != null ? ` • ${fmtDuration(ae.elapsed_seconds)}` : '';
+	          return { state: 'done', detail: `${candidateCount} candidates${timeStr}` };
+	        }
         return { state: 'pending', detail: 'Not yet run' };
       }
     },
@@ -1471,19 +1582,19 @@ function renderPipelineStatus() {
       name: 'Chat Features',
       icon: '💬',
       check: () => {
-        const cf = analysis.chat;
-        if (hasRun(cf)) {
-          const source = cf.laugh_source || 'unknown';
-          const isLLM = source.startsWith('llm');
-          const tokenCount = cf.laugh_tokens_count || 0;
-          const llmCount = cf.llm_learned_count || 0;
-          const timeStr = cf.elapsed_seconds ? ` • ${formatPipelineTime(cf.elapsed_seconds)}` : '';
-          if (isLLM) {
-            return { state: 'done', detail: `LLM: ${tokenCount} emotes (${llmCount} AI-learned)${timeStr}` };
-          } else {
-            return { state: 'partial', detail: `Seeds only: ${tokenCount} emotes (LLM not used)${timeStr}` };
-          }
-        }
+	        const cf = analysis.chat;
+	        if (hasRun(cf)) {
+	          const source = cf.laugh_source || 'unknown';
+	          const isLLM = source.startsWith('llm');
+	          const tokenCount = cf.laugh_tokens_count || 0;
+	          const llmCount = cf.llm_learned_count || 0;
+	          const timeStr = cf.elapsed_seconds != null ? ` • ${fmtDuration(cf.elapsed_seconds)}` : '';
+	          if (isLLM) {
+	            return { state: 'done', detail: `LLM: ${tokenCount} emotes (${llmCount} AI-learned)${timeStr}` };
+	          } else {
+	            return { state: 'partial', detail: `Seeds only: ${tokenCount} emotes (LLM not used)${timeStr}` };
+	          }
+	        }
         // Check if chat is available (try multiple sources)
         const hasChat = project.chat_ai_status?.has_chat || chatStatus?.available || project.chat?.available;
         if (!hasChat) {
@@ -1498,17 +1609,17 @@ function renderPipelineStatus() {
       name: 'Highlight Fusion',
       icon: '⭐',
       check: () => {
-        const h = analysis.highlights;
-        if (hasRun(h)) {
-          const count = h.candidates?.length || 0;
-          const llmScoring = h.signals_used?.llm_semantic ? ' + LLM' : '';
-          const llmFilter = h.signals_used?.llm_filter ? ' (filtered)' : '';
-          const speechUsed = h.signals_used?.speech ? ' + speech' : '';
-          const reactionUsed = h.signals_used?.reaction ? ' + reaction' : '';
-          const extras = speechUsed + reactionUsed + llmScoring + llmFilter;
-          const timeStr = h.elapsed_seconds ? ` • ${formatPipelineTime(h.elapsed_seconds)}` : '';
-          return { state: 'done', detail: `${count} candidates${extras}${timeStr}` };
-        }
+	        const h = analysis.highlights;
+	        if (hasRun(h)) {
+	          const count = h.candidates?.length || 0;
+	          const llmScoring = h.signals_used?.llm_semantic ? ' + LLM' : '';
+	          const llmFilter = h.signals_used?.llm_filter ? ' (filtered)' : '';
+	          const speechUsed = h.signals_used?.speech ? ' + speech' : '';
+	          const reactionUsed = h.signals_used?.reaction ? ' + reaction' : '';
+	          const extras = speechUsed + reactionUsed + llmScoring + llmFilter;
+	          const timeStr = h.elapsed_seconds != null ? ` • ${fmtDuration(h.elapsed_seconds)}` : '';
+	          return { state: 'done', detail: `${count} candidates${extras}${timeStr}` };
+	        }
         return { state: 'pending', detail: 'Not yet run' };
       }
     },
@@ -1519,11 +1630,11 @@ function renderPipelineStatus() {
       icon: '🗣️',
       check: () => {
         // Backend stores speech features in analysis.speech (with created_at)
-        const sf = analysis.speech;
-        if (hasRun(sf)) {
-          const timeStr = sf.elapsed_seconds ? ` • ${formatPipelineTime(sf.elapsed_seconds)}` : '';
-          return { state: 'done', detail: `Extracted from transcript${timeStr}` };
-        }
+	        const sf = analysis.speech;
+	        if (hasRun(sf)) {
+	          const timeStr = sf.elapsed_seconds != null ? ` • ${fmtDuration(sf.elapsed_seconds)}` : '';
+	          return { state: 'done', detail: `Extracted from transcript${timeStr}` };
+	        }
         if (!analysis.transcript?.segment_count) {
           return { state: 'skipped', detail: 'Requires transcript' };
         }
@@ -1535,11 +1646,11 @@ function renderPipelineStatus() {
       name: 'Reaction Audio',
       icon: '🎭',
       check: () => {
-        const ra = analysis.reaction_audio;
-        if (hasRun(ra)) {
-          const timeStr = ra.elapsed_seconds ? ` • ${formatPipelineTime(ra.elapsed_seconds)}` : '';
-          return { state: 'done', detail: `Acoustic reaction cues${timeStr}` };
-        }
+	        const ra = analysis.reaction_audio;
+	        if (hasRun(ra)) {
+	          const timeStr = ra.elapsed_seconds != null ? ` • ${fmtDuration(ra.elapsed_seconds)}` : '';
+	          return { state: 'done', detail: `Acoustic reaction cues${timeStr}` };
+	        }
         return { state: 'pending', detail: 'Not yet run' };
       }
     },
@@ -1548,12 +1659,12 @@ function renderPipelineStatus() {
       name: 'Enrich Candidates',
       icon: '📝',
       check: () => {
-        const h = analysis.highlights;
-        // Backend sets enriched_at when enrichment completes
-        if (h?.enriched_at) {
-          const timeStr = h.enrich_elapsed_seconds ? ` • ${formatPipelineTime(h.enrich_elapsed_seconds)}` : '';
-          return { state: 'done', detail: `Hook & quote text extracted${timeStr}` };
-        }
+	        const h = analysis.highlights;
+	        // Backend sets enriched_at when enrichment completes
+	        if (h?.enriched_at) {
+	          const timeStr = h.enrich_elapsed_seconds != null ? ` • ${fmtDuration(h.enrich_elapsed_seconds)}` : '';
+	          return { state: 'done', detail: `Hook & quote text extracted${timeStr}` };
+	        }
         // Check dependencies
         if (!hasRun(analysis.highlights)) {
           return { state: 'skipped', detail: 'Requires highlights' };
@@ -1570,12 +1681,12 @@ function renderPipelineStatus() {
       name: 'Semantic Chapters',
       icon: '📖',
       check: () => {
-        const ch = analysis.chapters;
-        if (hasRun(ch)) {
-          const count = ch.chapter_count || 0;
-          const timeStr = ch.elapsed_seconds ? ` • ${formatPipelineTime(ch.elapsed_seconds)}` : '';
-          return { state: 'done', detail: `${count} chapters detected${timeStr}` };
-        }
+	        const ch = analysis.chapters;
+	        if (hasRun(ch)) {
+	          const count = ch.chapter_count || 0;
+	          const timeStr = ch.elapsed_seconds != null ? ` • ${fmtDuration(ch.elapsed_seconds)}` : '';
+	          return { state: 'done', detail: `${count} chapters detected${timeStr}` };
+	        }
         // Check if chapters are enabled in profile
         const chaptersEnabled = profile?.context?.chapters?.enabled !== false;
         if (!chaptersEnabled) {
@@ -1592,11 +1703,11 @@ function renderPipelineStatus() {
       name: 'Context Boundaries',
       icon: '📍',
       check: () => {
-        const b = analysis.boundaries;
-        if (hasRun(b)) {
-          const timeStr = b.elapsed_seconds ? ` • ${formatPipelineTime(b.elapsed_seconds)}` : '';
-          return { state: 'done', detail: `Scene boundaries computed${timeStr}` };
-        }
+	        const b = analysis.boundaries;
+	        if (hasRun(b)) {
+	          const timeStr = b.elapsed_seconds != null ? ` • ${fmtDuration(b.elapsed_seconds)}` : '';
+	          return { state: 'done', detail: `Scene boundaries computed${timeStr}` };
+	        }
         return { state: 'pending', detail: 'Not yet run' };
       }
     },
@@ -1605,12 +1716,12 @@ function renderPipelineStatus() {
       name: 'Clip Variants',
       icon: '🎞️',
       check: () => {
-        const cv = analysis.clip_variants;
-        if (hasRun(cv)) {
-          const count = cv.candidate_count || 0;
-          const timeStr = cv.elapsed_seconds ? ` • ${formatPipelineTime(cv.elapsed_seconds)}` : '';
-          return { state: 'done', detail: `${count} variants generated${timeStr}` };
-        }
+	        const cv = analysis.clip_variants;
+	        if (hasRun(cv)) {
+	          const count = cv.candidate_count || 0;
+	          const timeStr = cv.elapsed_seconds != null ? ` • ${fmtDuration(cv.elapsed_seconds)}` : '';
+	          return { state: 'done', detail: `${count} variants generated${timeStr}` };
+	        }
         if (!hasRun(analysis.boundaries)) {
           return { state: 'skipped', detail: 'Requires boundaries' };
         }
@@ -1622,13 +1733,13 @@ function renderPipelineStatus() {
       name: 'AI Director',
       icon: '🤖',
       check: () => {
-        const d = analysis.ai_director;
-        if (hasRun(d)) {
-          const count = d.candidate_count || 0;
-          const llm = d.llm_available ? 'LLM' : 'heuristic';
-          const timeStr = d.elapsed_seconds ? ` • ${formatPipelineTime(d.elapsed_seconds)}` : '';
-          return { state: 'done', detail: `${count} clips analyzed • ${llm}${timeStr}` };
-        }
+	        const d = analysis.ai_director;
+	        if (hasRun(d)) {
+	          const count = d.candidate_count || 0;
+	          const llm = d.llm_available ? 'LLM' : 'heuristic';
+	          const timeStr = d.elapsed_seconds != null ? ` • ${fmtDuration(d.elapsed_seconds)}` : '';
+	          return { state: 'done', detail: `${count} clips analyzed • ${llm}${timeStr}` };
+	        }
         // Check if AI is disabled
         const aiEnabled = profile?.ai?.director?.enabled !== false;
         if (!aiEnabled) {
@@ -1693,10 +1804,24 @@ function renderPipelineStatus() {
     const cursorStyle = isClickable ? 'cursor:pointer;' : '';
     const hoverTitle = isClickable ? 'title="Click for details"' : '';
     
+    // Optional quick-actions per task (keep minimal; avoid clutter)
+    let actionsHtml = '';
+    if (isClickable && stage.id === 'diarization') {
+      actionsHtml = `
+        <a
+          data-role="artifact-download"
+          href="/api/task_artifact/diarization?download=1"
+          title="Download diarization.json"
+          style="padding:2px 6px;border-radius:6px;background:rgba(34,197,94,0.15);color:#22c55e;text-decoration:none;font-size:11px;"
+        >⬇</a>
+      `;
+    }
+    
     html += `
       <div class="pipeline-stage" data-task-id="${stage.id}" data-clickable="${isClickable}" style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:${bgColor};border-radius:6px;border-left:3px solid ${stateColor};${cursorStyle}" ${hoverTitle}>
         <span style="font-size:14px">${stage.icon}</span>
         <span style="flex:1;color:${stateColor};font-weight:500">${stage.name}</span>
+        ${actionsHtml}
         ${isClickable ? '<span style="color:#666;font-size:10px;margin-right:4px">ℹ️</span>' : ''}
         <span style="color:${stateColor};font-size:11px">${stateIcon}</span>
       </div>
@@ -1811,6 +1936,11 @@ function renderPipelineStatus() {
     el.addEventListener('mouseenter', () => el.style.opacity = '0.8');
     el.addEventListener('mouseleave', () => el.style.opacity = '1');
   });
+
+  // Prevent quick-action clicks from also opening the details modal.
+  container.querySelectorAll('[data-role="artifact-download"]').forEach(a => {
+    a.addEventListener('click', (e) => e.stopPropagation());
+  });
 }
 
 // Modal for showing task details ("show work" feature)
@@ -1845,23 +1975,44 @@ async function showTaskDetailsModal(taskId) {
         if (value !== null && value !== undefined) {
           const displayKey = key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
           let displayValue = value;
-          if (typeof value === 'object') {
-            displayValue = JSON.stringify(value, null, 2);
-          } else if (typeof value === 'boolean') {
-            displayValue = value ? '✓ Yes' : '✗ No';
-          } else if (key.includes('seconds') && typeof value === 'number') {
-            displayValue = value < 60 ? `${value.toFixed(2)}s` : `${Math.floor(value/60)}m ${(value%60).toFixed(0)}s`;
-          } else if ((key === 'created_at' || key === 'enriched_at') && typeof value === 'string') {
-            // Format ISO timestamp to readable date/time
-            try {
-              const d = new Date(value);
-              displayValue = d.toLocaleString();
+	          if (typeof value === 'object') {
+	            displayValue = JSON.stringify(value, null, 2);
+	          } else if (typeof value === 'boolean') {
+	            displayValue = value ? '✓ Yes' : '✗ No';
+	          } else if (key.includes('seconds') && typeof value === 'number') {
+	            displayValue = fmtDuration(value, { decimalsUnderMinute: 2 });
+	          } else if ((key === 'created_at' || key === 'enriched_at') && typeof value === 'string') {
+	            // Format ISO timestamp to readable date/time
+	            try {
+	              const d = new Date(value);
+	              displayValue = d.toLocaleString();
             } catch (e) {
               displayValue = value;
             }
           }
           contentHtml += `<div style="display:flex;justify-content:space-between;margin:4px 0;"><span style="color:#888;">${displayKey}:</span><span style="color:#fff;">${displayValue}</span></div>`;
         }
+      }
+      contentHtml += '</div>';
+    }
+
+    // Artifact links (download/view JSON, etc.)
+    if (Array.isArray(data.artifacts) && data.artifacts.length > 0) {
+      contentHtml += '<div style="background:rgba(255,255,255,0.05);padding:12px;border-radius:6px;margin-bottom:12px;">';
+      contentHtml += '<div style="font-weight:600;margin-bottom:8px;color:#60a5fa;">Artifacts</div>';
+      for (const a of data.artifacts) {
+        const label = a.label || 'artifact';
+        const urlView = a.url_view || '';
+        const urlDl = a.url_download || '';
+        contentHtml += `
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin:6px 0;">
+            <span style="color:#fff;">${label}</span>
+            <span style="display:flex;gap:6px;">
+              ${urlView ? `<a href="${urlView}" target="_blank" style="padding:4px 8px;border-radius:6px;background:rgba(96,165,250,0.2);color:#60a5fa;text-decoration:none;font-size:11px;">View</a>` : ''}
+              ${urlDl ? `<a href="${urlDl}" style="padding:4px 8px;border-radius:6px;background:rgba(34,197,94,0.2);color:#22c55e;text-decoration:none;font-size:11px;">Download</a>` : ''}
+            </span>
+          </div>
+        `;
       }
       contentHtml += '</div>';
     }
@@ -1911,7 +2062,10 @@ async function showTaskDetailsModal(taskId) {
     }
     
     // Sample segments/events/candidates
-    const sampleSections = [
+    const sampleSections = taskId === 'diarization' ? [
+      { key: 'speakers_list', title: 'Speakers', color: '#22c55e' },
+      { key: 'sample_segments', title: 'Sample Speaker Segments', color: '#22c55e' },
+    ] : [
       { key: 'sample_segments', title: 'Sample Transcript Segments', color: '#22c55e' },
       { key: 'top_peaks', title: 'Top Audio Peaks', color: '#f59e0b' },
       { key: 'sample_events', title: 'Sample Audio Events', color: '#ec4899' },
@@ -1926,10 +2080,16 @@ async function showTaskDetailsModal(taskId) {
         contentHtml += `<div style="font-weight:600;margin-bottom:8px;color:${section.color};">${section.title}</div>`;
         for (const item of data[section.key]) {
           contentHtml += '<div style="margin:4px 0;padding:6px;background:rgba(255,255,255,0.03);border-radius:4px;font-size:12px;">';
-          for (const [k, v] of Object.entries(item)) {
-            if (v !== null && v !== undefined && v !== '') {
-              const displayVal = typeof v === 'object' ? JSON.stringify(v) : v;
-              contentHtml += `<div><span style="color:#888;">${k}:</span> <span style="color:#fff;">${displayVal}</span></div>`;
+          if (item === null || item === undefined) {
+            // skip
+          } else if (typeof item !== 'object') {
+            contentHtml += `<div style="color:#fff;">${String(item)}</div>`;
+          } else {
+            for (const [k, v] of Object.entries(item)) {
+              if (v !== null && v !== undefined && v !== '') {
+                const displayVal = typeof v === 'object' ? JSON.stringify(v) : v;
+                contentHtml += `<div><span style="color:#888;">${k}:</span> <span style="color:#fff;">${displayVal}</span></div>`;
+              }
             }
           }
           contentHtml += '</div>';
@@ -2057,6 +2217,7 @@ async function showTaskDetailsModal(taskId) {
 function formatTaskName(taskId) {
   const names = {
     'transcript': 'Transcription',
+    'diarization': 'Speaker Diarization',
     'audio': 'Audio RMS',
     'motion': 'Motion Analysis',
     'audio_events': 'Audio Events',
@@ -2321,22 +2482,13 @@ function renderJobs() {
     return;
   }
 
-  // Helper to format seconds nicely, or handle "cached"/"skipped" markers
-  const formatTime = (seconds) => {
-    if (seconds === "cached") return 'cached';
-    if (seconds === "skipped") return 'skipped';
-    if (seconds == null) return '';
-    if (typeof seconds !== 'number') return String(seconds);
-    if (seconds < 60) return `${seconds.toFixed(1)}s`;
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins}m ${secs.toFixed(0)}s`;
-  };
+  const formatTime = (seconds) => fmtDuration(seconds);
   
   // Helper to compute elapsed time from a timestamp
   const getElapsed = (startedAt) => {
-    if (!startedAt) return null;
-    return (Date.now() / 1000) - startedAt;
+    const s = Number(startedAt);
+    if (!Number.isFinite(s) || s <= 0) return null;
+    return (Date.now() / 1000) - s;
   };
 
   for (const job of Array.from(jobs.values()).sort((a,b) => (a.created_at < b.created_at ? 1 : -1))) {
@@ -2346,8 +2498,11 @@ function renderJobs() {
     
     // Build elapsed time display (total time)
     let totalTimeHtml = '';
-    if (job.elapsed_seconds != null) {
-      totalTimeHtml = `<span style="color:#4f8cff;font-weight:600">${formatTime(job.elapsed_seconds)}</span>`;
+    const isRunning = job.status === 'running';
+    const liveElapsed = isRunning ? getElapsed(job.started_at) : null;
+    const totalSeconds = liveElapsed != null ? liveElapsed : job.elapsed_seconds;
+    if (totalSeconds != null) {
+      totalTimeHtml = `<span style="color:#4f8cff;font-weight:600">${formatTime(totalSeconds)}</span>`;
     }
     
     // Build detailed status for analyze_full jobs
@@ -3534,6 +3689,7 @@ async function startAnalyzeFullJob() {
   const whisperBackend = $('#whisperBackend')?.value || 'auto';
   const whisperVerbose = $('#whisperVerbose')?.checked || false;
   const diarizeEnabled = $('#diarizeEnabled')?.checked || false;
+  const traceTfImports = $('#traceTfImports')?.checked || false;
   const res = await apiJson('POST', '/api/analyze/full', {
     highlights: {
       motion_weight_mode: motionMode,
@@ -3544,6 +3700,9 @@ async function startAnalyzeFullJob() {
       strict: whisperBackend !== 'auto',  // Strict mode when explicitly choosing a backend
       verbose: whisperVerbose,
       diarize: diarizeEnabled
+    },
+    debug: {
+      trace_tf_imports: traceTfImports
     }
   });
   const jobId = res.job_id;
@@ -3571,7 +3730,12 @@ async function startAnalyzeSpeechJob() {
 
 async function startAnalyzeContextJob() {
   $('#analysisStatus').textContent = 'Starting context + titles analysis (AI)...';
-  const res = await apiJson('POST', '/api/analyze/context_titles', {});
+  const traceTfImports = $('#traceTfImports')?.checked || false;
+  const res = await apiJson('POST', '/api/analyze/context_titles', {
+    debug: {
+      trace_tf_imports: traceTfImports
+    }
+  });
   const jobId = res.job_id;
   watchJob(jobId);
   $('#analysisStatus').textContent = `Context analysis running (job ${jobId.slice(0,8)})...`;
@@ -5116,6 +5280,7 @@ async function main() {
   wireHomeUI();
   wireTabUI();
   wirePublishUI();
+  initTraceTfImportsToggle();
 
   // Check if there's an active project
   try {

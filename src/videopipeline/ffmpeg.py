@@ -137,6 +137,7 @@ def stream_audio_blocks_f32le(
     *,
     params: AudioStreamParams,
     block_samples: int,
+    duration_seconds: float | None = None,
     yield_partial: bool = False,
     pad_final: bool = False,
 ) -> Iterator[np.ndarray]:
@@ -156,12 +157,21 @@ def stream_audio_blocks_f32le(
     if block_samples <= 0:
         raise ValueError("block_samples must be > 0")
 
+    if duration_seconds is not None:
+        try:
+            duration_seconds = float(duration_seconds)
+        except Exception as exc:
+            raise ValueError(f"duration_seconds must be a float, got: {duration_seconds!r}") from exc
+        if duration_seconds <= 0:
+            raise ValueError("duration_seconds must be > 0 when provided")
+
     cmd = [
         "ffmpeg",
         "-v",
         "error",
         "-i",
         str(video_path),
+        *(["-t", str(duration_seconds)] if duration_seconds is not None else []),
         "-vn",
         "-ac",
         str(params.channels),

@@ -3,6 +3,12 @@ import os as _os
 _os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # Suppress TF info/warning logs
 _os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")  # Disable oneDNN message
 
+# Prefer PyTorch-only backends in HuggingFace Transformers by default.
+# This avoids optional TensorFlow/tf_keras imports (and their dependency pitfalls) in a pipeline that runs on torch.
+_os.environ.setdefault("USE_TORCH", "1")
+_os.environ.setdefault("USE_TF", "0")
+_os.environ.setdefault("USE_FLAX", "0")
+
 import warnings as _warnings
 _warnings.filterwarnings("ignore", message=".*pkg_resources.*deprecated.*")
 

@@ -42,9 +42,10 @@
             <span id="probeBadgeText" class="small" style="color:#7fdbff"></span>
           </div>
           <div class="row" style="margin-top:10px;gap:15px;align-items:center;flex-wrap:wrap">
-            <label class="small"><input type="checkbox" id="dlCreatePreview" checked /> Create preview</label>
-            <label class="small"><input type="checkbox" id="dlNoPlaylist" checked /> No playlist</label>
-            <label class="small" title="Print transcript to server console as it's transcribed"><input type="checkbox" id="dlWhisperVerbose" checked /> Verbose transcript</label>
+            <label class="small" title="Creates a browser-friendly H.264/AAC preview/proxy if needed (helps playback in Studio)."><input type="checkbox" id="dlCreatePreview" checked /> Create preview</label>
+            <label class="small" title="Prevents yt-dlp from downloading entire playlists/channels when a playlist URL is pasted."><input type="checkbox" id="dlNoPlaylist" checked /> No playlist</label>
+            <label class="small" title="Print transcript to server console as it's transcribed"><input type="checkbox" id="dlWhisperVerbose" /> Verbose transcript</label>
+            <label class="small" title="Enable detailed internal logs (chat/emotes) for this download (DEBUG level)"><input type="checkbox" id="dlVerboseLogs" checked /> Verbose logs</label>
             <label class="small" style="display:flex;align-items:center;gap:5px">
               Speed:
               <select id="dlSpeedMode" style="padding:2px 6px">
@@ -174,6 +175,9 @@
             </label>
             <label title="Print transcript to server console as it's transcribed (useful for monitoring progress)">
               <input type="checkbox" id="whisperVerbose" /> Verbose
+            </label>
+            <label title="Log a stack trace the first time TensorFlow/tf_keras is imported (debugging noisy protobuf/TensorFlow warnings)">
+              <input type="checkbox" id="traceTfImports" /> Trace TF imports
             </label>
             <div class="dropdown" style="position:relative">
               <button id="btnAnalysisTools" title="Show/hide individual analysis tools">🔧 Tools ▾</button>

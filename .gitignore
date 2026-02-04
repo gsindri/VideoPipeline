@@ -54,7 +54,7 @@ yarn-error.log*
 credentials*.json
 token*.json
 .videopipeline/
-VideoPipeline/
+/VideoPipeline/
 publisher.sqlite
 accounts.json
 

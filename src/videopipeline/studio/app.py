@@ -4,7 +4,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 from fastapi import Body, FastAPI, HTTPException, Request
@@ -102,6 +102,43 @@ def create_app(
     publish_store = PublishJobStore()
     publish_worker = PublishWorker(job_store=publish_store, account_store=account_store)
     publish_worker.start()
+
+    # -------------------------------------------------------------------------
+    # Runtime log overrides (opt-in verbose logs)
+    # -------------------------------------------------------------------------
+    # Keep default logs concise, but allow enabling detailed DEBUG logs for
+    # specific subtrees (e.g. chat/emotes) for a single job.
+    import logging
+    import threading
+
+    _log_override_lock = threading.Lock()
+    _log_override_state: Dict[str, Dict[str, int]] = {}
+
+    def _acquire_log_overrides(logger_names: list[str], level: int) -> Callable[[], None]:
+        """Temporarily set specific loggers to `level` with ref-counted restore."""
+        with _log_override_lock:
+            for name in logger_names:
+                lg = logging.getLogger(name)
+                st = _log_override_state.get(name)
+                if st is None:
+                    _log_override_state[name] = {"prev": int(lg.level), "count": 1}
+                    lg.setLevel(level)
+                else:
+                    st["count"] += 1
+
+        def _release() -> None:
+            with _log_override_lock:
+                for name in logger_names:
+                    st = _log_override_state.get(name)
+                    if st is None:
+                        continue
+                    st["count"] -= 1
+                    if st["count"] <= 0:
+                        prev = st["prev"]
+                        logging.getLogger(name).setLevel(prev)
+                        del _log_override_state[name]
+
+        return _release
 
     # Mount publisher API router
     def get_exports_dir():
@@ -1180,6 +1217,7 @@ def create_app(
                 create_preview: bool (default True)
                 speed_mode: str - One of: auto, conservative, balanced, fast, aggressive
                 quality_cap: str - One of: source, 1080, 720, 480
+                verbose_logs: bool (default False) - Enable detailed internal logs (chat/emotes)
             auto_open: bool - Automatically open as project when done (default True)
         
         Returns job_id for tracking progress.
@@ -1223,6 +1261,8 @@ def create_app(
         whisper_verbose = bool(opts.get("whisper_verbose", True))
         # Parse diarize option (defaults to False)
         diarize_enabled = bool(opts.get("diarize", False))
+        # Parse verbose logs option (defaults to False)
+        verbose_logs = bool(opts.get("verbose_logs", False))
 
         job = JOB_MANAGER.create("download_url")
 
@@ -1230,6 +1270,7 @@ def create_app(
         def runner() -> None:
             import concurrent.futures
             import logging
+            import threading
             log = logging.getLogger("videopipeline.studio")
             
             # Shared state for progress tracking
@@ -1238,6 +1279,8 @@ def create_app(
             # Throttled logging for yt-dlp progress (keeps server logs readable).
             video_log_next_pct = 0
             video_log_last_phase_msg: Optional[str] = None
+            video_log_last_download_msg: Optional[str] = None
+            video_log_lock = threading.Lock()
             
             # Cancellation support - raise this exception from callbacks to abort
             class CancelledError(Exception):
@@ -1266,7 +1309,7 @@ def create_app(
             diarization_status = {"status": "pending", "progress": 0}
 
             def on_video_progress(frac: float, msg: str) -> None:
-                nonlocal video_log_next_pct, video_log_last_phase_msg
+                nonlocal video_log_next_pct, video_log_last_phase_msg, video_log_last_download_msg
                 # Check for cancellation
                 check_cancel()
                 
@@ -1274,31 +1317,35 @@ def create_app(
                 # We log download progress at 10% steps + phase changes.
                 try:
                     import re as _re
-
-                    if msg.startswith("Downloading"):
-                        m = _re.search(r"(\d{1,3})%", msg)
-                        if m:
-                            pct = max(0, min(100, int(m.group(1))))
-                            if pct >= video_log_next_pct:
-                                log.info("[DOWNLOAD] %s", msg)
-                                video_log_next_pct = min(100, ((pct // 10) + 1) * 10)
-                    else:
-                        if msg and msg != video_log_last_phase_msg:
-                            # Log key non-download phases once.
-                            if any(
-                                msg.startswith(prefix)
-                                for prefix in (
-                                    "Detecting",
-                                    "Detected:",
-                                    "Retrying",
-                                    "Throttled",
-                                    "Finding",
-                                    "Post-processing",
-                                    "Download complete",
-                                )
-                            ):
-                                log.info("[DOWNLOAD] %s", msg)
-                                video_log_last_phase_msg = msg
+                    
+                    with video_log_lock:
+                        if msg.startswith("Downloading"):
+                            m = _re.search(r"(\d{1,3})%", msg)
+                            if m:
+                                pct = max(0, min(100, int(m.group(1))))
+                                if pct >= video_log_next_pct:
+                                    # Thread-safe throttling: yt-dlp progress callbacks can be concurrent.
+                                    if msg != video_log_last_download_msg:
+                                        log.info("[DOWNLOAD] %s", msg)
+                                        video_log_last_download_msg = msg
+                                    video_log_next_pct = min(100, ((pct // 10) + 1) * 10)
+                        else:
+                            if msg and msg != video_log_last_phase_msg:
+                                # Log key non-download phases once.
+                                if any(
+                                    msg.startswith(prefix)
+                                    for prefix in (
+                                        "Detecting",
+                                        "Detected:",
+                                        "Retrying",
+                                        "Throttled",
+                                        "Finding",
+                                        "Post-processing",
+                                        "Download complete",
+                                    )
+                                ):
+                                    log.info("[DOWNLOAD] %s", msg)
+                                    video_log_last_phase_msg = msg
                 except Exception:
                     pass
 
@@ -1406,11 +1453,11 @@ def create_app(
                 nonlocal chat_result, chat_error, current_chat_status
                 import logging
                 log = logging.getLogger("videopipeline.studio")
-                log.info(f"[CHAT DEBUG] Starting chat download for URL: {url}")
+                log.info("[CHAT] Starting chat download for URL: %s", url)
                 
                 # Only download chat for Twitch VODs
                 if "twitch.tv/videos/" not in url.lower():
-                    log.info(f"[CHAT DEBUG] Skipped: not a Twitch VOD")
+                    log.info("[CHAT] Skipped chat download (not a Twitch VOD)")
                     chat_result = {"status": "skipped", "message": "Not a Twitch VOD"}
                     current_chat_status = chat_result
                     return chat_result
@@ -1419,7 +1466,7 @@ def create_app(
                     from ..chat.downloader import download_chat as dl_chat, find_twitch_downloader_cli
                     
                     cli_path = find_twitch_downloader_cli()
-                    log.info(f"[CHAT DEBUG] TwitchDownloaderCLI path: {cli_path}")
+                    log.debug("[CHAT] TwitchDownloaderCLI path: %s", cli_path)
                     if not cli_path:
                         chat_result = {"status": "skipped", "message": "TwitchDownloaderCLI not found"}
                         current_chat_status = chat_result
@@ -1429,19 +1476,19 @@ def create_app(
                     import re
                     match = re.search(r'twitch\.tv/videos/(\d+)', url)
                     if not match:
-                        log.info(f"[CHAT DEBUG] Could not extract video ID from URL")
+                        log.warning("[CHAT] Skipped chat download (could not extract video ID from URL)")
                         chat_result = {"status": "skipped", "message": "Could not extract video ID"}
                         current_chat_status = chat_result
                         return chat_result
                     
                     video_id = match.group(1)
-                    log.info(f"[CHAT DEBUG] Extracted video ID: {video_id}")
+                    log.debug("[CHAT] Extracted video ID: %s", video_id)
                     
                     # Download to temp location first, will move to project later
                     # Use job-unique filename to avoid overwrite prompts on repeat runs
                     from ..ingest.ytdlp_runner import _default_downloads_dir
                     chat_temp_path = _default_downloads_dir() / f"chat_{video_id}_{job.id}.json"
-                    log.info(f"[CHAT DEBUG] Chat temp path: {chat_temp_path}")
+                    log.debug("[CHAT] Chat temp path: %s", chat_temp_path)
                     
                     # Update status to downloading
                     current_chat_status["status"] = "downloading"
@@ -1479,20 +1526,20 @@ def create_app(
                             }
                         )
                     
-                    log.info(f"[CHAT DEBUG] Calling dl_chat...")
+                    log.debug("[CHAT] Calling dl_chat...")
                     
                     def check_cancel_chat() -> bool:
                         return job.cancel_requested
                     
                     dl_chat(url, chat_temp_path, on_progress=on_chat_progress, check_cancel=check_cancel_chat)
-                    log.info(f"[CHAT DEBUG] dl_chat completed")
+                    log.debug("[CHAT] dl_chat completed")
                     
                     # Check if file was created
                     if chat_temp_path.exists():
                         file_size = chat_temp_path.stat().st_size
-                        log.info(f"[CHAT DEBUG] Chat file created: {file_size} bytes")
+                        log.info("[CHAT] Chat downloaded (%d bytes)", file_size)
                     else:
-                        log.warning(f"[CHAT DEBUG] Chat file NOT created!")
+                        log.warning("[CHAT] Chat file NOT created: %s", chat_temp_path)
                     
                     chat_result = {
                         "status": "success",
@@ -1502,12 +1549,11 @@ def create_app(
                     }
                     current_chat_status["status"] = "success"
                     current_chat_status["message"] = "Chat downloaded"
-                    log.info(f"[CHAT DEBUG] chat_result: {chat_result}")
+                    log.debug("[CHAT] chat_result: %s", chat_result)
                     return chat_result
                     
                 except Exception as e:
-                    import traceback
-                    log.error(f"[CHAT DEBUG] Exception: {e}\n{traceback.format_exc()}")
+                    log.exception("[CHAT] Chat download exception")
                     chat_error = str(e)
                     chat_result = {"status": "failed", "message": str(e)}
                     current_chat_status["status"] = "failed"
@@ -1919,6 +1965,14 @@ def create_app(
                     early_dag_status["message"] = str(e)
                     return None
 
+            release_verbose_logs: Optional[Callable[[], None]] = None
+            if verbose_logs:
+                release_verbose_logs = _acquire_log_overrides(
+                    ["videopipeline.studio", "videopipeline.chat"],
+                    logging.DEBUG,
+                )
+                log.info("[LOG] Verbose internal logs enabled for this download (job=%s)", job.id)
+
             try:
                 # Run video, chat, and audio downloads in parallel
                 # Audio finishes first -> start DAG analysis while video continues
@@ -2299,16 +2353,20 @@ def create_app(
                     
                     # If chat was downloaded and NOT already imported by DAG, import it
                     chat_already_imported = bool(getattr(proj, "chat_db_path", None) and proj.chat_db_path.exists())
-                    log.info(f"[CHAT DEBUG] Checking chat_result: status={chat_result.get('status')}, already_imported={chat_already_imported}")
+                    log.debug(
+                        "[CHAT] Checking chat_result: status=%s, already_imported=%s",
+                        chat_result.get("status"),
+                        chat_already_imported,
+                    )
                     if chat_result.get("status") == "success" and chat_result.get("temp_path"):
                         chat_temp = Path(chat_result["temp_path"])
-                        log.info(f"[CHAT DEBUG] Chat temp file exists: {chat_temp.exists()}")
+                        log.debug("[CHAT] Chat temp file exists: %s", chat_temp.exists())
                         if chat_temp.exists():
-                            log.info(f"[CHAT DEBUG] Chat temp file size: {chat_temp.stat().st_size} bytes")
+                            log.debug("[CHAT] Chat temp file size: %d bytes", chat_temp.stat().st_size)
 
                         # Import once (DAG may have already imported into chat.sqlite)
                         if chat_already_imported:
-                            log.info(f"[CHAT DEBUG] Chat already imported (chat.sqlite exists)")
+                            log.info("[CHAT] Chat already imported (chat.sqlite exists); skipping import")
                             chat_result["imported"] = True
                             from ..project import set_chat_config
                             set_chat_config(proj, download_status="success")
@@ -2342,13 +2400,13 @@ def create_app(
                                     }
                                 )
 
-                                log.info(f"[CHAT DEBUG] Calling import_chat_to_project...")
+                                log.info("[CHAT] Importing chat into project...")
                                 import_chat_to_project(proj, chat_temp)
-                                log.info(f"[CHAT DEBUG] import_chat_to_project completed successfully")
+                                log.info("[CHAT] Chat imported successfully")
 
                                 # Verify the chat.sqlite was created
                                 chat_db = proj.chat_db_path
-                                log.info(f"[CHAT DEBUG] chat_db_path: {chat_db}, exists: {chat_db.exists()}")
+                                log.debug("[CHAT] chat_db_path: %s, exists: %s", chat_db, chat_db.exists())
 
                                 chat_result["imported"] = True
 
@@ -2356,13 +2414,12 @@ def create_app(
                                 from ..project import set_chat_config
                                 set_chat_config(proj, download_status="success")
                             except Exception as e:
-                                import traceback
-                                log.error(f"[CHAT DEBUG] Import exception: {e}\n{traceback.format_exc()}")
+                                log.exception("[CHAT] Import exception")
                                 chat_result["import_error"] = str(e)
                                 from ..project import set_chat_config
                                 set_chat_config(proj, download_status="failed", download_error=str(e))
                         else:
-                            log.warning(f"[CHAT DEBUG] Chat temp file missing: {chat_temp}")
+                            log.warning("[CHAT] Chat temp file missing: %s", chat_temp)
 
                         # Compute LLM-based chat features if chat is available in project
                         if getattr(proj, "chat_db_path", None) and proj.chat_db_path.exists():
@@ -2370,7 +2427,7 @@ def create_app(
                             # already produced it. This keeps logs clean and prevents confusing
                             # "AI learning" messages when nothing is actually learned.
                             if getattr(proj, "chat_features_path", None) and proj.chat_features_path.exists():
-                                log.info("[CHAT DEBUG] Chat features already exist (chat_features.npz); skipping recompute")
+                                log.debug("[CHAT] Chat features already exist (chat_features.npz); skipping recompute")
                             else:
                                 JOB_MANAGER._set(
                                     job,
@@ -2409,6 +2466,7 @@ def create_app(
                                     channel_id = channel_info[0] if channel_info else None
                                     platform = channel_info[1] if channel_info else "twitch"
 
+                                    log.info("[CHAT] Computing chat features...")
                                     compute_and_save_chat_features(
                                         proj,
                                         hop_s=hop_s,
@@ -2418,9 +2476,9 @@ def create_app(
                                         channel_id=channel_id,
                                         platform=platform,
                                     )
-                                    log.info(f"[CHAT DEBUG] Chat features computed")
+                                    log.info("[CHAT] Chat features computed")
                                 except Exception as e:
-                                    log.warning(f"[CHAT DEBUG] Chat feature computation failed: {e}")
+                                    log.warning("[CHAT] Chat feature computation failed: %s", e)
                                     # Non-fatal - features can be computed later during analysis
 
                         if chat_result.get("imported"):
@@ -2441,11 +2499,11 @@ def create_app(
                         if (chat_result.get("imported") or chat_already_imported) and chat_temp.exists():
                             try:
                                 chat_temp.unlink()
-                                log.info(f"[CHAT DEBUG] Cleaned up temp file")
+                                log.debug("[CHAT] Cleaned up temp file")
                             except Exception:
                                 pass
                     else:
-                        log.info(f"[CHAT DEBUG] Skipping import - condition not met")
+                        log.debug("[CHAT] Skipping chat import - condition not met")
                         # Record the chat download status
                         from ..project import set_chat_config
                         chat_status = chat_result.get("status", "unknown")
@@ -2524,6 +2582,9 @@ def create_app(
             except Exception as e:
                 if not job.cancel_requested:
                     JOB_MANAGER._set(job, status="failed", message=f"{type(e).__name__}: {e}")
+            finally:
+                if release_verbose_logs is not None:
+                    release_verbose_logs()
 
         threading.Thread(target=runner, daemon=True).start()
         return JSONResponse({"job_id": job.id})
@@ -3198,6 +3259,9 @@ def create_app(
         ai_cfg = ctx.profile.get("ai", {}).get("director", {})
         body = body or {}
 
+        debug_cfg = body.get("debug") or {}
+        trace_tf_imports = bool(debug_cfg.get("trace_tf_imports", False))
+
         # Merge body overrides
         context_cfg = {**context_cfg, **(body.get("context") or {})}
         ai_cfg = {**ai_cfg, **(body.get("ai") or {})}
@@ -3207,6 +3271,18 @@ def create_app(
         def runner() -> None:
             import threading as _threading
             JOB_MANAGER._set(job, status="running", progress=0.0, message="Starting context analysis...")
+
+            release_import_trace: Optional[Callable[[], None]] = None
+            if trace_tf_imports:
+                from ..import_tracer import enable_tf_import_trace
+
+                release_import_trace = enable_tf_import_trace()
+                import logging as _logging
+
+                _logging.getLogger("videopipeline.studio").warning(
+                    "[IMPORT TRACE] Enabled for analyze_context_titles (job=%s)",
+                    job.id,
+                )
 
             try:
                 # Step 1: Silence detection
@@ -3347,6 +3423,9 @@ def create_app(
 
             except Exception as e:
                 JOB_MANAGER._set(job, status="failed", message=f"{type(e).__name__}: {e}")
+            finally:
+                if release_import_trace is not None:
+                    release_import_trace()
 
         import threading
         threading.Thread(target=runner, daemon=True).start()
@@ -3422,6 +3501,9 @@ def create_app(
         include_context = bool(body.get("include_context", True))
         include_director = bool(body.get("include_director", True))
 
+        debug_cfg = body.get("debug") or {}
+        trace_tf_imports = bool(debug_cfg.get("trace_tf_imports", False))
+
         job = JOB_MANAGER.create("analyze_full")
 
         @with_prevent_sleep("Full analysis running")
@@ -3435,6 +3517,13 @@ def create_app(
             log = logging.getLogger("videopipeline.studio")
 
             JOB_MANAGER._set(job, status="running", progress=0.0, message="Starting parallel analysis DAG...")
+
+            release_import_trace: Optional[Callable[[], None]] = None
+            if trace_tf_imports:
+                from ..import_tracer import enable_tf_import_trace
+
+                release_import_trace = enable_tf_import_trace()
+                log.warning("[IMPORT TRACE] Enabled for analyze_full (job=%s)", job.id)
             
             completed_stages = []
             errors = []
@@ -3473,8 +3562,12 @@ def create_app(
             
             def check_cancelled() -> bool:
                 """Check if job was cancelled. Returns True if cancelled."""
+                nonlocal release_import_trace
                 if job.cancel_requested:
                     current_stage.clear()
+                    if release_import_trace is not None:
+                        release_import_trace()
+                        release_import_trace = None
                     return True
                 return False
 
@@ -3998,9 +4091,15 @@ def create_app(
                 if dag_result.error:
                     log.warning(f"[analyze_full] DAG error: {dag_result.error}")
                 for tr in dag_result.tasks_run:
-                    log.info(f"[analyze_full] Task '{tr.task_name}': {tr.status} ({tr.elapsed_seconds:.1f}s)")
+                    # Note: runner uses `error` for both real failures and skip reasons
+                    # like "outputs exist". Treat failures as warnings; treat reasons as info.
+                    msg = f"[analyze_full] Task '{tr.task_name}': {tr.status} ({tr.elapsed_seconds:.1f}s)"
                     if tr.error:
-                        log.warning(f"[analyze_full] Task error: {tr.error}")
+                        msg += f" — {tr.error}"
+                    if tr.status == "failed":
+                        log.warning(msg)
+                    else:
+                        log.info(msg)
                 
                 # Treat DAG failure as partial completion - still continue but record the error
                 if not dag_result.success:
@@ -4223,6 +4322,9 @@ def create_app(
                     result=result,
                 )
 
+            if release_import_trace is not None:
+                release_import_trace()
+
         threading.Thread(target=runner, daemon=True).start()
         return JSONResponse({"job_id": job.id})
 
@@ -4283,7 +4385,105 @@ def create_app(
                     details["total_duration_s"] = segments[-1].get("end", 0) if segments else 0
                 except Exception:
                     pass
-                    
+
+        elif task_id == "diarization":
+            d = analysis.get("diarization", {})
+            details["summary"] = {
+                "speakers": d.get("speaker_count", 0),
+                "segments": d.get("segment_count", 0),
+                "turns": d.get("turn_count", 0),
+                "elapsed_seconds": d.get("elapsed_seconds"),
+                "created_at": get_timestamp(d),
+            }
+
+            diar_path = None
+            rel = d.get("diarization_json")
+            if rel:
+                diar_path = proj.project_dir / rel
+            else:
+                diar_path = proj.analysis_dir / "diarization.json"
+
+            if diar_path.exists():
+                import json
+                try:
+                    diar_data = json.loads(diar_path.read_text(encoding="utf-8"))
+                    backend_meta = diar_data.get("backend_meta") or {}
+                    if isinstance(backend_meta, dict):
+                        fp = str(backend_meta.get("device_fingerprint") or "")
+                        hardware = "unknown"
+                        device_name = ""
+                        if fp.startswith("rocm:"):
+                            hardware = "GPU (ROCm)"
+                        elif fp.startswith("cuda:"):
+                            hardware = "GPU (CUDA)"
+                        elif fp.startswith("mps:"):
+                            hardware = "GPU (MPS)"
+                        elif fp.startswith("cpu:"):
+                            hardware = "CPU"
+                        if fp:
+                            parts = fp.split(":")
+                            # fp format: backend:device:torch=...
+                            torch_i = None
+                            for i, p in enumerate(parts):
+                                if p.startswith("torch="):
+                                    torch_i = i
+                                    break
+                            if torch_i is None:
+                                device_name = ":".join(parts[1:])
+                            else:
+                                device_name = ":".join(parts[1:torch_i])
+                        if device_name:
+                            hardware = f"{hardware} • {device_name}"
+
+                        batching = backend_meta.get("batching") or {}
+                        if isinstance(batching, dict):
+                            seg_bs = batching.get("segmentation_batch_size")
+                            emb_bs = batching.get("embedding_batch_size")
+                            details["summary"]["segmentation_batch_size"] = seg_bs
+                            details["summary"]["embedding_batch_size"] = emb_bs
+                            if seg_bs is not None or emb_bs is not None:
+                                if seg_bs == emb_bs and seg_bs is not None:
+                                    details["summary"]["batching"] = f"bs={seg_bs}"
+                                else:
+                                    details["summary"]["batching"] = f"bs={seg_bs}/{emb_bs}"
+                            else:
+                                details["summary"]["batching"] = "default"
+                            details["summary"]["batch_configured"] = bool(batching.get("configured", False))
+                            details["summary"]["auto_probe_used"] = batching.get("auto_probe_used")
+                            details["summary"]["auto_probe_from_cache"] = batching.get("auto_probe_from_cache")
+
+                        timing = backend_meta.get("timing") or {}
+                        if isinstance(timing, dict):
+                            for k in (
+                                "load_pipeline_seconds",
+                                "probe_seconds",
+                                "run_seconds",
+                                "fallback_decode_seconds",
+                                "convert_seconds",
+                                "total_seconds",
+                            ):
+                                if k in timing:
+                                    details["summary"][k] = timing.get(k)
+
+                        if fp:
+                            details["summary"]["device_fingerprint"] = fp
+                        details["summary"]["hardware"] = hardware
+                        details["summary"]["used_waveform_input"] = bool(backend_meta.get("used_waveform_input", False))
+
+                    details["speakers_list"] = diar_data.get("speakers", [])[:16]
+                    details["sample_segments"] = (diar_data.get("speaker_segments", []) or [])[:8]
+                except Exception:
+                    pass
+
+            # Artifact download/view links
+            details["artifacts"] = [
+                {
+                    "label": "diarization.json",
+                    "url_view": "/api/task_artifact/diarization",
+                    "url_download": "/api/task_artifact/diarization?download=1",
+                }
+            ]
+
         elif task_id == "audio":
             a = analysis.get("audio", {})
             details["summary"] = {
@@ -4297,7 +4497,7 @@ def create_app(
                 {"time_s": p.get("peak_time_s"), "score": p.get("score")}
                 for p in peaks
             ]
-            
+
         elif task_id == "motion":
             m = analysis.get("motion", {})
             details["summary"] = {
@@ -4495,6 +4695,33 @@ def create_app(
             return JSONResponse({"ok": False, "reason": f"unknown_task: {task_id}"}, status_code=404)
             
         return JSONResponse(details)
+
+    @app.get("/api/task_artifact/{task_id}")
+    def api_task_artifact(task_id: str, download: int = 0) -> FileResponse:
+        """Download/view the main JSON artifact for a pipeline task."""
+        proj = ctx.require_project()
+        proj_data = get_project_data(proj)
+        analysis = proj_data.get("analysis", {})
+
+        def _safe(p: Path) -> Path:
+            root = proj.project_dir.resolve()
+            rp = p.resolve()
+            if rp != root and root not in rp.parents:
+                raise HTTPException(status_code=400, detail="invalid_artifact_path")
+            return rp
+
+        if task_id == "diarization":
+            d = analysis.get("diarization", {})
+            rel = d.get("diarization_json")
+            path = (proj.project_dir / rel) if rel else (proj.analysis_dir / "diarization.json")
+            path = _safe(path)
+            if not path.exists():
+                raise HTTPException(status_code=404, detail="artifact_not_found")
+            if download:
+                return FileResponse(str(path), media_type="application/json", filename=path.name)
+            return FileResponse(str(path), media_type="application/json")
+
+        raise HTTPException(status_code=404, detail="unknown_task_id")
 
     @app.get("/api/speech/timeline")
     def api_speech_timeline(max_points: int = 2000) -> JSONResponse:
