@@ -57,7 +57,7 @@ def test_pyannote_pipeline_from_pretrained_prefers_token_kw(monkeypatch: pytest.
 
     dia._load_diarization_pipeline(hf_token="abc123", use_gpu=False)
 
-    assert calls["model_id"] == "pyannote/speaker-diarization-3.1"
+    assert calls["model_id"] == "pyannote-community/speaker-diarization-community-1"
     assert calls["token"] == "abc123"
 
 
@@ -85,6 +85,5 @@ def test_pyannote_pipeline_from_pretrained_falls_back_to_use_auth_token(monkeypa
 
     dia._load_diarization_pipeline(hf_token="abc123", use_gpu=False)
 
-    assert calls["model_id"] == "pyannote/speaker-diarization-3.1"
+    assert calls["model_id"] == "pyannote-community/speaker-diarization-community-1"
     assert calls["use_auth_token"] == "abc123"
-

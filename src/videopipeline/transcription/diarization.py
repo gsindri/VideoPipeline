@@ -41,7 +41,8 @@ from .base import TranscriptResult, TranscriptSegment, TranscriptWord
 _log = logging.getLogger(__name__)
 
 # pyannote model id (keep stable; used in caching + tests)
-_MODEL_ID = "pyannote/speaker-diarization-3.1"
+# NOTE: We use the newer OSS "community" diarization model (pyannote.audio>=4).
+_MODEL_ID = "pyannote-community/speaker-diarization-community-1"
 
 # Lazy-loaded pipeline
 _diarization_pipeline = None
