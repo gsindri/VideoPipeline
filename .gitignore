@@ -32,6 +32,7 @@ htmlcov/
 .venv/
 venv/
 env/
+tools/senko/.venv/
 
 .ipynb_checkpoints/
 
