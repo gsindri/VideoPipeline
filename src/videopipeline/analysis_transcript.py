@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional
 
 from .ffmpeg import _require_cmd, ffprobe_duration_seconds
-from .project import Project, update_project
+from .project import Project, save_json, update_project
 from .utils import subprocess_flags as _subprocess_flags
 
 logger = logging.getLogger(__name__)
@@ -494,7 +494,7 @@ def compute_transcript_analysis(
         "transcript": transcript.to_dict(),
     }
 
-    transcript_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    save_json(transcript_path, payload)
 
     # Update project.json
     def _upd(d: Dict[str, Any]) -> None:
@@ -775,8 +775,7 @@ def save_transcript_to_project(
     """
     # Save transcript JSON
     transcript_path = proj.analysis_dir / "transcript_full.json"
-    transcript_path.parent.mkdir(parents=True, exist_ok=True)
-    transcript_path.write_text(json.dumps(transcript_data, indent=2), encoding="utf-8")
+    save_json(transcript_path, transcript_data)
 
     # Update project.json
     def _upd(d: Dict[str, Any]) -> None:
@@ -787,6 +786,8 @@ def save_transcript_to_project(
             "config": transcript_data["config"],
             "backend_used": transcript_data.get("backend_used", "unknown"),
             "gpu_used": transcript_data.get("gpu_used", False),
+            "diarization_used": bool(transcript_data.get("diarization_used", False)),
+            "speakers": transcript_data.get("speakers"),
             "detected_language": transcript_data.get("detected_language"),
             "duration_seconds": transcript_data.get("duration_seconds", 0.0),
             "segment_count": transcript_data.get("segment_count", 0),
@@ -795,3 +796,163 @@ def save_transcript_to_project(
 
     update_project(proj, _upd)
     logger.info(f"Saved early transcript to project: {transcript_data.get('segment_count', 0)} segments")
+
+
+def merge_diarization_json_into_transcript(proj: Project) -> bool:
+    """Merge `analysis/diarization.json` speaker labels into `analysis/transcript_full.json`.
+
+    This is a lightweight post-processing step that assigns a `speaker` label to:
+      - transcript segments (dominant diarization speaker over the segment window)
+      - transcript words (speaker over the word window; falls back to segment speaker)
+
+    Returns:
+        True if a merge was applied, False otherwise.
+    """
+    diar_path = proj.analysis_dir / "diarization.json"
+    transcript_path = proj.analysis_dir / "transcript_full.json"
+    if not diar_path.exists() or not transcript_path.exists():
+        return False
+
+    try:
+        diar_data = json.loads(diar_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("[transcript] Failed to read diarization.json for merge: %s", e)
+        return False
+
+    try:
+        transcript_data = json.loads(transcript_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        # Transcript may still be in the process of being written by another task.
+        logger.info("[transcript] Transcript not ready for diarization merge (%s)", e)
+        return False
+
+    diar_segments_raw = diar_data.get("speaker_segments") or []
+    if not isinstance(diar_segments_raw, list) or not diar_segments_raw:
+        return False
+
+    diar_segments: list[tuple[float, float, str]] = []
+    for s in diar_segments_raw:
+        if not isinstance(s, dict):
+            continue
+        try:
+            spk = str(s.get("speaker", ""))
+            st = float(s.get("start_s", 0.0))
+            en = float(s.get("end_s", st))
+        except Exception:
+            continue
+        if not spk or en <= st:
+            continue
+        diar_segments.append((st, en, spk))
+
+    if not diar_segments:
+        return False
+
+    diar_segments.sort(key=lambda t: (t[0], t[1]))
+
+    t_obj = transcript_data.get("transcript") or {}
+    if not isinstance(t_obj, dict):
+        return False
+
+    t_segments = t_obj.get("segments") or []
+    if not isinstance(t_segments, list) or not t_segments:
+        return False
+
+    def dominant_speaker_in_range(start_s: float, end_s: float, idx: int) -> tuple[Optional[str], int]:
+        n = len(diar_segments)
+        i = idx
+        while i < n and diar_segments[i][1] <= start_s:
+            i += 1
+
+        speaker_times: Dict[str, float] = {}
+        j = i
+        while j < n and diar_segments[j][0] < end_s:
+            ds_st, ds_en, ds_spk = diar_segments[j]
+            ov_st = max(ds_st, start_s)
+            ov_en = min(ds_en, end_s)
+            if ov_st < ov_en:
+                speaker_times[ds_spk] = speaker_times.get(ds_spk, 0.0) + (ov_en - ov_st)
+            j += 1
+
+        if not speaker_times:
+            return None, i
+        spk = max(speaker_times.items(), key=lambda kv: kv[1])[0]
+        return spk, i
+
+    applied = False
+    seg_idx = 0
+    word_idx = 0
+
+    for seg in t_segments:
+        if not isinstance(seg, dict):
+            continue
+        try:
+            st = float(seg.get("start", 0.0))
+            en = float(seg.get("end", st))
+        except Exception:
+            continue
+        if en <= st:
+            continue
+
+        seg_speaker, seg_idx = dominant_speaker_in_range(st, en, seg_idx)
+        if seg_speaker is not None:
+            if seg.get("speaker") != seg_speaker:
+                seg["speaker"] = seg_speaker
+                applied = True
+        else:
+            # If transcript had a speaker label already, preserve it.
+            seg_speaker = seg.get("speaker") if isinstance(seg.get("speaker"), str) else None
+
+        words = seg.get("words")
+        if isinstance(words, list) and words:
+            for w in words:
+                if not isinstance(w, dict):
+                    continue
+                try:
+                    w_st = float(w.get("start", 0.0))
+                    w_en = float(w.get("end", w_st))
+                except Exception:
+                    continue
+                if w_en <= w_st:
+                    continue
+
+                w_spk, word_idx = dominant_speaker_in_range(w_st, w_en, word_idx)
+                if w_spk is None:
+                    w_spk = seg_speaker
+                if w_spk is not None and w.get("speaker") != w_spk:
+                    w["speaker"] = w_spk
+                    applied = True
+
+    if not applied:
+        return False
+
+    # Update transcript header metadata.
+    speakers = diar_data.get("speakers")
+    if not isinstance(speakers, list):
+        speakers = sorted({spk for _, _, spk in diar_segments})
+    else:
+        speakers = [str(s) for s in speakers if str(s)]
+
+    transcript_data["diarization_used"] = True
+    transcript_data["speakers"] = speakers
+    transcript_data["diarization_merged_from"] = {
+        "generated_at": diar_data.get("generated_at"),
+        "speaker_count": diar_data.get("speaker_count"),
+        "diarization_path": str(diar_path.relative_to(proj.project_dir)),
+    }
+
+    save_json(transcript_path, transcript_data)
+
+    # Keep project.json in sync (UI reads from this summary).
+    def _upd(d: Dict[str, Any]) -> None:
+        d.setdefault("analysis", {})
+        t = d["analysis"].get("transcript") or {}
+        if not isinstance(t, dict):
+            t = {}
+        t["diarization_used"] = True
+        t["speakers"] = speakers
+        t["diarization_merged_from"] = transcript_data.get("diarization_merged_from")
+        d["analysis"]["transcript"] = t
+
+    update_project(proj, _upd)
+
+    return True

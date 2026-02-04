@@ -4363,23 +4363,41 @@ def create_app(
         # Map task_id to data sources and format appropriately
         if task_id == "transcript":
             t = analysis.get("transcript", {})
+            speakers_list = t.get("speakers") if isinstance(t.get("speakers"), list) else []
             details["summary"] = {
                 "segments": t.get("segment_count", 0),
                 "backend": t.get("backend_used", "unknown"),
                 "gpu_used": t.get("gpu_used", False),
                 "language": t.get("detected_language", "unknown"),
+                "diarization_used": t.get("diarization_used", False),
+                "speaker_count": len(speakers_list),
                 "elapsed_seconds": t.get("elapsed_seconds"),
                 "created_at": get_timestamp(t),
             }
+            if speakers_list:
+                details["speakers_list"] = speakers_list[:16]
+            details["artifacts"] = [
+                {
+                    "label": "transcript_full.json",
+                    "url_view": "/api/task_artifact/transcript",
+                    "url_download": "/api/task_artifact/transcript?download=1",
+                }
+            ]
             # Try to load some sample segments
             transcript_path = proj.analysis_dir / "transcript_full.json"
             if transcript_path.exists():
                 import json
                 try:
                     t_data = json.loads(transcript_path.read_text(encoding="utf-8"))
-                    segments = t_data.get("segments", [])[:5]  # First 5 as sample
+                    segs_all = (t_data.get("transcript") or {}).get("segments", []) or []
+                    segments = segs_all[:5]  # First 5 as sample
                     details["sample_segments"] = [
-                        {"start": s.get("start"), "end": s.get("end"), "text": s.get("text", "")[:100]}
+                        {
+                            "start": s.get("start"),
+                            "end": s.get("end"),
+                            "speaker": s.get("speaker"),
+                            "text": (s.get("text", "") or "")[:140],
+                        }
                         for s in segments
                     ]
                     details["total_duration_s"] = segments[-1].get("end", 0) if segments else 0
@@ -4714,6 +4732,17 @@ def create_app(
             d = analysis.get("diarization", {})
             rel = d.get("diarization_json")
             path = (proj.project_dir / rel) if rel else (proj.analysis_dir / "diarization.json")
+            path = _safe(path)
+            if not path.exists():
+                raise HTTPException(status_code=404, detail="artifact_not_found")
+            if download:
+                return FileResponse(str(path), media_type="application/json", filename=path.name)
+            return FileResponse(str(path), media_type="application/json")
+
+        if task_id == "transcript":
+            t = analysis.get("transcript", {})
+            rel = t.get("transcript_path")
+            path = (proj.project_dir / rel) if rel else (proj.analysis_dir / "transcript_full.json")
             path = _safe(path)
             if not path.exists():
                 raise HTTPException(status_code=404, detail="artifact_not_found")

@@ -48,6 +48,7 @@ _diarization_pipeline = None
 
 # Cache auto-selected batch sizes per (model, device, torch) fingerprint.
 _batch_size_cache: Dict[str, Tuple[int, int]] = {}
+_batch_size_cache_loaded: bool = False
 _warned_batch_instantiate: bool = False
 _warned_batch_probe: bool = False
 _perf_settings_applied: bool = False
@@ -57,6 +58,53 @@ _perf_settings_meta: Dict[str, Any] = {}
 # the directory is removed from the DLL search path.
 _dll_dir_handles: List[Any] = []
 _dll_dir_added: set[str] = set()
+
+
+def _batch_cache_path() -> Path:
+    return Path.home() / ".cache" / "videopipeline" / "diarization_batch_cache.json"
+
+
+def _load_batch_cache() -> None:
+    global _batch_size_cache_loaded
+    if _batch_size_cache_loaded:
+        return
+    _batch_size_cache_loaded = True
+
+    path = _batch_cache_path()
+    if not path.exists():
+        return
+    try:
+        import json
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return
+        for k, v in data.items():
+            if not isinstance(k, str):
+                continue
+            if not isinstance(v, (list, tuple)) or len(v) != 2:
+                continue
+            try:
+                seg = int(v[0])
+                emb = int(v[1])
+            except Exception:
+                continue
+            if seg > 0 and emb > 0:
+                _batch_size_cache[k] = (seg, emb)
+    except Exception:
+        return
+
+
+def _save_batch_cache() -> None:
+    path = _batch_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        import json
+
+        payload = {k: [int(v[0]), int(v[1])] for k, v in _batch_size_cache.items()}
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        return
 
 
 def _maybe_add_windows_ffmpeg_dll_dir() -> None:
@@ -285,18 +333,84 @@ def _configure_pyannote_batches(
     segmentation_batch_size: Optional[int],
     embedding_batch_size: Optional[int],
 ) -> bool:
-    """Best-effort: configure pyannote pipeline batch sizes via `pipeline.instantiate`."""
+    """Best-effort: configure pyannote batch sizes.
+
+    pyannote's public API does not consistently expose a first-class way to set
+    inference batch sizes across versions. We try a few strategies:
+      1) direct attributes on known pipeline internals (common in pyannote>=3)
+      2) shallow name-based scan of pipeline attributes
+      3) `pipeline.instantiate(...)` with a couple common config shapes
+    """
     global _warned_batch_instantiate
 
     if segmentation_batch_size is None and embedding_batch_size is None:
         return True
 
-    inst = getattr(pipeline, "instantiate", None)
-    if not callable(inst):
-        if not _warned_batch_instantiate:
-            _log.info("pyannote pipeline has no instantiate(); cannot set batch sizes (using defaults).")
-            _warned_batch_instantiate = True
+    def _try_set(obj: Any, bs: Optional[int]) -> bool:
+        if obj is None or bs is None:
+            return False
+        bs_i = int(bs)
+
+        for attr in ("batch_size", "_batch_size"):
+            if hasattr(obj, attr):
+                try:
+                    setattr(obj, attr, bs_i)
+                    return True
+                except Exception:
+                    pass
+
+        setter = getattr(obj, "set_batch_size", None)
+        if callable(setter):
+            try:
+                setter(bs_i)
+                return True
+            except Exception:
+                pass
+
         return False
+
+    seg_ok = False
+    emb_ok = False
+
+    # Known common names first.
+    if segmentation_batch_size is not None:
+        for name in (
+            "segmentation",
+            "_segmentation",
+            "segmentation_inference",
+            "_segmentation_inference",
+        ):
+            if hasattr(pipeline, name):
+                seg_ok = _try_set(getattr(pipeline, name, None), segmentation_batch_size)
+                if seg_ok:
+                    break
+
+    if embedding_batch_size is not None:
+        for name in (
+            "embedding",
+            "_embedding",
+            "embedding_inference",
+            "_embedding_inference",
+        ):
+            if hasattr(pipeline, name):
+                emb_ok = _try_set(getattr(pipeline, name, None), embedding_batch_size)
+                if emb_ok:
+                    break
+
+    # Shallow scan fallback (handles dict-backed pipelines).
+    if not seg_ok or not emb_ok:
+        try:
+            for k, v in vars(pipeline).items():
+                lk = str(k).lower()
+                if not seg_ok and segmentation_batch_size is not None and "segment" in lk:
+                    seg_ok = _try_set(v, segmentation_batch_size) or seg_ok
+                if not emb_ok and embedding_batch_size is not None and "embed" in lk:
+                    emb_ok = _try_set(v, embedding_batch_size) or emb_ok
+        except Exception:
+            pass
+
+    if (segmentation_batch_size is None or seg_ok) and (embedding_batch_size is None or emb_ok):
+        return True
 
     cfg: Dict[str, Any] = {}
     if segmentation_batch_size is not None:
@@ -314,6 +428,13 @@ def _configure_pyannote_batches(
     candidates: List[Dict[str, Any]] = [cfg]
     if flat:
         candidates.append(flat)
+
+    inst = getattr(pipeline, "instantiate", None)
+    if not callable(inst):
+        if not _warned_batch_instantiate:
+            _log.info("pyannote pipeline has no instantiate(); cannot set batch sizes (using defaults).")
+            _warned_batch_instantiate = True
+        return False
 
     for c in candidates:
         try:
@@ -339,13 +460,10 @@ def _autotune_batch_sizes(
     """Pick a batch size by probing on a short input and caching the result."""
     global _warned_batch_probe
 
+    _load_batch_cache()
     cached = _batch_size_cache.get(cache_key)
     if cached is not None:
         return cached
-
-    # If we can't configure batches, probing doesn't help.
-    if not callable(getattr(pipeline, "instantiate", None)):
-        return None
 
     for bs in candidates:
         try:
@@ -365,6 +483,7 @@ def _autotune_batch_sizes(
         try:
             pipeline(probe_input, **diarization_params)
             _batch_size_cache[cache_key] = (bs_i, bs_i)
+            _save_batch_cache()
             _log.info("Auto-selected diarization batch_size=%d (segmentation+embedding).", bs_i)
             return (bs_i, bs_i)
         except Exception as exc:
@@ -425,6 +544,164 @@ def _decode_audio_with_ffmpeg(
     return {"waveform": waveform, "sample_rate": int(sample_rate)}
 
 
+def _progress_cb(cb: Optional[Callable[..., Any]], frac: float, msg: Optional[str] = None) -> None:
+    """Call progress callback with best-effort support for optional message."""
+    if cb is None:
+        return
+    try:
+        f = float(frac)
+    except Exception:
+        f = 0.0
+    f = max(0.0, min(1.0, f))
+    if msg is None:
+        cb(f)
+        return
+    try:
+        cb(f, msg)
+    except TypeError:
+        cb(f)
+
+
+class _DiarizationProgressHook:
+    """Best-effort bridge from pyannote progress hooks to our on_progress callback.
+
+    pyannote pipelines accept a `hook=...` callable in many versions. The exact
+    call signature varies between releases, so we accept `*args/**kwargs` and
+    infer (stage, fraction) from common patterns.
+    """
+
+    _STAGE_WEIGHTS: Dict[str, float] = {
+        "segmentation": 0.55,
+        "embedding": 0.35,
+        "clustering": 0.10,
+    }
+
+    def __init__(
+        self,
+        report: Callable[[float, Optional[str]], None],
+        *,
+        start: float,
+        end: float,
+        min_emit_interval_s: float = 0.2,
+    ) -> None:
+        self._report = report
+        self._start = float(start)
+        self._end = float(end)
+        self._stage_frac: Dict[str, float] = {k: 0.0 for k in self._STAGE_WEIGHTS}
+        self._last_emit_time = 0.0
+        self._last_emit_pct = -1
+        self._last_mapped = float(start)
+        self._min_emit_interval_s = float(min_emit_interval_s)
+
+    def _stage_key(self, raw: str) -> str:
+        s = (raw or "").lower().strip()
+        if "segment" in s:
+            return "segmentation"
+        if "embed" in s:
+            return "embedding"
+        if "cluster" in s:
+            return "clustering"
+        return "segmentation"
+
+    def _parse(self, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Optional[Tuple[str, float]]:
+        stage = ""
+
+        for k in ("stage", "task", "step", "name", "component"):
+            v = kwargs.get(k)
+            if v is not None:
+                stage = str(v)
+                break
+
+        if not stage and args and isinstance(args[0], str):
+            stage = str(args[0])
+
+        frac: Optional[float] = None
+
+        # Common keyword patterns
+        if "progress" in kwargs:
+            try:
+                frac = float(kwargs["progress"])
+            except Exception:
+                frac = None
+        elif "fraction" in kwargs:
+            try:
+                frac = float(kwargs["fraction"])
+            except Exception:
+                frac = None
+        elif ("completed" in kwargs or "current" in kwargs) and "total" in kwargs:
+            cur = kwargs.get("completed", kwargs.get("current"))
+            tot = kwargs.get("total")
+            try:
+                cur_f = float(cur)
+                tot_f = float(tot)
+                if tot_f > 0:
+                    frac = cur_f / tot_f
+            except Exception:
+                frac = None
+
+        # Common positional patterns: (stage, completed, total) or (completed, total)
+        if frac is None and len(args) >= 3:
+            try:
+                cur_f = float(args[1])
+                tot_f = float(args[2])
+                if tot_f > 0:
+                    frac = cur_f / tot_f
+            except Exception:
+                frac = None
+
+        if frac is None and len(args) == 2:
+            try:
+                v = float(args[1])
+                # Either already normalized or a "completed" count.
+                if 0.0 <= v <= 1.0:
+                    frac = v
+            except Exception:
+                frac = None
+
+        # Last resort: pick any normalized float argument
+        if frac is None:
+            for a in args:
+                try:
+                    v = float(a)
+                except Exception:
+                    continue
+                if 0.0 <= v <= 1.0:
+                    frac = v
+                    break
+
+        if frac is None:
+            return None
+
+        frac = max(0.0, min(1.0, float(frac)))
+        return (stage or "progress", frac)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> None:
+        parsed = self._parse(args, kwargs)
+        if parsed is None:
+            return
+        stage, frac = parsed
+        key = self._stage_key(stage)
+        self._stage_frac[key] = max(self._stage_frac.get(key, 0.0), float(frac))
+
+        overall = 0.0
+        for k, w in self._STAGE_WEIGHTS.items():
+            overall += float(w) * float(self._stage_frac.get(k, 0.0))
+
+        mapped = self._start + (self._end - self._start) * float(overall)
+        mapped = max(float(self._start), min(float(self._end), float(mapped)))
+        mapped = max(mapped, self._last_mapped)
+
+        now = time.time()
+        pct = int(mapped * 100)
+        if pct == self._last_emit_pct and (now - self._last_emit_time) < self._min_emit_interval_s:
+            return
+
+        self._last_mapped = mapped
+        self._last_emit_pct = pct
+        self._last_emit_time = now
+        self._report(mapped, key)
+
+
 @dataclass
 class DiarizationSegment:
     """A segment of speech attributed to a specific speaker."""
@@ -473,6 +750,136 @@ class DiarizationResult:
             return None
         
         return max(speaker_times.items(), key=lambda x: x[1])[0]
+
+
+def _merge_adjacent_speaker_segments(
+    segments: List[DiarizationSegment],
+    *,
+    gap_s: float = 0.2,
+) -> List[DiarizationSegment]:
+    if not segments:
+        return []
+    segs = sorted(segments, key=lambda s: (float(s.start), float(s.end)))
+    out: List[DiarizationSegment] = [segs[0]]
+    for seg in segs[1:]:
+        prev = out[-1]
+        if seg.speaker == prev.speaker and float(seg.start) <= float(prev.end) + float(gap_s):
+            out[-1] = DiarizationSegment(
+                speaker=prev.speaker,
+                start=float(prev.start),
+                end=max(float(prev.end), float(seg.end)),
+            )
+        else:
+            out.append(seg)
+    return out
+
+
+def _speaker_durations(segments: List[DiarizationSegment]) -> Dict[str, float]:
+    totals: Dict[str, float] = {}
+    for s in segments:
+        dur = float(s.end) - float(s.start)
+        if dur <= 0:
+            continue
+        totals[str(s.speaker)] = totals.get(str(s.speaker), 0.0) + dur
+    return totals
+
+
+def _clean_short_segments(
+    segments: List[DiarizationSegment],
+    *,
+    hard_min_s: float = 0.10,
+    flicker_min_s: float = 0.25,
+    merge_gap_s: float = 0.2,
+) -> List[DiarizationSegment]:
+    """Remove obvious diarization flicker (e.g., 20ms speaker flips).
+
+    This is conservative: it only rewrites *very* short segments, either to the
+    surrounding speaker (when flanked by the same speaker) or to the nearest
+    neighbor for micro segments.
+    """
+    segs_in = [s for s in segments if float(s.end) > float(s.start)]
+    if not segs_in:
+        return []
+    segs_in.sort(key=lambda s: (float(s.start), float(s.end)))
+
+    out: List[DiarizationSegment] = []
+    for i, seg in enumerate(segs_in):
+        dur = float(seg.end) - float(seg.start)
+        prev = out[-1] if out else None
+        nxt = segs_in[i + 1] if i + 1 < len(segs_in) else None
+
+        speaker = str(seg.speaker)
+        if dur < float(flicker_min_s) and prev is not None and nxt is not None:
+            if str(prev.speaker) == str(nxt.speaker) and speaker != str(prev.speaker):
+                speaker = str(prev.speaker)
+
+        if dur < float(hard_min_s) and speaker == str(seg.speaker):
+            choices: List[Tuple[float, str]] = []
+            if prev is not None:
+                choices.append((abs(float(seg.start) - float(prev.end)), str(prev.speaker)))
+            if nxt is not None:
+                choices.append((abs(float(nxt.start) - float(seg.end)), str(nxt.speaker)))
+            if choices:
+                choices.sort(key=lambda t: t[0])
+                speaker = choices[0][1]
+
+        out.append(DiarizationSegment(speaker=speaker, start=float(seg.start), end=float(seg.end)))
+
+    return _merge_adjacent_speaker_segments(out, gap_s=float(merge_gap_s))
+
+
+def _collapse_to_max_speakers(
+    segments: List[DiarizationSegment],
+    *,
+    max_speakers: int,
+    merge_gap_s: float = 0.2,
+) -> List[DiarizationSegment]:
+    """Collapse minor speakers into the nearest dominant speakers by duration."""
+    if max_speakers <= 0 or not segments:
+        return segments
+
+    totals = _speaker_durations(segments)
+    if len(totals) <= max_speakers:
+        return segments
+
+    top = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:max_speakers]
+    keep = {k for k, _ in top}
+    fallback = top[0][0] if top else segments[0].speaker
+
+    segs = sorted(segments, key=lambda s: (float(s.start), float(s.end)))
+    out: List[DiarizationSegment] = []
+
+    # Precompute nearest kept speaker by scanning neighbors.
+    for i, seg in enumerate(segs):
+        if seg.speaker in keep:
+            out.append(seg)
+            continue
+
+        prev_choice: Optional[Tuple[float, str]] = None
+        for j in range(i - 1, -1, -1):
+            sj = segs[j]
+            if sj.speaker in keep:
+                prev_choice = (abs(float(seg.start) - float(sj.end)), str(sj.speaker))
+                break
+
+        next_choice: Optional[Tuple[float, str]] = None
+        for j in range(i + 1, len(segs)):
+            sj = segs[j]
+            if sj.speaker in keep:
+                next_choice = (abs(float(sj.start) - float(seg.end)), str(sj.speaker))
+                break
+
+        chosen = fallback
+        if prev_choice is not None and next_choice is not None:
+            chosen = prev_choice[1] if prev_choice[0] <= next_choice[0] else next_choice[1]
+        elif prev_choice is not None:
+            chosen = prev_choice[1]
+        elif next_choice is not None:
+            chosen = next_choice[1]
+
+        out.append(DiarizationSegment(speaker=str(chosen), start=float(seg.start), end=float(seg.end)))
+
+    return _merge_adjacent_speaker_segments(out, gap_s=float(merge_gap_s))
 
 
 def is_diarization_available() -> bool:
@@ -670,14 +1077,31 @@ def diarize_audio(
 
     t_total0 = time.time()
 
+    last_progress = 0.0
+
+    def _report(frac: float, msg: Optional[str] = None) -> None:
+        nonlocal last_progress
+        try:
+            f = float(frac)
+        except Exception:
+            f = 0.0
+        f = max(0.0, min(1.0, f))
+        prev = last_progress
+        if f < prev:
+            f = prev
+        # Avoid spamming callbacks with unchanged fractional progress.
+        if msg is None and f <= prev + 1e-9:
+            return
+        last_progress = f
+        _progress_cb(on_progress, f, msg)
+
     perf_meta = _apply_torch_perf_settings(
         use_gpu=use_gpu,
         matmul_precision=str(matmul_precision),
         benchmark_backend=bool(benchmark_backend),
     )
 
-    if on_progress:
-        on_progress(0.1)
+    _report(0.05, "init")
     
     _log.info(f"Starting speaker diarization for: {audio_path.name}")
     
@@ -685,8 +1109,7 @@ def diarize_audio(
     pipeline = _load_diarization_pipeline(hf_token=hf_token, use_gpu=use_gpu)
     load_s = time.time() - t_load0
     
-    if on_progress:
-        on_progress(0.2)
+    _report(0.12, "pipeline loaded")
     
     # Build pipeline parameters
     params: Dict[str, Any] = {}
@@ -718,8 +1141,8 @@ def diarize_audio(
         and probe_seconds > 0
         and not device_fp.startswith("cpu:")
         and not device_fp.startswith("torch:missing")
-        and callable(getattr(pipeline, "instantiate", None))
     ):
+        _load_batch_cache()
         cached = _batch_size_cache.get(cache_key)
         if cached is not None:
             probe_used = True
@@ -751,6 +1174,63 @@ def diarize_audio(
             segmentation_batch_size=seg_bs,
             embedding_batch_size=emb_bs,
         )
+
+    _report(0.18, "running")
+
+    # UI polish: when pyannote doesn't report granular progress, the UI can look
+    # "stuck" (e.g., staying at ~20% until completion). Run a soft ticker that
+    # advances progress based on a rough runtime estimate, capped at 92% until
+    # the pipeline completes.
+    ticker_stop = None
+    if on_progress is not None:
+        try:
+            import threading
+
+            est_total_s = 300.0
+            try:
+                from ..ffmpeg import ffprobe_duration_seconds
+
+                dur = float(ffprobe_duration_seconds(audio_path))
+                # Heuristic: diarization is typically faster than realtime on GPU.
+                rate = 0.30 if use_gpu and not device_fp.startswith("cpu:") else 1.05
+                est_total_s = max(10.0, dur * rate)
+            except Exception:
+                est_total_s = 300.0
+
+            start_frac = last_progress
+            end_frac = 0.92
+            ticker_stop = threading.Event()
+
+            def _ticker() -> None:
+                t0 = time.time()
+                while not ticker_stop.is_set():
+                    time.sleep(0.5)
+                    elapsed = time.time() - t0
+                    if est_total_s <= 0:
+                        continue
+                    frac = start_frac + (end_frac - start_frac) * min(elapsed / est_total_s, 1.0)
+                    _report(frac)
+
+            threading.Thread(target=_ticker, daemon=True).start()
+        except Exception:
+            ticker_stop = None
+
+    hook: Optional[_DiarizationProgressHook] = None
+    if on_progress is not None:
+        hook = _DiarizationProgressHook(_report, start=0.18, end=0.92)
+
+    def _call_pipeline(inp: Any) -> Any:
+        nonlocal hook
+        if hook is None:
+            return pipeline(inp, **params)
+        try:
+            return pipeline(inp, hook=hook, **params)
+        except TypeError as exc:
+            # Some pyannote versions/pipelines don't accept `hook=...`.
+            if "hook" in str(exc) or "unexpected keyword argument" in str(exc):
+                hook = None
+                return pipeline(inp, **params)
+            raise
     
     # Run diarization
     _log.info(f"Running diarization (min_speakers={min_speakers}, max_speakers={max_speakers})...")
@@ -758,24 +1238,30 @@ def diarize_audio(
     fallback_decode_s = 0.0
     t_run0 = time.time()
     try:
-        diarization = pipeline(str(audio_path), **params)
-    except Exception as e:
-        msg = str(e)
-        if ("AudioDecoder" not in msg) and ("torchcodec" not in msg.lower()):
-            raise
-        _log.warning(
-            "pyannote audio decoding failed (%s). Falling back to ffmpeg-decoded waveform input.",
-            msg,
-        )
-        used_waveform_input = True
-        t_dec0 = time.time()
-        wav = _decode_audio_with_ffmpeg(audio_path)
-        fallback_decode_s = time.time() - t_dec0
-        diarization = pipeline(wav, **params)
+        try:
+            diarization = _call_pipeline(str(audio_path))
+        except Exception as e:
+            msg = str(e)
+            if ("AudioDecoder" not in msg) and ("torchcodec" not in msg.lower()):
+                raise
+            _log.warning(
+                "pyannote audio decoding failed (%s). Falling back to ffmpeg-decoded waveform input.",
+                msg,
+            )
+            used_waveform_input = True
+            t_dec0 = time.time()
+            wav = _decode_audio_with_ffmpeg(audio_path)
+            fallback_decode_s = time.time() - t_dec0
+            diarization = _call_pipeline(wav)
+    finally:
+        if ticker_stop is not None:
+            try:
+                ticker_stop.set()
+            except Exception:
+                pass
     run_s = time.time() - t_run0
     
-    if on_progress:
-        on_progress(0.9)
+    _report(0.94, "post")
     
     # Convert pyannote output to our format.
     #
@@ -811,14 +1297,25 @@ def diarize_audio(
         segments.append(seg)
         speakers_set.add(speaker)
     convert_s = time.time() - t_conv0
+    _report(0.98, "finalize")
     
     # Sort by start time
     segments.sort(key=lambda s: s.start)
+
+    speaker_count_before = len({str(s.speaker) for s in segments})
+    segments = _clean_short_segments(segments, hard_min_s=0.10, flicker_min_s=0.25, merge_gap_s=0.2)
+    if max_speakers is not None:
+        try:
+            max_s = int(max_speakers)
+        except Exception:
+            max_s = 0
+        if max_s > 0:
+            segments = _collapse_to_max_speakers(segments, max_speakers=max_s, merge_gap_s=0.2)
     
     # Duration is max end-time (segments may overlap).
     duration = max((s.end for s in segments), default=0.0)
     
-    speakers = sorted(list(speakers_set))
+    speakers = sorted({str(s.speaker) for s in segments})
     _log.info(f"Diarization complete: found {len(speakers)} speakers, {len(segments)} segments")
     total_s = time.time() - t_total0
     _log.info(
@@ -831,8 +1328,7 @@ def diarize_audio(
         device_fp,
     )
     
-    if on_progress:
-        on_progress(1.0)
+    _report(1.0)
     
     return DiarizationResult(
         segments=segments,
@@ -842,6 +1338,14 @@ def diarize_audio(
             "model_id": _MODEL_ID,
             "device_fingerprint": device_fp,
             "perf": perf_meta,
+            "postprocess": {
+                "speaker_count_before": int(speaker_count_before),
+                "speaker_count_after": int(len(speakers)),
+                "hard_min_segment_seconds": 0.10,
+                "flicker_min_segment_seconds": 0.25,
+                "merge_gap_seconds": 0.2,
+                "max_speakers_cap": max_speakers,
+            },
             "batching": {
                 "segmentation_batch_size": seg_bs,
                 "embedding_batch_size": emb_bs,

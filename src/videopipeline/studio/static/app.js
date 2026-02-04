@@ -1815,6 +1815,15 @@ function renderPipelineStatus() {
           style="padding:2px 6px;border-radius:6px;background:rgba(34,197,94,0.15);color:#22c55e;text-decoration:none;font-size:11px;"
         >⬇</a>
       `;
+    } else if (isClickable && stage.id === 'transcript') {
+      actionsHtml = `
+        <a
+          data-role="artifact-download"
+          href="/api/task_artifact/transcript?download=1"
+          title="Download transcript_full.json"
+          style="padding:2px 6px;border-radius:6px;background:rgba(34,197,94,0.15);color:#22c55e;text-decoration:none;font-size:11px;"
+        >⬇</a>
+      `;
     }
     
     html += `

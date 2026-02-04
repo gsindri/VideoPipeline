@@ -235,13 +235,19 @@ def _run_reaction_audio(proj: Project, cfg: Dict[str, Any], on_progress: Optiona
 def _run_diarization(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Compute speaker diarization as a standalone analysis artifact."""
     diar_path = proj.analysis_dir / "diarization.json"
-    if diar_path.exists():
-        return
-
-    # We hang diarization off the speech config so one toggle controls
-    # both transcript speaker labeling (if supported) and diarization signals.
     speech_cfg = cfg.get("speech", {})
     if not speech_cfg.get("diarize", False):
+        return
+
+    # If diarization already exists, still try to merge speaker labels into the transcript
+    # (older projects may have transcript_full.json without speakers).
+    if diar_path.exists():
+        try:
+            from ..analysis_transcript import merge_diarization_json_into_transcript
+
+            merge_diarization_json_into_transcript(proj)
+        except Exception:
+            pass
         return
 
     from ..analysis_diarization import compute_diarization_analysis, DiarizationConfig
@@ -259,16 +265,34 @@ def _run_diarization(proj: Project, cfg: Dict[str, Any], on_progress: Optional[C
         on_progress=on_progress,
     )
 
+    # Best-effort: merge speaker labels into transcript_full.json if it exists.
+    try:
+        from ..analysis_transcript import merge_diarization_json_into_transcript
+
+        merge_diarization_json_into_transcript(proj)
+    except Exception:
+        pass
+
 
 def _run_transcript(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Compute full video transcript."""
     transcript_path = proj.analysis_dir / "transcript_full.json"
-    if transcript_path.exists():
-        return
     
     from ..analysis_transcript import compute_transcript_analysis, TranscriptConfig
     
     speech_cfg = cfg.get("speech", {})
+
+    # If transcript already exists, still try to merge diarization speaker labels (if enabled).
+    if transcript_path.exists():
+        if speech_cfg.get("diarize", False):
+            try:
+                from ..analysis_transcript import merge_diarization_json_into_transcript
+
+                merge_diarization_json_into_transcript(proj)
+            except Exception:
+                pass
+        return
+
     compute_transcript_analysis(
         proj,
         cfg=TranscriptConfig(
@@ -284,6 +308,15 @@ def _run_transcript(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Ca
         ),
         on_progress=on_progress,
     )
+
+    # Best-effort: merge speaker labels once both transcript and diarization exist.
+    if speech_cfg.get("diarize", False):
+        try:
+            from ..analysis_transcript import merge_diarization_json_into_transcript
+
+            merge_diarization_json_into_transcript(proj)
+        except Exception:
+            pass
 
 
 def _run_sentences(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:

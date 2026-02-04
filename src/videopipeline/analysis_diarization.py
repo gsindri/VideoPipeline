@@ -127,8 +127,8 @@ class DiarizationConfig:
         return cls(
             enabled=enabled,
             use_gpu=use_gpu,
-            min_speakers=_opt_int(d.get("min_speakers")),
-            max_speakers=_opt_int(d.get("max_speakers")),
+            min_speakers=_opt_int(d.get("min_speakers", d.get("diarize_min_speakers"))),
+            max_speakers=_opt_int(d.get("max_speakers", d.get("diarize_max_speakers"))),
             hf_token=d.get("hf_token") or None,
             segmentation_batch_size=_opt_int(d.get("segmentation_batch_size") or d.get("diarize_segmentation_batch_size")),
             embedding_batch_size=_opt_int(d.get("embedding_batch_size") or d.get("diarize_embedding_batch_size")),
