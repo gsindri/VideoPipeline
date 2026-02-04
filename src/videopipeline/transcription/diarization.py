@@ -46,6 +46,7 @@ _MODEL_ID = "pyannote-community/speaker-diarization-community-1"
 
 # Lazy-loaded pipeline
 _diarization_pipeline = None
+_diarization_pipeline_model_id: str | None = None
 
 # Cache auto-selected batch sizes per (model, device, torch) fingerprint.
 _batch_size_cache: Dict[str, Tuple[int, int]] = {}
@@ -918,9 +919,15 @@ def _load_diarization_pipeline(
         ValueError: If no HF token provided
     """
     global _diarization_pipeline
+    global _diarization_pipeline_model_id
     
-    if _diarization_pipeline is not None:
+    model_id = (os.environ.get("VP_DIARIZATION_MODEL_ID") or "").strip() or _MODEL_ID
+
+    if _diarization_pipeline is not None and _diarization_pipeline_model_id == model_id:
         return _diarization_pipeline
+    if _diarization_pipeline is not None and _diarization_pipeline_model_id != model_id:
+        unload_diarization_pipeline()
+        _diarization_pipeline_model_id = None
 
     _maybe_add_windows_ffmpeg_dll_dir()
 
@@ -957,9 +964,6 @@ def _load_diarization_pipeline(
         )
     
     _log.info("Loading pyannote diarization pipeline...")
-
-    # Use the latest speaker diarization model
-    model_id = _MODEL_ID
 
     # Preflight Hugging Face access check. This avoids some upstream libraries
     # printing raw "gated repo" guidance directly to stdout/stderr on failure.
@@ -1026,15 +1030,18 @@ def _load_diarization_pipeline(
             _log.warning(f"Failed to move diarization to GPU: {e}, using CPU")
     
     _diarization_pipeline = pipeline
+    _diarization_pipeline_model_id = model_id
     return pipeline
 
 
 def unload_diarization_pipeline() -> None:
     """Unload the diarization pipeline to free memory."""
     global _diarization_pipeline
+    global _diarization_pipeline_model_id
     if _diarization_pipeline is not None:
         del _diarization_pipeline
         _diarization_pipeline = None
+        _diarization_pipeline_model_id = None
         _log.info("Diarization pipeline unloaded")
 
 
@@ -1105,6 +1112,8 @@ def diarize_audio(
     _report(0.05, "init")
     
     _log.info(f"Starting speaker diarization for: {audio_path.name}")
+
+    model_id = (os.environ.get("VP_DIARIZATION_MODEL_ID") or "").strip() or _MODEL_ID
     
     t_load0 = time.time()
     pipeline = _load_diarization_pipeline(hf_token=hf_token, use_gpu=use_gpu)
@@ -1128,7 +1137,7 @@ def diarize_audio(
         emb_bs = seg_bs
 
     device_fp = _torch_device_fingerprint()
-    cache_key = f"{_MODEL_ID}|{device_fp}"
+    cache_key = f"{model_id}|{device_fp}"
 
     probe_elapsed_s = 0.0
     probe_used = False
@@ -1336,7 +1345,7 @@ def diarize_audio(
         speakers=speakers,
         duration_seconds=duration,
         meta={
-            "model_id": _MODEL_ID,
+            "model_id": model_id,
             "device_fingerprint": device_fp,
             "perf": perf_meta,
             "postprocess": {
