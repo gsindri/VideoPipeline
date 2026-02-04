@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -148,7 +149,7 @@ def _find_latest_media(repo_root: Path, *, exclude_under: set[Path]) -> Path | N
 
 
 def _require_ffmpeg() -> str:
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
     if not ffmpeg:
         raise RuntimeError(
             "ffmpeg not found in PATH. Install ffmpeg and ensure it is available on PATH "
@@ -220,6 +221,20 @@ def _run_pyannote(*, wav_path: Path, out_json: Path) -> BackendResult:
         from videopipeline.transcription import diarization as dia
     except Exception as exc:
         return BackendResult(status="error", error=f"Failed to import videopipeline diarization module: {exc}")
+
+    # Keep console output short: importing pyannote (via availability check) can emit
+    # non-fatal warnings. These are already filtered in our diarization module when
+    # loading the pipeline, but we pre-filter here because we import pyannote earlier.
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*TensorFloat-32 \(TF32\) has been disabled.*",
+        module=r"pyannote\.audio\.utils\.reproducibility",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"std\(\): degrees of freedom is <= 0\..*",
+        module=r"pyannote\.audio\.models\.blocks\.pooling",
+    )
 
     if not getattr(dia, "is_diarization_available", None) or not dia.is_diarization_available():
         return BackendResult(
@@ -460,4 +475,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
