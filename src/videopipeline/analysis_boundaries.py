@@ -280,6 +280,24 @@ def compute_boundary_graph(
             # Use .get() and normalize floats for defensive schema handling
             valleys = chat_bounds.get("valleys") or []
             valleys = [float(v) for v in valleys]  # Normalize to float
+
+            # Shift valleys into video time using the current sync offset.
+            # Offset convention: video_time = chat_time + offset.
+            try:
+                from .project import get_chat_config
+
+                chat_cfg = get_chat_config(proj)
+                offset_ms = int(chat_cfg.get("sync_offset_ms", 0) or 0)
+                offset_s = float(offset_ms) / 1000.0
+            except Exception:
+                offset_s = 0.0
+
+            if abs(offset_s) > 1e-6:
+                valleys = [v + offset_s for v in valleys]
+
+            # Clamp to video duration if known (keeps merge stable).
+            if duration_s > 0:
+                valleys = [v for v in valleys if 0.0 <= v <= duration_s]
             _merge_boundaries(valleys, "chat_valley", start_points, tolerance)
             _merge_boundaries(valleys, "chat_valley", end_points, tolerance)
 

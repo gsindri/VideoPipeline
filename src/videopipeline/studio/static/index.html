@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="referrer" content="no-referrer" />
   <title>VideoPipeline Studio</title>
   <link rel="stylesheet" href="/static/styles.css" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
@@ -15,6 +16,9 @@
     <header>
       <h1>VideoPipeline Studio</h1>
       <span class="muted">Home</span>
+      <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+        <button data-action="api-token" title="Set API token (VP_API_TOKEN)">🔑 API Token</button>
+      </div>
     </header>
     <main class="home-main">
       <section class="home-section">
@@ -45,6 +49,7 @@
             <label class="small" title="Creates a browser-friendly H.264/AAC preview/proxy if needed (helps playback in Studio)."><input type="checkbox" id="dlCreatePreview" checked /> Create preview</label>
             <label class="small" title="Prevents yt-dlp from downloading entire playlists/channels when a playlist URL is pasted."><input type="checkbox" id="dlNoPlaylist" checked /> No playlist</label>
             <label class="small" title="Print transcript to server console as it's transcribed"><input type="checkbox" id="dlWhisperVerbose" /> Verbose transcript</label>
+            <label class="small" title="Run speaker diarization and add speaker labels to the transcript (requires pyannote-audio and HuggingFace token)"><input type="checkbox" id="dlDiarizeEnabled" checked /> Diarization (speakers)</label>
             <label class="small" title="Enable detailed internal logs (chat/emotes) for this download (DEBUG level)"><input type="checkbox" id="dlVerboseLogs" checked /> Verbose logs</label>
             <label class="small" style="display:flex;align-items:center;gap:5px">
               Speed:
@@ -105,14 +110,27 @@
         <button class="tab-btn" data-tab="publish" id="tabPublish">Publish</button>
       </div>
       <button id="btnBackToHome" style="margin-left:20px" title="Back to Home">← Home</button>
-      <span class="muted" style="margin-left:auto">
-        Shortcuts: <kbd>Space</kbd> play/pause, <kbd>I</kbd> set start, <kbd>O</kbd> set end, <kbd>[</kbd>/<kbd>]</kbd> nudge ±0.5s
-      </span>
+      <div style="margin-left:auto;display:flex;gap:10px;align-items:center">
+        <button data-action="api-token" title="Set API token (VP_API_TOKEN)">🔑 Token</button>
+        <span class="muted">
+          Shortcuts: <kbd>Space</kbd> play/pause, <kbd>I</kbd> set start, <kbd>O</kbd> set end, <kbd>[</kbd>/<kbd>]</kbd> nudge ±0.5s
+        </span>
+      </div>
     </header>
 
     <!-- Edit Tab Content -->
     <main id="editTabContent">
       <section id="left">
+        <div class="panel" id="chatTimelinePanel" data-panel="chat_timeline" style="display:none">
+          <h2>Chat timeline</h2>
+          <div class="panel-content">
+            <div id="chatMiniTimelineWrap" class="chat-mini-timeline" style="display:none" title="Click to seek • Scroll to zoom • Drag to pan">
+              <canvas id="chatMiniTimeline"></canvas>
+              <div class="playhead" id="chatTimelinePlayhead"></div>
+            </div>
+          </div>
+        </div>
+
         <div class="panel">
           <h2>Source video</h2>
           <div class="video-wrap">
@@ -170,15 +188,6 @@
                 <option value="auto">auto</option>
               </select>
             </label>
-            <label title="Run speaker diarization and add speaker labels to the transcript (requires pyannote-audio and HuggingFace token)">
-              <input type="checkbox" id="diarizeEnabled" checked /> Speakers
-            </label>
-            <label title="Print transcript to server console as it's transcribed (useful for monitoring progress)">
-              <input type="checkbox" id="whisperVerbose" /> Verbose
-            </label>
-            <label title="Log a stack trace the first time TensorFlow/tf_keras is imported (debugging noisy protobuf/TensorFlow warnings)">
-              <input type="checkbox" id="traceTfImports" /> Trace TF imports
-            </label>
             <div class="dropdown" style="position:relative">
               <button id="btnAnalysisTools" title="Show/hide individual analysis tools">🔧 Tools ▾</button>
               <div id="analysisToolsDropdown" class="dropdown-menu" style="display:none;position:absolute;top:100%;left:0;background:#1a1d24;border:1px solid var(--border);border-radius:6px;padding:8px;z-index:100;min-width:180px;margin-top:4px">
@@ -197,9 +206,6 @@
                 <label class="dropdown-item" style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;font-size:12px">
                   <input type="checkbox" id="showBtnContext" /> Context + Titles (AI)
                 </label>
-                <label class="dropdown-item" style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;font-size:12px">
-                  <input type="checkbox" id="showBtnReset" /> Reset Analysis
-                </label>
                 <hr style="border:0;border-top:1px solid var(--border);margin:8px 0">
                 <div style="font-size:11px;color:#888;margin-bottom:4px">GPU Memory</div>
                 <div id="gpuMemoryStatus" style="font-size:11px;color:#888;margin-bottom:6px">Loading...</div>
@@ -211,7 +217,25 @@
             <button class="analysis-btn-optional" id="btnAnalyzeAudioEvents" title="Detect laughter, cheering, shouting events">Audio events</button>
             <button class="analysis-btn-optional" id="btnAnalyzeSpeech" title="Transcribe with Whisper and extract speech/reaction features">Speech</button>
             <button class="analysis-btn-optional" id="btnAnalyzeContext" title="Generate clip variants and AI titles/hooks">Context + Titles (AI)</button>
-            <button class="analysis-btn-optional" id="btnResetAnalysis" style="background:#dc2626" title="Delete all analysis data and start fresh">🗑 Reset Analysis</button>
+            <button id="btnResetAnalysis" class="danger" title="Delete analysis data and start fresh">🗑 Reset Analysis</button>
+          </div>
+          <div class="row" style="margin-top:6px;gap:14px">
+            <label title="Run speaker diarization and add speaker labels to the transcript (requires pyannote-audio and HuggingFace token)">
+              <input type="checkbox" id="diarizeEnabled" checked /> Diarization
+            </label>
+            <label title="Hint: minimum expected speakers (leave blank for auto)">Min speakers:
+              <input type="number" id="diarizeMinSpeakers" min="1" step="1" placeholder="auto" style="width:90px;padding:6px 8px" />
+            </label>
+            <label title="Hint: maximum expected speakers (leave blank for auto). Setting this can prevent the model from inventing too many speakers.">Max speakers:
+              <input type="number" id="diarizeMaxSpeakers" min="1" step="1" placeholder="auto" style="width:90px;padding:6px 8px" />
+            </label>
+            <a class="small" id="lnkViewDiarization" href="/api/task_artifact/diarization" target="_blank" rel="noopener" title="View current analysis/diarization.json (if it exists)">View diarization.json</a>
+            <label title="Print transcript to server console as it's transcribed (useful for monitoring progress)">
+              <input type="checkbox" id="whisperVerbose" /> Verbose transcript
+            </label>
+            <label title="Log a stack trace the first time TensorFlow/tf_keras is imported (debugging noisy protobuf/TensorFlow warnings)">
+              <input type="checkbox" id="traceTfImports" /> Trace TF imports
+            </label>
           </div>
           <div class="row">
             <span class="small" id="analysisStatus"></span>
@@ -364,12 +388,6 @@
               <button id="chatNudgeFwd" style="padding:2px 8px">+1s</button>
             </label>
             <label style="font-size:0.85em"><input type="checkbox" id="chatAutoScroll" checked /> Auto-scroll</label>
-          </div>
-          
-          <!-- Chat Mini-Timeline -->
-          <div id="chatMiniTimelineWrap" class="chat-mini-timeline" style="display:none" title="Click to seek, shows chat activity over time">
-            <canvas id="chatMiniTimeline"></canvas>
-            <div class="playhead" id="chatTimelinePlayhead"></div>
           </div>
           
           <!-- Chat Filter Controls -->
@@ -561,6 +579,26 @@
         </div>
       </section>
     </main>
+  </div>
+
+  <!-- API token prompt (shown automatically on 401 if VP_API_TOKEN is set) -->
+  <div id="apiTokenModal" class="token-modal-overlay" style="display:none">
+    <div class="token-modal">
+      <h2>API Token Required</h2>
+      <div class="small" style="color:var(--muted);margin-bottom:10px">
+        This Studio server requires a token (<code>VP_API_TOKEN</code>). Paste it to access <code>/api/*</code> endpoints.
+      </div>
+      <input type="password" id="apiTokenInput" placeholder="Paste token…" autocomplete="off" />
+      <label class="small" style="display:flex;align-items:center;gap:8px;margin-top:10px">
+        <input type="checkbox" id="apiTokenRemember" /> Remember on this device
+      </label>
+      <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">
+        <button id="btnApiTokenCancel">Cancel</button>
+        <button class="danger" id="btnApiTokenForget">Forget</button>
+        <button class="primary" id="btnApiTokenSave">Save</button>
+      </div>
+      <div class="small" id="apiTokenError" style="display:none;color:var(--danger);margin-top:10px"></div>
+    </div>
   </div>
 
   <script src="/static/app.js"></script>

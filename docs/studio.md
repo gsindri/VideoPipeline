@@ -123,6 +123,14 @@ Downloads are saved to: `%LOCALAPPDATA%\VideoPipeline\Workspace\downloads\`
 - Watch progress in Jobs
 - Click "← Home" to return to Home screen and open another project
 
+### AI Titles (Director)
+
+Studio's **Context + Titles (AI)** step generates clip variants and suggests a **title / hook / hashtags** per top candidate. The suggestions are grounded in:
+- **Transcript text** inside each variant window
+- **Chat replay** around the moment (if `analysis/chat.sqlite` exists and is synced)
+
+If titles/hooks miss the joke, verify transcription ran and chat is downloaded + synced (use the Chat Replay offset controls).
+
 ## Publishing from the UI
 
 Studio includes a **Publish** tab for uploading exports to YouTube (and later TikTok).

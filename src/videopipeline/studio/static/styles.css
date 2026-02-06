@@ -695,6 +695,42 @@ details[open] summary::before {
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
 }
 
+/* API token modal (for VP_API_TOKEN protected servers) */
+.token-modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.8);
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(4px);
+}
+
+.token-modal {
+  background: var(--bg);
+  padding: 22px;
+  border-radius: 12px;
+  width: min(520px, calc(100vw - 32px));
+  border: 1px solid var(--border);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+
+.token-modal h2 {
+  margin: 0 0 10px 0;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.token-modal input[type="password"],
+.token-modal input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+}
+
 /* Candidate card with AI info */
 .candidate-ai-section {
   margin-top: 8px;
@@ -1011,13 +1047,18 @@ details[open] summary::before {
    ========================================================================= */
 
 .chat-mini-timeline {
-  height: 40px;
+  height: 80px;
   background: #0a0c0f;
   border-radius: 6px;
   margin: 8px 0;
   position: relative;
   overflow: hidden;
-  cursor: pointer;
+  cursor: grab;
+  user-select: none;
+}
+
+.chat-mini-timeline.dragging {
+  cursor: grabbing;
 }
 
 .chat-mini-timeline canvas {

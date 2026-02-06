@@ -7,7 +7,10 @@ from videopipeline.ai.director import (
     DirectorConfig,
     DirectorResult,
     DIRECTOR_SYSTEM_PROMPT,
+    _build_director_prompt,
+    _parse_director_response,
 )
+from videopipeline.clip_variants import CandidateVariants, ClipVariant
 
 
 class TestDirectorConfig:
@@ -231,3 +234,61 @@ class TestFallbackMetadata:
             chosen = variants[0]["variant_id"]
         
         assert chosen == "medium_B"
+
+
+class TestPromptBuilder:
+    def test_prompt_includes_chat_and_transcript_context(self):
+        v = ClipVariant(
+            variant_id="short",
+            start_s=0.0,
+            end_s=10.0,
+            duration_s=10.0,
+            description="test",
+            setup_text="Setup line",
+            payoff_text="Payoff line",
+        )
+        # These are optional attributes populated at runtime by the director analysis.
+        v.transcript_snippet = "I pour the milk first."
+        v.closing_text = "I pour the milk first."
+
+        cand = CandidateVariants(candidate_rank=1, candidate_peak_time_s=5.0, variants=[v])
+        prompt = _build_director_prompt(
+            cand,
+            "shorts",
+            chat_summary={"top_lines": [{"text": "MILK FIRST EWWW", "count": 3}]},
+            score_info={"chat": 1.0},
+        )
+        assert "MILK FIRST EWWW" in prompt
+        assert "I pour the milk first" in prompt
+
+
+class TestParseDirectorResponse:
+    def test_sanitizes_fragment_hook(self):
+        r = _parse_director_response(
+            {
+                "best_variant_id": "short",
+                "reason": "x",
+                "title": "TEST",
+                "hook": "You Are A",
+                "description": "x",
+                "hashtags": ["test"],
+                "confidence": 0.9,
+            },
+            candidate_rank=1,
+        )
+        assert r.hook == "WATCH THIS"
+
+    def test_strips_trailing_stopword_in_hook(self):
+        r = _parse_director_response(
+            {
+                "best_variant_id": "short",
+                "reason": "x",
+                "title": "TEST",
+                "hook": "MILK FIRST A",
+                "description": "x",
+                "hashtags": ["test"],
+                "confidence": 0.9,
+            },
+            candidate_rank=1,
+        )
+        assert r.hook == "MILK FIRST"

@@ -379,7 +379,6 @@ def _run_chapters(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Call
             changepoint_penalty=float(chapters_cfg.get("changepoint_penalty", 10.0)),
             llm_labeling=bool(chapters_cfg.get("llm_labeling", True)) and llm_complete is not None,
         ),
-        llm_complete=llm_complete,
         on_progress=on_progress,
     )
 
@@ -448,6 +447,23 @@ def _run_chat_boundaries(proj: Project, cfg: Dict[str, Any], on_progress: Option
             min_valley_gap_s=float(chat_cfg.get("min_valley_gap_s", 5.0)),
             min_burst_gap_s=float(chat_cfg.get("min_burst_gap_s", 3.0)),
         ),
+        on_progress=on_progress,
+    )
+
+
+def _run_chat_sync(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
+    """Estimate chat↔video sync offset from chat spikes vs audio intensity.
+
+    Persists:
+      - analysis/chat_sync.json
+      - project.json -> chat.sync_offset_ms (+ metadata)
+    """
+    from ..analysis_chat_sync import ChatSyncConfig, compute_chat_sync_analysis
+
+    sync_cfg = cfg.get("chat_sync", {}) or {}
+    compute_chat_sync_analysis(
+        proj,
+        cfg=ChatSyncConfig.from_dict(sync_cfg),
         on_progress=on_progress,
     )
 
@@ -739,6 +755,19 @@ task_registry.register(Task(
     can_run_partial=True,
 ))
 
+task_registry.register(Task(
+    name="chat_sync",
+    # Requires audio for timebase; chat is optional (artifact still written for UI/debugging).
+    requires={"audio_features"},
+    optional_inputs={"chat_features", "audio_events", "reaction_audio"},
+    produces={"chat_sync"},
+    run=_run_chat_sync,
+    version="1.0",
+    can_run_partial=True,
+    upgrade_triggers={"chat_features", "audio_events", "reaction_audio"},
+    enabled_check=lambda cfg: cfg.get("chat_sync", {}).get("enabled", True),
+))
+
 # --- Video-derived tasks ---
 task_registry.register(Task(
     name="motion_features",
@@ -766,8 +795,8 @@ task_registry.register(Task(
     run=_run_boundary_graph,
     version="1.0",
     can_run_partial=True,  # Can run without scenes/chapters/audio_vad (if torch missing)
-    optional_inputs={"silence", "diarization", "scenes", "chapters", "chat_boundaries", "audio_vad"},
-    upgrade_triggers={"silence", "diarization", "scenes", "chapters", "chat_boundaries", "audio_vad"},  # Re-run when these appear
+    optional_inputs={"silence", "diarization", "scenes", "chapters", "chat_boundaries", "audio_vad", "chat_sync"},
+    upgrade_triggers={"silence", "diarization", "scenes", "chapters", "chat_boundaries", "audio_vad", "chat_sync"},  # Re-run when these appear
 ))
 
 # --- Highlights (split into scoring + shaping) ---
@@ -778,8 +807,8 @@ task_registry.register(Task(
     run=_run_highlights_scores,
     version="1.0",
     can_run_partial=True,
-    optional_inputs={"motion_features", "chat_features", "audio_events", "speech_features", "audio_vad", "reaction_audio", "diarization"},
-    upgrade_triggers={"motion_features", "chat_features", "audio_events", "speech_features", "audio_vad", "reaction_audio", "diarization"},  # Re-score when richer signals become available
+    optional_inputs={"motion_features", "chat_features", "audio_events", "speech_features", "audio_vad", "reaction_audio", "diarization", "chat_sync"},
+    upgrade_triggers={"motion_features", "chat_features", "audio_events", "speech_features", "audio_vad", "reaction_audio", "diarization", "chat_sync"},  # Re-score when richer signals become available
 ))
 
 task_registry.register(Task(
@@ -789,8 +818,8 @@ task_registry.register(Task(
     run=_run_highlights_candidates,
     version="1.0",
     can_run_partial=True,  # Can run without boundary graph (rough cuts)
-    optional_inputs={"boundary_graph", "scenes", "motion_features", "chat_features", "audio_events", "speech_features", "audio_vad", "reaction_audio", "diarization"},
-    upgrade_triggers={"boundary_graph", "scenes", "motion_features", "chat_features", "audio_events", "speech_features", "audio_vad", "reaction_audio", "diarization"},  # Re-shape when boundaries OR scoring signals improve
+    optional_inputs={"boundary_graph", "scenes", "motion_features", "chat_features", "audio_events", "speech_features", "audio_vad", "reaction_audio", "diarization", "chat_sync"},
+    upgrade_triggers={"boundary_graph", "scenes", "motion_features", "chat_features", "audio_events", "speech_features", "audio_vad", "reaction_audio", "diarization", "chat_sync"},  # Re-shape when boundaries OR scoring signals improve
 ))
 
 # --- Post-highlights ---
@@ -805,6 +834,7 @@ task_registry.register(Task(
         "audio_vad",
         "reaction_audio",
         "diarization",
+        "chat_sync",
     },
     produces={"variants"},
     run=_run_variants,
@@ -817,6 +847,7 @@ task_registry.register(Task(
         "audio_vad",
         "reaction_audio",
         "diarization",
+        "chat_sync",
     },
     can_run_partial=True,
 ))

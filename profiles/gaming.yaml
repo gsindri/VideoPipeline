@@ -61,7 +61,7 @@ analysis:
       max_post_seconds: 28
     # LLM-powered quality filtering
     # This lets the LLM reject boring candidates even if they have high signal scores
-    llm_filter_enabled: true
+    llm_filter_enabled: false
     llm_filter_min_quality: 5  # 1-10 scale, candidates below this are rejected
     llm_filter_max_keep: 10    # Keep at most this many candidates (null = no limit)
     content_type: gaming       # Helps LLM understand what "good content" means

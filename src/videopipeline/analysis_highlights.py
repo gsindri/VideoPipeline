@@ -12,7 +12,7 @@ from .analysis_chat import compute_chat_analysis
 from .analysis_motion import compute_motion_analysis
 from .analysis_scenes import compute_scene_analysis
 from .peaks import moving_average, pick_top_peaks, robust_z
-from .project import Project, get_project_data, load_npz, save_npz, update_project
+from .project import Project, get_chat_config, get_project_data, load_npz, save_npz, update_project
 
 
 def _coerce_llm_response_to_text(resp: Any) -> str:
@@ -1328,8 +1328,14 @@ def compute_highlights_analysis(
     chat_scores = np.zeros_like(audio_scores)
     chat_used = False
     if include_chat and proj.chat_features_path.exists():
+        chat_cfg = get_chat_config(proj)
+        chat_offset_ms = int(chat_cfg.get("sync_offset_ms", 0) or 0)
+        chat_offset_s = float(chat_offset_ms) / 1000.0
+
         chat_data = load_npz(proj.chat_features_path)
-        chat_raw = chat_data.get("scores")
+        chat_raw = chat_data.get("scores_activity")
+        if chat_raw is None:
+            chat_raw = chat_data.get("scores")
         chat_hop_arr = chat_data.get("hop_seconds")
         if chat_raw is not None and chat_hop_arr is not None and len(chat_hop_arr) > 0:
             chat_scores = resample_series(
@@ -1337,6 +1343,7 @@ def compute_highlights_analysis(
                 src_hop_s=float(chat_hop_arr[0]),
                 target_hop_s=hop_s,
                 target_len=len(audio_scores),
+                target_times=(np.arange(len(audio_scores), dtype=np.float64) * hop_s - chat_offset_s),
                 fill_value=0.0,
             )
             chat_used = True
@@ -1419,7 +1426,9 @@ def compute_highlights_analysis(
     if proj.reaction_audio_features_path.exists():
         try:
             reaction_data = load_npz(proj.reaction_audio_features_path)
-            reaction_raw = reaction_data.get("scores")
+            reaction_raw = reaction_data.get("reaction_score")
+            if reaction_raw is None:
+                reaction_raw = reaction_data.get("scores")
             reaction_hop_arr = reaction_data.get("hop_seconds")
             if reaction_raw is not None and reaction_hop_arr is not None and len(reaction_hop_arr) > 0:
                 reaction_scores = resample_series(
@@ -1439,6 +1448,11 @@ def compute_highlights_analysis(
 
     w_chat_cfg = float(weights.get("chat", 0.20))
     w_chat = w_chat_cfg if chat_used else 0.0
+    if w_chat > 0:
+        chat_weight_mult = float(highlights_cfg.get("chat_weight_multiplier", 1.25))
+        # Defensive clamp to prevent extreme ratios.
+        chat_weight_mult = float(np.clip(chat_weight_mult, 0.0, 3.0))
+        w_chat *= chat_weight_mult
 
     w_audio_events_cfg = float(weights.get("audio_events", 0.20))
     w_audio_events = w_audio_events_cfg if audio_events_used else 0.0
@@ -1941,8 +1955,14 @@ def compute_highlights_scores(
     chat_scores = np.zeros_like(audio_scores)
     chat_used = False
     if include_chat and proj.chat_features_path.exists():
+        chat_cfg = get_chat_config(proj)
+        chat_offset_ms = int(chat_cfg.get("sync_offset_ms", 0) or 0)
+        chat_offset_s = float(chat_offset_ms) / 1000.0
+
         chat_data = load_npz(proj.chat_features_path)
-        chat_raw = chat_data.get("scores")
+        chat_raw = chat_data.get("scores_activity")
+        if chat_raw is None:
+            chat_raw = chat_data.get("scores")
         chat_hop_arr = chat_data.get("hop_seconds")
         if chat_raw is not None and chat_hop_arr is not None and len(chat_hop_arr) > 0:
             chat_scores = resample_series(
@@ -1950,6 +1970,7 @@ def compute_highlights_scores(
                 src_hop_s=float(chat_hop_arr[0]),
                 target_hop_s=hop_s,
                 target_len=len(audio_scores),
+                target_times=(np.arange(len(audio_scores), dtype=np.float64) * hop_s - chat_offset_s),
                 fill_value=0.0,
             )
             chat_used = True
@@ -2011,7 +2032,9 @@ def compute_highlights_scores(
     if proj.reaction_audio_features_path.exists():
         try:
             reaction_data = load_npz(proj.reaction_audio_features_path)
-            reaction_raw = reaction_data.get("scores")
+            reaction_raw = reaction_data.get("reaction_score")
+            if reaction_raw is None:
+                reaction_raw = reaction_data.get("scores")
             reaction_hop_arr = reaction_data.get("hop_seconds")
             if reaction_raw is not None and reaction_hop_arr is not None and len(reaction_hop_arr) > 0:
                 reaction_scores = resample_series(
@@ -2108,6 +2131,10 @@ def compute_highlights_scores(
     w_audio = float(weights.get("audio", 0.45))
     w_motion = float(weights.get("motion", 0.15)) if motion_used else 0.0
     w_chat = float(weights.get("chat", 0.20)) if chat_used else 0.0
+    if w_chat > 0:
+        chat_weight_mult = float(highlights_cfg.get("chat_weight_multiplier", 1.25))
+        chat_weight_mult = float(np.clip(chat_weight_mult, 0.0, 3.0))
+        w_chat *= chat_weight_mult
     w_audio_events = float(weights.get("audio_events", 0.20)) if audio_events_used else 0.0
     w_speech = float(weights.get("speech", 0.15)) if speech_used else 0.0
     w_reaction = float(weights.get("reaction", 0.15)) if reaction_used else 0.0
@@ -2323,6 +2350,99 @@ def compute_highlights_scores(
             "speech_gate_floor": speech_gate_floor,
         },
     }
+
+
+def _interval_iou(a0: float, a1: float, b0: float, b1: float) -> float:
+    a0 = float(a0)
+    a1 = float(a1)
+    b0 = float(b0)
+    b1 = float(b1)
+    if a1 <= a0 or b1 <= b0:
+        return 0.0
+    inter = max(0.0, min(a1, b1) - max(a0, b0))
+    union = (a1 - a0) + (b1 - b0) - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
+def _merge_candidate_extras(
+    candidates: List[Dict[str, Any]],
+    prev_candidates: List[Dict[str, Any]],
+    *,
+    peak_tol_s: float = 1.0,
+    iou_tol: float = 0.55,
+    preserve_keys: Iterable[str] = ("ai", "hook_text", "quote_text"),
+) -> List[Dict[str, Any]]:
+    """Best-effort preserve non-score metadata across re-shaping.
+
+    The highlights shaping stage can be re-run when boundary data improves (upgrade_mode),
+    which rewrites the candidate list. This function tries to carry forward auxiliary
+    fields added by later stages (AI Director, enrichment, etc.) when the "same" clip
+    still exists after reshaping.
+    """
+    if not candidates or not prev_candidates:
+        return candidates
+
+    def f(x: Any, default: float = 0.0) -> float:
+        try:
+            return float(x)
+        except Exception:
+            return float(default)
+
+    prev_rows: List[Dict[str, Any]] = []
+    for idx, pc in enumerate(prev_candidates):
+        prev_rows.append(
+            {
+                "idx": idx,
+                "start": f(pc.get("start_s")),
+                "end": f(pc.get("end_s")),
+                "peak": f(pc.get("peak_time_s")),
+                "cand": pc,
+            }
+        )
+
+    used_prev: set[int] = set()
+
+    for c in candidates:
+        cs = f(c.get("start_s"))
+        ce = f(c.get("end_s"))
+        cp = f(c.get("peak_time_s"))
+
+        best: Optional[Dict[str, Any]] = None
+        best_key: Optional[tuple] = None
+
+        for row in prev_rows:
+            idx = int(row["idx"])
+            if idx in used_prev:
+                continue
+
+            ps = float(row["start"])
+            pe = float(row["end"])
+            pp = float(row["peak"])
+            peak_diff = abs(cp - pp)
+            iou = _interval_iou(cs, ce, ps, pe)
+
+            if peak_diff > float(peak_tol_s) and iou < float(iou_tol):
+                continue
+
+            # Prefer higher overlap, then smaller peak diff
+            key = (round(iou, 4), -round(peak_diff, 3))
+            if best_key is None or key > best_key:
+                best_key = key
+                best = row
+
+        if best is None:
+            continue
+
+        used_prev.add(int(best["idx"]))
+        prev = best["cand"]
+
+        for k in preserve_keys:
+            if k in prev and prev.get(k) not in (None, "", [], {}):
+                # Only overwrite if new is missing/empty.
+                if c.get(k) in (None, "", [], {}):
+                    c[k] = prev.get(k)
+
+    return candidates
 
 
 def compute_highlights_candidates(
@@ -2607,7 +2727,8 @@ def compute_highlights_candidates(
     llm_filter_used = False
     llm_filter_stats: Dict[str, Any] = {}
     
-    llm_filter_enabled = bool(highlights_cfg.get("llm_filter_enabled", True))
+    # LLM quality filter is destructive (it removes candidates). Keep it opt-in by default.
+    llm_filter_enabled = bool(highlights_cfg.get("llm_filter_enabled", False))
     
     if not llm_filter_enabled:
         _highlight_logger.info("[highlights_candidates] LLM quality filter disabled in config (llm_filter_enabled=false)")
@@ -2679,10 +2800,25 @@ def compute_highlights_candidates(
     # Update project.json
     def _upd(d: Dict[str, Any]) -> None:
         d.setdefault("analysis", {})
-        d["analysis"]["highlights"] = {
+
+        prev_highlights = d.get("analysis", {}).get("highlights", {}) or {}
+        prev_candidates = prev_highlights.get("candidates", []) or []
+
+        merged_candidates = _merge_candidate_extras(list(payload.get("candidates", []) or []), list(prev_candidates))
+        payload["candidates"] = merged_candidates
+
+        highlights_out: Dict[str, Any] = {
+            **prev_highlights,
             **payload,
             "features_npz": str(proj.highlights_features_path.relative_to(proj.project_dir)),
         }
+
+        # If we couldn't preserve enrichment fields, drop the stale "enriched_at" marker.
+        if not any((c.get("hook_text") or c.get("quote_text")) for c in merged_candidates):
+            highlights_out.pop("enriched_at", None)
+            highlights_out.pop("enrich_elapsed_seconds", None)
+
+        d["analysis"]["highlights"] = highlights_out
     
     update_project(proj, _upd)
     

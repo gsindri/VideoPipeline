@@ -1,0 +1,29 @@
+@echo off
+setlocal
+
+rem Example launcher for a VP_API_TOKEN-protected Studio server.
+rem - Activates the local venv
+rem - Ensures a token exists (persisted to %LOCALAPPDATA%\VideoPipeline\vp_api_token.txt)
+rem - Exports VP_API_TOKEN for this run
+rem - Launches Studio minimized
+
+cd /d "%~dp0\.."
+
+if not exist ".venv\Scripts\activate.bat" (
+  echo Missing venv at .venv\Scripts\activate.bat 1>&2
+  exit /b 1
+)
+
+call ".venv\Scripts\activate.bat"
+
+for /f "usebackq delims=" %%T in (`powershell.exe -NoProfile -ExecutionPolicy Bypass -File "tools\vp_api_token.ps1" -Persist`) do set "VP_API_TOKEN=%%T"
+
+if not defined VP_API_TOKEN (
+  echo Failed to set VP_API_TOKEN 1>&2
+  exit /b 1
+)
+
+start "" /min python -m videopipeline.launcher
+
+endlocal
+

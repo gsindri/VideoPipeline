@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -374,6 +375,23 @@ def _configure_pyannote_batches(
     seg_ok = False
     emb_ok = False
 
+    # Some pipelines expose batch-size knobs as direct attributes/properties
+    # (not `ParamDict` parameters), so `instantiate(...)` won't work. Handle the
+    # common pyannote.audio>=4 SpeakerDiarization case explicitly.
+    if segmentation_batch_size is not None and hasattr(pipeline, "segmentation_batch_size"):
+        try:
+            setattr(pipeline, "segmentation_batch_size", int(segmentation_batch_size))
+            seg_ok = True
+        except Exception:
+            pass
+
+    if embedding_batch_size is not None and hasattr(pipeline, "embedding_batch_size"):
+        try:
+            setattr(pipeline, "embedding_batch_size", int(embedding_batch_size))
+            emb_ok = True
+        except Exception:
+            pass
+
     # Known common names first.
     if segmentation_batch_size is not None:
         for name in (
@@ -498,6 +516,69 @@ def _autotune_batch_sizes(
 
     _log.info("Batch-size auto probe failed; using defaults.")
     return None
+
+
+def _maybe_convert_input_to_wav(
+    audio_path: Path,
+    *,
+    sample_rate: int = 16000,
+) -> tuple[Optional[tempfile.TemporaryDirectory], Path]:
+    """Best-effort: convert container/compressed audio to a mono 16kHz WAV.
+
+    pyannote diarization crops audio many times (e.g., embeddings). Random access
+    in compressed containers (mp4/m4a/webm/opus/...) can be very slow on some
+    platforms/decoders. Converting to PCM WAV up-front is typically much faster.
+
+    Returns:
+        (tmpdir, wav_path). Caller must keep `tmpdir` alive until done.
+        If conversion is not possible, returns (None, audio_path).
+    """
+    audio_path = Path(audio_path)
+    if audio_path.suffix.lower() == ".wav":
+        return None, audio_path
+
+    try:
+        from ..ffmpeg import _require_cmd
+
+        _require_cmd("ffmpeg")
+    except Exception:
+        return None, audio_path
+
+    td = tempfile.TemporaryDirectory(prefix="vp_diar_")
+    wav_path = Path(td.name) / "audio.wav"
+
+    try:
+        import subprocess
+
+        from ..utils import subprocess_flags as _subprocess_flags
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            str(audio_path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            str(int(sample_rate)),
+            "-f",
+            "wav",
+            str(wav_path),
+        ]
+        subprocess.check_call(cmd, **_subprocess_flags())
+        if wav_path.exists() and wav_path.stat().st_size > 0:
+            return td, wav_path
+    except Exception:
+        pass
+
+    try:
+        td.cleanup()
+    except Exception:
+        pass
+    return None, audio_path
 
 
 def _decode_audio_with_ffmpeg(
@@ -1085,6 +1166,29 @@ def diarize_audio(
 
     t_total0 = time.time()
 
+    pipeline_audio_path = audio_path
+    input_tmpdir: Optional[tempfile.TemporaryDirectory] = None
+    converted_to_wav = False
+    input_convert_s = 0.0
+    try:
+        t_in0 = time.time()
+        input_tmpdir, pipeline_audio_path = _maybe_convert_input_to_wav(audio_path, sample_rate=16000)
+        input_convert_s = time.time() - t_in0
+        converted_to_wav = input_tmpdir is not None and pipeline_audio_path != audio_path
+        if converted_to_wav:
+            _log.info("Diarization input converted to WAV for faster decoding/seek.")
+    except Exception:
+        # Best-effort: conversion should never prevent diarization.
+        input_convert_s = 0.0
+        converted_to_wav = False
+        pipeline_audio_path = audio_path
+        try:
+            if input_tmpdir is not None:
+                input_tmpdir.cleanup()
+        except Exception:
+            pass
+        input_tmpdir = None
+
     last_progress = 0.0
 
     def _report(frac: float, msg: Optional[str] = None) -> None:
@@ -1249,7 +1353,7 @@ def diarize_audio(
     t_run0 = time.time()
     try:
         try:
-            diarization = _call_pipeline(str(audio_path))
+            diarization = _call_pipeline(str(pipeline_audio_path))
         except Exception as e:
             msg = str(e)
             if ("AudioDecoder" not in msg) and ("torchcodec" not in msg.lower()):
@@ -1260,13 +1364,18 @@ def diarize_audio(
             )
             used_waveform_input = True
             t_dec0 = time.time()
-            wav = _decode_audio_with_ffmpeg(audio_path)
+            wav = _decode_audio_with_ffmpeg(pipeline_audio_path)
             fallback_decode_s = time.time() - t_dec0
             diarization = _call_pipeline(wav)
     finally:
         if ticker_stop is not None:
             try:
                 ticker_stop.set()
+            except Exception:
+                pass
+        if input_tmpdir is not None:
+            try:
+                input_tmpdir.cleanup()
             except Exception:
                 pass
     run_s = time.time() - t_run0
@@ -1347,6 +1456,10 @@ def diarize_audio(
         meta={
             "model_id": model_id,
             "device_fingerprint": device_fp,
+            "input": {
+                "original_suffix": str(audio_path.suffix).lower(),
+                "converted_to_wav": bool(converted_to_wav),
+            },
             "perf": perf_meta,
             "postprocess": {
                 "speaker_count_before": int(speaker_count_before),
@@ -1367,6 +1480,7 @@ def diarize_audio(
                 "auto_probe_cache_key": cache_key if probe_used else "",
             },
             "timing": {
+                "input_convert_seconds": float(input_convert_s),
                 "load_pipeline_seconds": float(load_s),
                 "probe_seconds": float(probe_elapsed_s),
                 "run_seconds": float(run_s),

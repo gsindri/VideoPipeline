@@ -7,13 +7,16 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..clip_variants import CandidateVariants, ClipVariant, load_clip_variants
-from ..project import Project, get_project_data, save_json, update_project
+from ..project import Project, get_chat_config, get_project_data, save_json, update_project
+from ..analysis_transcript import load_transcript
+from ..chat.store import ChatStore
 from .llm_client import (
     LLMClient,
     LLMClientConfig,
@@ -92,30 +95,218 @@ Rules:
 1. Choose the variant that best captures the highlight while keeping viewer attention
 2. For shorts/TikTok: prefer shorter variants (16-30s) unless setup is crucial
 3. For YouTube: can use longer variants if story is compelling
-4. Title should be attention-grabbing, use caps for emphasis
-5. Hook is shown at start of video (max 2-3 words)
+4. Title should be attention-grabbing and specific to what happens in the clip (object + action). Use caps for emphasis, but don't be misleading.
+5. Hook is shown at start of video (2-3 words). It MUST be a standalone phrase; do NOT end with a/an/the/to/of/and/or. Avoid fragments like "YOU ARE …" unless it's immediately followed by a specific noun/adjective.
 6. Description should be brief and engaging
 7. Include relevant hashtags for discoverability
+8. If the transcript has a reveal near the END, prefer variants that include it. Use chat_context to understand what viewers reacted to.
+
+Examples:
+- transcript: "I pour the milk first." chat_context: ["MILK FIRST EWWW"] -> hook: "MILK FIRST?!" title: "MILK FIRST (NO JUDGMENT)"
+- transcript: "What did he just say?!" -> hook: "WAIT WHAT" title: "WHAT DID HE SAY?!"
 
 Output ONLY valid JSON matching the schema exactly. No explanation text."""
+
+
+_HOOK_TRAILING_STOPWORDS = {
+    "a",
+    "an",
+    "the",
+    "to",
+    "of",
+    "and",
+    "or",
+    "but",
+    "for",
+    "in",
+    "on",
+    "at",
+    "with",
+    "from",
+    "into",
+    "as",
+}
+
+
+def _clean_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _trim_text(text: str, max_chars: int) -> str:
+    text = _clean_ws(text)
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    cut = text[: max_chars - 1]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return (cut + "…").strip()
+
+
+def _clamp_at_word_boundary(text: str, max_chars: int) -> str:
+    text = _clean_ws(text)
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.strip()
+
+
+def _sanitize_title(title: str) -> str:
+    return _clean_ws(str(title or "")).strip('"\''"“”")
+
+
+def _sanitize_hook(hook: str) -> str:
+    hook = _clean_ws(str(hook or "")).strip('"\''"“”")
+    words = hook.split()
+    while words and words[-1].lower() in _HOOK_TRAILING_STOPWORDS:
+        words = words[:-1]
+    hook = " ".join(words).strip()
+    if hook.lower() in {"you are", "i am", "we are"}:
+        hook = ""
+    return _clamp_at_word_boundary(hook, 20)
+
+
+def _transcript_snippet_for_range(
+    transcript: Any,
+    start_s: float,
+    end_s: float,
+    *,
+    max_chars: int = 320,
+) -> Tuple[str, str]:
+    """Return (snippet, closing_line) for transcript segments overlapping [start_s,end_s]."""
+    if not transcript or not getattr(transcript, "segments", None):
+        return ("", "")
+
+    parts: List[str] = []
+    closing = ""
+    for seg in transcript.segments:
+        try:
+            if float(getattr(seg, "end", 0.0)) < float(start_s):
+                continue
+            if float(getattr(seg, "start", 0.0)) > float(end_s):
+                break
+        except Exception:
+            continue
+
+        try:
+            overlaps = float(seg.end) >= float(start_s) and float(seg.start) <= float(end_s)
+        except Exception:
+            overlaps = False
+        if not overlaps:
+            continue
+
+        t = _clean_ws(str(getattr(seg, "text", "") or ""))
+        if not t:
+            continue
+        parts.append(t)
+        closing = t
+
+    snippet = _trim_text(" ".join(parts), max_chars=max_chars)
+    closing = _trim_text(closing, max_chars=120)
+    return (snippet, closing)
+
+
+def _summarize_chat_messages(texts: List[str], *, max_lines: int = 8, max_keywords: int = 10) -> Dict[str, Any]:
+    texts = [_clean_ws(t) for t in (texts or [])]
+    texts = [t for t in texts if t]
+    if not texts:
+        return {}
+
+    def is_informative(line: str) -> bool:
+        if len(line) > 120:
+            return False
+        return bool(re.search(r"[A-Za-z0-9]", line))
+
+    counts: Counter[str] = Counter()
+    first_seen: Dict[str, str] = {}
+    for t in texts:
+        if not is_informative(t):
+            continue
+        key = t.lower()
+        counts[key] += 1
+        if key not in first_seen:
+            first_seen[key] = t
+
+    top_lines: List[Dict[str, Any]] = []
+    for key, n in counts.most_common():
+        top_lines.append({"text": first_seen.get(key, key), "count": int(n)})
+        if len(top_lines) >= max_lines:
+            break
+
+    stop = {
+        "the",
+        "a",
+        "an",
+        "to",
+        "of",
+        "and",
+        "or",
+        "is",
+        "are",
+        "im",
+        "i'm",
+        "you",
+        "u",
+        "we",
+        "they",
+        "he",
+        "she",
+        "it",
+        "this",
+        "that",
+        "lol",
+        "lmao",
+        "omg",
+        "wtf",
+        "nah",
+        "no",
+        "yes",
+        "yo",
+        "bro",
+        "pls",
+        "please",
+        "dont",
+        "don't",
+    }
+    word_counts: Counter[str] = Counter()
+    for t in texts:
+        for w in re.findall(r"[a-z0-9']{2,}", t.lower()):
+            if w in stop:
+                continue
+            word_counts[w] += 1
+    top_keywords = [w for w, _ in word_counts.most_common(max_keywords)]
+
+    return {
+        "messages": len(texts),
+        "top_keywords": top_keywords,
+        "top_lines": top_lines,
+    }
 
 
 def _build_director_prompt(
     candidate: CandidateVariants,
     platform: str,
-    chat_summary: Optional[str] = None,
+    chat_summary: Optional[Dict[str, Any]] = None,
     score_info: Optional[Dict[str, float]] = None,
 ) -> str:
     """Build the prompt for the director LLM."""
     variants_info = []
     for v in candidate.variants:
-        variants_info.append({
-            "id": v.variant_id,
-            "duration_s": round(v.duration_s, 1),
-            "description": v.description,
-            "setup_text": v.setup_text[:100] if v.setup_text else "",
-            "payoff_text": v.payoff_text[:100] if v.payoff_text else "",
-        })
+        variants_info.append(
+            {
+                "id": v.variant_id,
+                "start_s": round(v.start_s, 2),
+                "end_s": round(v.end_s, 2),
+                "duration_s": round(v.duration_s, 1),
+                "description": v.description,
+                "setup_text": _trim_text(v.setup_text or "", 220),
+                "payoff_text": _trim_text(v.payoff_text or "", 220),
+                # Optional context populated by compute_director_analysis (best-effort).
+                "transcript_snippet": _trim_text(getattr(v, "transcript_snippet", "") or "", 320),
+                "closing_text": _trim_text(getattr(v, "closing_text", "") or "", 120),
+            }
+        )
 
     prompt_data = {
         "task": "Select best variant and generate metadata",
@@ -230,8 +421,10 @@ def _parse_director_response(
     if best_variant_id not in ("short", "medium", "long", "setup_first", "punchline_first", "chat_centered"):
         best_variant_id = "medium"
 
-    title = str(response.get("title", ""))[:60]
-    hook = str(response.get("hook", "WATCH THIS"))[:20]
+    title = _sanitize_title(response.get("title", ""))[:60]
+    hook = _sanitize_hook(response.get("hook", ""))
+    if not hook:
+        hook = "WATCH THIS"
     description = str(response.get("description", ""))[:200]
 
     hashtags = response.get("hashtags", [])
@@ -287,7 +480,7 @@ class AIDirector:
         self,
         candidate: CandidateVariants,
         *,
-        chat_summary: Optional[str] = None,
+        chat_summary: Optional[Dict[str, Any]] = None,
         score_info: Optional[Dict[str, float]] = None,
     ) -> DirectorResult:
         """Process a single candidate and generate metadata.
@@ -389,6 +582,10 @@ def compute_director_analysis(
     if not variants_list:
         raise ValueError("No clip variants found. Run clip variant analysis first.")
 
+    # Optional grounding context
+    transcript = load_transcript(proj)
+    chat_offset_ms = int(get_chat_config(proj).get("sync_offset_ms", 0) or 0)
+
     # Create director with potentially updated endpoint
     cache_dir = proj.analysis_dir
     # Create a new config with the actual endpoint (may have been updated by auto-start)
@@ -430,17 +627,59 @@ def compute_director_analysis(
         rank = c.get("rank", 0)
         score_lookup[rank] = c.get("breakdown", {})
 
-    for i, cv in enumerate(candidates_to_process):
-        score_info = score_lookup.get(cv.candidate_rank)
+    chat_store: Optional[ChatStore] = None
+    if proj.chat_db_path.exists():
+        chat_store = ChatStore(proj.chat_db_path)
 
-        result = director.process_candidate(
-            cv,
-            score_info=score_info,
-        )
-        results.append(result)
+    try:
+        for i, cv in enumerate(candidates_to_process):
+            score_info = score_lookup.get(cv.candidate_rank)
 
-        if on_progress:
-            on_progress(0.2 + 0.7 * ((i + 1) / total))
+            # Populate per-variant transcript context (best-effort).
+            if transcript is not None:
+                for v in cv.variants:
+                    snippet, closing = _transcript_snippet_for_range(transcript, v.start_s, v.end_s)
+                    setattr(v, "transcript_snippet", snippet)
+                    setattr(v, "closing_text", closing)
+
+            # Summarize chat around the candidate's primary window (if chat is available).
+            chat_summary: Optional[Dict[str, Any]] = None
+            try:
+                if chat_store is not None:
+                    # Prefer the short/clean cut window when available; otherwise fall back to peak±.
+                    win: Optional[Tuple[float, float]] = None
+                    for vid in ("clean_cut", "short", "medium", "punchline_first", "setup_first", "long"):
+                        vv = cv.get_variant(vid)
+                        if vv:
+                            win = (float(vv.start_s), float(vv.end_s))
+                            break
+                    if win is None:
+                        pt = float(cv.candidate_peak_time_s)
+                        win = (max(0.0, pt - 10.0), pt + 10.0)
+
+                    pad_s = 15.0
+                    start_ms = int(max(0.0, (win[0] - pad_s) * 1000.0))
+                    end_ms = int(max(0.0, (win[1] + pad_s) * 1000.0))
+                    msgs = chat_store.get_messages(start_ms, end_ms, offset_ms=chat_offset_ms, limit=800)
+                    chat_summary = _summarize_chat_messages([m.text for m in msgs])
+                    if chat_summary:
+                        chat_summary["window_start_s"] = round(win[0] - pad_s, 2)
+                        chat_summary["window_end_s"] = round(win[1] + pad_s, 2)
+            except Exception:
+                chat_summary = None
+
+            result = director.process_candidate(
+                cv,
+                chat_summary=chat_summary,
+                score_info=score_info,
+            )
+            results.append(result)
+
+            if on_progress:
+                on_progress(0.2 + 0.7 * ((i + 1) / total))
+    finally:
+        if chat_store is not None:
+            chat_store.close()
 
     # Calculate elapsed time
     elapsed_seconds = _time.time() - start_time

@@ -28,7 +28,15 @@ from ..clip_variants import VariantGeneratorConfig, VariantDurationConfig, compu
 from ..ai.director import DirectorConfig, compute_director_analysis
 from ..ai.helpers import get_llm_complete_fn
 from ..layouts import RectNorm
-from ..project import create_or_load_project, get_project_data, load_npz, set_layout_facecam, Project, utc_now_iso
+from ..project import (
+    Project,
+    create_or_load_project,
+    get_project_data,
+    load_npz,
+    set_layout_facecam,
+    update_project,
+    utc_now_iso,
+)
 from ..profile import load_profile
 from ..publisher.accounts import AccountStore
 from ..publisher.jobs import PublishJobStore
@@ -153,8 +161,60 @@ def create_app(
     )
     app.include_router(publisher_router)
 
+    # -------------------------------------------------------------------------
+    # Actions router (ChatGPT-friendly operator API)
+    # -------------------------------------------------------------------------
+    from .actions_api import create_actions_router
+
+    app.include_router(create_actions_router(profile=ctx.profile))
+
     static_dir = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+    # -------------------------------------------------------------------------
+    # Optional API auth (Bearer token)
+    # -------------------------------------------------------------------------
+    # If VP_API_TOKEN is set, require `Authorization: Bearer <token>` for all /api/*
+    # endpoints (including Actions). This is recommended when exposing Studio via a
+    # public HTTPS tunnel for ChatGPT Actions.
+    import os
+    import secrets
+
+    api_token = (os.environ.get("VP_API_TOKEN") or "").strip()
+
+    def _auth_ok(auth_header: str) -> bool:
+        raw = (auth_header or "").strip()
+        if not raw:
+            return False
+        parts = raw.split(None, 1)
+        if len(parts) != 2:
+            return False
+        scheme, token = parts[0], parts[1]
+        if scheme.lower() != "bearer":
+            return False
+        return secrets.compare_digest(token.strip(), api_token)
+
+    if api_token:
+
+        @app.middleware("http")
+        async def _require_api_token(request: Request, call_next):  # type: ignore[no-untyped-def]
+            path = request.url.path
+            if path.startswith("/api/"):
+                ok = _auth_ok(request.headers.get("authorization") or "")
+                # EventSource and normal link navigations can't set Authorization headers;
+                # allow a token query param for GET-only endpoints.
+                if (not ok) and request.method.upper() == "GET":
+                    token_q = (request.query_params.get("token") or "").strip()
+                    if token_q and secrets.compare_digest(token_q, api_token):
+                        ok = True
+
+                if not ok:
+                    return JSONResponse(
+                        {"detail": "unauthorized"},
+                        status_code=401,
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+            return await call_next(request)
 
     @app.get("/")
     def index() -> FileResponse:
@@ -440,84 +500,198 @@ def create_app(
 
     @app.post("/api/project/reset_analysis")
     def api_project_reset_analysis(body: Dict[str, Any] = Body(default={})) -> JSONResponse:
-        """Reset all analysis data for the current project.
-        
-        This deletes all analysis files (audio, motion, highlights, transcript, etc.)
-        but keeps the project, video, selections, and exports intact.
-        
+        """Reset analysis artifacts for the current project.
+
+        This deletes analysis files (audio, motion, highlights, transcript, etc.) but keeps the project,
+        video, selections, and exports intact.
+
         Body (optional):
-            keep_chat: bool - If True, keep chat data (default False)
-            keep_transcript: bool - If True, keep transcript (default False)
+            reset: Dict[str, bool] - reset-map where checked items are deleted (current UI).
+            keep: Dict[str, bool] - keep-map where checked items are preserved (legacy UI variant).
+            keep_chat: bool - Legacy flag to preserve chat data (default False).
+            keep_transcript: bool - Legacy flag to preserve transcript data (default False).
         """
-        import shutil
-        
         proj = ctx.require_project()
-        keep_chat = body.get("keep_chat", False)
-        keep_transcript = body.get("keep_transcript", False)
-        
-        deleted_files = []
-        
-        # List of analysis files to delete
-        analysis_files = [
-            proj.audio_features_path,
-            proj.motion_features_path,
-            proj.highlights_features_path,
-            proj.scenes_path,
-            proj.chapters_path,
-            proj.speech_features_path,
-            proj.reaction_audio_features_path,
-            proj.audio_events_features_path,
-            proj.analysis_dir / "silence.json",
-            proj.analysis_dir / "sentences.json",
-            proj.analysis_dir / "boundaries.json",
-            proj.analysis_dir / "chat_boundaries.json",
-            proj.analysis_dir / "clip_variants.json",
-            # AI Director (new + legacy filenames)
-            proj.analysis_dir / "ai_director.json",
-            proj.analysis_dir / "director_results.json",
-        ]
-        
-        # Add chat files unless keeping
-        if not keep_chat:
-            analysis_files.extend([
+
+        keep_map_raw = body.get("keep")
+        keep_map = keep_map_raw if isinstance(keep_map_raw, dict) else None
+        use_keep_map = keep_map is not None
+
+        reset_map_raw = body.get("reset")
+        reset_map = reset_map_raw if isinstance(reset_map_raw, dict) else None
+        use_reset_map = reset_map is not None and not use_keep_map
+
+        def keep_flag(key: str, *, legacy_key: Optional[str] = None) -> bool:
+            if use_keep_map:
+                # Missing keys default to "keep" for safety.
+                if key in keep_map:
+                    return bool(keep_map.get(key))
+                return True
+            if use_reset_map:
+                # Missing keys default to "keep" for safety.
+                if key in reset_map:
+                    return not bool(reset_map.get(key))
+                return True
+            if legacy_key is not None:
+                return bool(body.get(legacy_key, False))
+            # Legacy default: reset everything unless explicitly kept.
+            return False
+
+        keep_chat = keep_flag("chat", legacy_key="keep_chat")
+        keep_transcript = keep_flag("transcript", legacy_key="keep_transcript")
+
+        keep_by_component = {
+            "audio": keep_flag("audio"),
+            "vad": keep_flag("vad"),
+            "motion": keep_flag("motion"),
+            "scenes": keep_flag("scenes"),
+            "highlights": keep_flag("highlights"),
+            "silence": keep_flag("silence"),
+            "sentences": keep_flag("sentences"),
+            "speech": keep_flag("speech"),
+            "reaction_audio": keep_flag("reaction_audio"),
+            "audio_events": keep_flag("audio_events"),
+            "chapters": keep_flag("chapters"),
+            "boundaries": keep_flag("boundaries"),
+            "variants": keep_flag("variants"),
+            "ai_director": keep_flag("ai_director"),
+            "director": keep_flag("director"),
+            "chat_boundaries": keep_flag("chat_boundaries"),
+            "chat_sync": keep_flag("chat_sync"),
+            "chat": keep_chat,
+            "transcript": keep_transcript,
+            "diarization": keep_flag("diarization"),
+            "analysis_state": keep_flag("analysis_state"),
+        }
+
+        files_by_component = {
+            "audio": [proj.audio_features_path],
+            # VAD has a legacy name in older projects.
+            "vad": [proj.audio_vad_path, proj.analysis_dir / "vad_features.npz"],
+            "motion": [proj.motion_features_path],
+            "scenes": [proj.scenes_path],
+            "highlights": [proj.highlights_features_path, proj.analysis_dir / "highlights.json"],
+            "silence": [proj.analysis_dir / "silence.json"],
+            "sentences": [proj.analysis_dir / "sentences.json"],
+            "speech": [proj.speech_features_path],
+            "reaction_audio": [proj.reaction_audio_features_path],
+            "audio_events": [proj.audio_events_features_path],
+            "chapters": [proj.chapters_path],
+            # Boundaries has a legacy filename (boundaries.json) and newer boundary_graph.json.
+            "boundaries": [proj.analysis_dir / "boundary_graph.json", proj.analysis_dir / "boundaries.json"],
+            # Variants has a legacy filename (clip_variants.json) and newer variants.json.
+            "variants": [proj.analysis_dir / "variants.json", proj.analysis_dir / "clip_variants.json"],
+            "ai_director": [proj.analysis_dir / "ai_director.json"],
+            "director": [proj.analysis_dir / "director.json", proj.analysis_dir / "director_results.json"],
+            "chat_boundaries": [proj.analysis_dir / "chat_boundaries.json"],
+            "chat_sync": [proj.analysis_dir / "chat_sync.json"],
+            "chat": [
                 proj.chat_features_path,
                 proj.chat_raw_path,
                 proj.chat_db_path,
-            ])
-        
-        # Add transcript files unless keeping
-        if not keep_transcript:
-            analysis_files.append(proj.transcript_path)
-        
-        # Delete each file
-        for fpath in analysis_files:
-            if fpath.exists():
+                proj.analysis_dir / "chat.sqlite-wal",
+                proj.analysis_dir / "chat.sqlite-shm",
+                proj.analysis_dir / "chat.sqlite-journal",
+            ],
+            "transcript": [proj.transcript_path],
+            "diarization": [proj.analysis_dir / "diarization.json"],
+            "analysis_state": [proj.analysis_dir / "analysis_state.json"],
+        }
+
+        deleted_files: list[str] = []
+
+        for comp, paths in files_by_component.items():
+            if keep_by_component.get(comp, True):
+                continue
+            for fpath in paths:
+                if not fpath.exists():
+                    continue
                 try:
+                    if fpath.is_dir():
+                        continue
                     fpath.unlink()
-                    deleted_files.append(fpath.name)
-                except Exception as e:
+                    try:
+                        deleted_files.append(str(fpath.relative_to(proj.project_dir)))
+                    except ValueError:
+                        deleted_files.append(fpath.name)
+                except Exception:
                     pass  # Continue on error
-        
-        # Clear analysis data from project.json
-        proj_json_path = proj.project_json_path
-        if proj_json_path.exists():
-            import json
-            with open(proj_json_path, "r", encoding="utf-8") as f:
-                proj_data = json.load(f)
-            
-            # Clear analysis section but preserve other data
-            if "analysis" in proj_data:
-                del proj_data["analysis"]
-            
-            with open(proj_json_path, "w", encoding="utf-8") as f:
-                json.dump(proj_data, f, indent=2)
-        
-        return JSONResponse({
-            "reset": True,
-            "deleted_files": deleted_files,
-            "kept_chat": keep_chat,
-            "kept_transcript": keep_transcript,
-        })
+
+        reset_components = {c for c, keep in keep_by_component.items() if not keep}
+        reset_ai_director = "ai_director" in reset_components
+        reset_highlights = "highlights" in reset_components
+
+        def _upd(d: Dict[str, Any]) -> None:
+            analysis = d.get("analysis")
+            if not isinstance(analysis, dict):
+                return
+
+            if "audio" in reset_components:
+                analysis.pop("audio", None)
+            if "vad" in reset_components:
+                analysis.pop("vad", None)
+            if "motion" in reset_components:
+                analysis.pop("motion", None)
+            if "scenes" in reset_components:
+                analysis.pop("scenes", None)
+            if "highlights" in reset_components:
+                analysis.pop("highlights", None)
+                # Enrichment is embedded into highlights candidates, but also tracked separately.
+                analysis.pop("enrich", None)
+            if "silence" in reset_components:
+                analysis.pop("silence", None)
+            if "sentences" in reset_components:
+                analysis.pop("sentences", None)
+            if "speech" in reset_components:
+                analysis.pop("speech", None)
+            if "reaction_audio" in reset_components:
+                analysis.pop("reaction_audio", None)
+            if "audio_events" in reset_components:
+                analysis.pop("audio_events", None)
+            if "chapters" in reset_components:
+                analysis.pop("chapters", None)
+            if "boundaries" in reset_components:
+                analysis.pop("boundaries", None)
+            if "variants" in reset_components:
+                analysis.pop("variants", None)
+                analysis.pop("clip_variants", None)
+            if "chat_boundaries" in reset_components:
+                analysis.pop("chat_boundaries", None)
+            if "chat_sync" in reset_components:
+                analysis.pop("chat_sync", None)
+            if "chat" in reset_components:
+                analysis.pop("chat", None)
+            if "transcript" in reset_components:
+                analysis.pop("transcript", None)
+            if "diarization" in reset_components:
+                analysis.pop("diarization", None)
+            if "director" in reset_components:
+                analysis.pop("director", None)
+            if "ai_director" in reset_components:
+                analysis.pop("ai_director", None)
+
+            # If we reset AI director but keep highlights, scrub per-candidate AI fields.
+            if reset_ai_director and not reset_highlights:
+                h = analysis.get("highlights")
+                if isinstance(h, dict):
+                    cands = h.get("candidates")
+                    if isinstance(cands, list):
+                        for c in cands:
+                            if isinstance(c, dict):
+                                c.pop("ai", None)
+
+            if not analysis:
+                d.pop("analysis", None)
+
+        update_project(proj, _upd)
+
+        return JSONResponse(
+            {
+                "reset": True,
+                "deleted_files": deleted_files,
+                "kept": {k: bool(v) for k, v in keep_by_component.items()},
+            }
+        )
 
     @app.get("/api/home/recent_projects")
     def api_home_recent_projects() -> JSONResponse:
@@ -1260,6 +1434,7 @@ def create_app(
         # Parse whisper verbose option (defaults to True)
         whisper_verbose = bool(opts.get("whisper_verbose", True))
         # Parse diarize option (defaults to False)
+        diarize_opt_provided = "diarize" in opts
         diarize_enabled = bool(opts.get("diarize", False))
         # Parse verbose logs option (defaults to False)
         verbose_logs = bool(opts.get("verbose_logs", False))
@@ -1649,8 +1824,8 @@ def create_app(
                     from ..analysis_transcript import TranscriptConfig, compute_transcript_analysis_from_audio
                     
                     speech_cfg = ctx.profile.get("analysis", {}).get("speech", {})
-                    # Use diarize from download options (UI checkbox) or fall back to profile
-                    should_diarize = diarize_enabled or bool(speech_cfg.get("diarize", False))
+                    # Use explicit download option when provided; otherwise fall back to profile.
+                    should_diarize = diarize_enabled if diarize_opt_provided else bool(speech_cfg.get("diarize", False))
                     
                     transcript_config = TranscriptConfig(
                         backend=str(speech_cfg.get("backend", "auto")),
@@ -1766,6 +1941,10 @@ def create_app(
                         audio_path=audio_path,
                     )
                     set_source_url(early_proj, url)
+                    try:
+                        JOB_MANAGER._set(job, result={"project_id": early_proj.project_dir.name})
+                    except Exception:
+                        pass
                     
                     log.info(f"[DAG] Early project created at: {early_proj.project_dir}")
                     
@@ -1802,21 +1981,26 @@ def create_app(
                     
                     # Build config from profile
                     analysis_cfg = ctx.profile.get("analysis", {})
+                    speech_cfg = dict(analysis_cfg.get("speech", {}) or {})
+                    if whisper_verbose:
+                        speech_cfg["verbose"] = True
+                    if diarize_opt_provided:
+                        speech_cfg["diarize"] = diarize_enabled
                     dag_config = {
                         "audio": analysis_cfg.get("audio", {}),
+                        "vad": analysis_cfg.get("vad", {}),
                         "silence": analysis_cfg.get("silence", {}),
-                        "speech": analysis_cfg.get("speech", {}),
+                        "reaction_audio": analysis_cfg.get("reaction_audio", {}),
+                        "speech": speech_cfg,
+                        "diarization": analysis_cfg.get("diarization", {}),
                         "sentences": analysis_cfg.get("sentences", {}),
                         "speech_features": analysis_cfg.get("speech_features", {}),
+                        "boundaries": analysis_cfg.get("boundaries", {}),
                         "highlights": analysis_cfg.get("highlights", {}),
                         "audio_events": analysis_cfg.get("audio_events", {}),
                         "include_chat": True,
                         "include_audio_events": bool(analysis_cfg.get("audio_events", {}).get("enabled", True)),
                     }
-                    
-                    # Add verbose transcript setting
-                    if whisper_verbose:
-                        dag_config["speech"]["verbose"] = True
                     
                     log.info(f"[DAG] Starting pre_download bundle analysis...")
                     early_dag_status["status"] = "analyzing"
@@ -2065,12 +2249,21 @@ def create_app(
                                         nonlocal early_dag_result, early_dag_status
                                         try:
                                             analysis_cfg = ctx.profile.get("analysis", {})
+                                            speech_cfg = dict(analysis_cfg.get("speech", {}) or {})
+                                            if whisper_verbose:
+                                                speech_cfg["verbose"] = True
+                                            if diarize_opt_provided:
+                                                speech_cfg["diarize"] = diarize_enabled
                                             dag_config = {
                                                 "audio": analysis_cfg.get("audio", {}),
+                                                "vad": analysis_cfg.get("vad", {}),
                                                 "silence": analysis_cfg.get("silence", {}),
-                                                "speech": analysis_cfg.get("speech", {}),
+                                                "reaction_audio": analysis_cfg.get("reaction_audio", {}),
+                                                "speech": speech_cfg,
+                                                "diarization": analysis_cfg.get("diarization", {}),
                                                 "sentences": analysis_cfg.get("sentences", {}),
                                                 "speech_features": analysis_cfg.get("speech_features", {}),
+                                                "boundaries": analysis_cfg.get("boundaries", {}),
                                                 "highlights": analysis_cfg.get("highlights", {}),
                                                 "audio_events": analysis_cfg.get("audio_events", {}),
                                                 "include_chat": True,
@@ -2328,22 +2521,23 @@ def create_app(
                     import logging
                     log = logging.getLogger("videopipeline.studio")
                     
-                    # Use preview if available, otherwise original
-                    video_to_open = video_result.preview_path or video_result.video_path
+                    # Analysis/export should use the source video; browser playback can use preview.
+                    source_video = Path(video_result.video_path)
+                    preview_video = Path(video_result.preview_path) if video_result.preview_path else None
                     
                     # If we created an early project during DAG analysis, use it and update video path
                     if early_proj:
                         from ..project import set_project_video
-                        set_project_video(early_proj, Path(video_to_open))
+                        set_project_video(early_proj, source_video, preview_path=preview_video)
                         proj = early_proj
                         ctx._project = proj  # Update context to use this project
-                        log.info(f"[DAG] Updated early project with video: {video_to_open}")
+                        log.info(f"[DAG] Updated early project with source video: {source_video}")
                     else:
                         # No early project - create one now (fallback path)
                         # Use set_project_video to ensure video is copied into project
                         from ..project import create_project_early, set_project_video
                         proj = create_project_early(url, source_url=url)  # Create based on URL
-                        set_project_video(proj, Path(video_to_open))  # Copy video into project
+                        set_project_video(proj, source_video, preview_path=preview_video)  # Copy source + preview into project
                         ctx._project = proj
                     log.info(f"[DOWNLOAD] Project ready: {proj.project_dir}")
                     
@@ -2526,8 +2720,100 @@ def create_app(
                                 f"[DOWNLOAD] DAG analysis completed with failures: {len(early_dag_result.tasks_run)} tasks "
                                 f"({_summary}); error={getattr(early_dag_result, 'error', '')}"
                             )
+
+                    # Kick off a post-download "upgrade" analysis pass (video-based features + re-shaping).
+                    # IMPORTANT: this is a separate job so Home can auto-open Studio immediately.
+                    try:
+                        upgrade_job = JOB_MANAGER.create("analyze_upgrade")
+                        result_dict["auto_upgrade_job_id"] = upgrade_job.id
+
+                        @with_prevent_sleep("Upgrading analysis")
+                        def upgrade_runner() -> None:
+                            import logging
+                            log_u = logging.getLogger("videopipeline.studio")
+
+                            if upgrade_job.cancel_requested:
+                                return
+
+                            JOB_MANAGER._set(
+                                upgrade_job,
+                                status="running",
+                                progress=0.0,
+                                message="Upgrading analysis (video features + best clips)...",
+                            )
+
+                            analysis_cfg = ctx.profile.get("analysis", {})
+                            speech_cfg = dict(analysis_cfg.get("speech", {}) or {})
+                            if whisper_verbose:
+                                speech_cfg["verbose"] = True
+                            if diarize_opt_provided:
+                                speech_cfg["diarize"] = diarize_enabled
+
+                            dag_config: Dict[str, Any] = {
+                                **(analysis_cfg or {}),
+                                "speech": speech_cfg,
+                                "include_chat": True,
+                                "include_audio_events": bool(analysis_cfg.get("audio_events", {}).get("enabled", True)),
+                            }
+
+                            # Optional LLM support (semantic filtering/reranking + chat emotes).
+                            llm_complete_fn = None
+                            try:
+                                ai_cfg = ctx.profile.get("ai", {}).get("director", {}) or {}
+                                highlights_cfg = dag_config.get("highlights", {}) or {}
+                                llm_needed = bool(highlights_cfg.get("llm_semantic_enabled", True)) or bool(
+                                    highlights_cfg.get("llm_filter_enabled", False)
+                                )
+                                if ai_cfg.get("enabled", True) and llm_needed:
+                                    llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
+                            except Exception:
+                                llm_complete_fn = None
+
+                            def on_upgrade_progress(frac: float, msg: str) -> None:
+                                if upgrade_job.cancel_requested:
+                                    return
+                                JOB_MANAGER._set(upgrade_job, progress=frac, message=msg)
+
+                            try:
+                                dag_result = run_analysis(
+                                    proj,
+                                    bundle="full",
+                                    config=dag_config,
+                                    on_progress=on_upgrade_progress,
+                                    llm_complete=llm_complete_fn,
+                                    upgrade_mode=True,
+                                )
+                                # Treat partial failures as "done" (they'll be visible in logs/project),
+                                # since missing optional deps (torch/ruptures/etc) shouldn't feel fatal.
+                                msg = "Upgrade complete."
+                                if not getattr(dag_result, "success", True):
+                                    err = getattr(dag_result, "error", "") or "see logs"
+                                    msg = f"Upgrade complete (with warnings): {err}"
+                                JOB_MANAGER._set(
+                                    upgrade_job,
+                                    status="succeeded",
+                                    progress=1.0,
+                                    message=msg,
+                                    result={
+                                        "success": bool(getattr(dag_result, "success", True)),
+                                        "error": getattr(dag_result, "error", None),
+                                        "tasks_run": len(getattr(dag_result, "tasks_run", []) or []),
+                                        "elapsed_seconds": getattr(dag_result, "total_elapsed_seconds", None),
+                                    },
+                                )
+                                log_u.info("[analyze_upgrade] Completed (success=%s)", getattr(dag_result, "success", True))
+                            except Exception as e:
+                                if not upgrade_job.cancel_requested:
+                                    JOB_MANAGER._set(upgrade_job, status="failed", message=f"{type(e).__name__}: {e}")
+
+                        import threading as _threading
+
+                        _threading.Thread(target=upgrade_runner, daemon=True).start()
+                    except Exception as e:
+                        log.warning(f"[DOWNLOAD] Failed to start analyze_upgrade job: {e}")
                     
                     result_dict["project"] = get_project_data(proj)
+                    result_dict["project_id"] = proj.project_dir.name
                     result_dict["auto_opened"] = True
                     result_dict["chat"] = chat_result
                     
@@ -2562,6 +2848,39 @@ def create_app(
                     final_msg = f"Download complete. Chat download failed: {chat_result.get('message', 'unknown')}"
                 elif chat_result.get("status") == "skipped":
                     final_msg = f"Download complete. {chat_result.get('message', 'Chat skipped.')}"
+
+                # Persist per-task status snapshot for the Jobs card UI.
+                # (JobManager merges result updates, but also include this in the final payload so a refresh
+                # still shows the correct task statuses.)
+                chat_status_final = str(chat_result.get("status") or current_chat_status.get("status") or "pending")
+                if chat_result.get("imported"):
+                    chat_status_final = "complete"
+                result_dict.update(
+                    {
+                        "video_status": "complete",
+                        "video_progress": 1.0,
+                        "chat_status": chat_status_final,
+                        "chat_progress": 1.0 if chat_status_final in ("complete", "success") else float(current_chat_status.get("progress", 0) or 0),
+                        "chat_message": str(current_chat_status.get("message") or chat_result.get("message") or ""),
+                        "chat_messages_count": int(current_chat_status.get("messages_count") or 0),
+                        "transcript_status": str(transcript_status.get("status", "pending")),
+                        "transcript_progress": float(transcript_status.get("progress", 0) or 0),
+                        "audio_progress": float(transcript_status.get("audio_progress", 0) or 0),
+                        "audio_total_bytes": transcript_status.get("audio_total_bytes"),
+                        "audio_downloaded_bytes": transcript_status.get("audio_downloaded_bytes"),
+                        "audio_speed": transcript_status.get("audio_speed"),
+                        "audio_rms_status": str(audio_rms_status.get("status", "pending")),
+                        "audio_rms_progress": float(audio_rms_status.get("progress", 0) or 0),
+                        "audio_events_status": str(audio_events_status.get("status", "pending")),
+                        "audio_events_progress": float(audio_events_status.get("progress", 0) or 0),
+                        "diarization_status": str(diarization_status.get("status", "pending")),
+                        "diarization_progress": float(diarization_status.get("progress", 0) or 0),
+                        "diarization_speakers": diarization_status.get("speakers", []),
+                        "dag_status": str(early_dag_status.get("status", "pending")),
+                        "dag_progress": float(early_dag_status.get("progress", 0) or 0),
+                        "dag_message": str(early_dag_status.get("message") or ""),
+                    }
+                )
                 
                 JOB_MANAGER._set(
                     job,
@@ -2774,7 +3093,7 @@ def create_app(
                 # Set up LLM client for semantic scoring and/or filtering
                 llm_complete_fn = None
                 llm_semantic_enabled = highlights_cfg.get("llm_semantic_enabled", True)
-                llm_filter_enabled = highlights_cfg.get("llm_filter_enabled", True)
+                llm_filter_enabled = highlights_cfg.get("llm_filter_enabled", False)
                 llm_needed = llm_semantic_enabled or llm_filter_enabled
                 
                 if ai_cfg.get("enabled", True) and llm_needed:
@@ -3474,6 +3793,7 @@ def create_app(
         highlights_cfg = {**analysis_cfg.get("highlights", {}), **(body.get("highlights") or {})}
         audio_events_cfg = {**analysis_cfg.get("audio_events", {}), **(body.get("audio_events") or {})}
         speech_cfg = {**analysis_cfg.get("speech", {}), **(body.get("speech") or {})}
+        diarization_cfg = {**analysis_cfg.get("diarization", {}), **(body.get("diarization") or {})}
         reaction_cfg = {**analysis_cfg.get("reaction_audio", {}), **(body.get("reaction_audio") or {})}
         # Support both "enrich" and legacy "rerank" config keys
         enrich_cfg_dict = {
@@ -4026,7 +4346,7 @@ def create_app(
             # Set up LLM client for semantic scoring and/or filtering (optional enhancement)
             llm_complete_fn_highlights = None
             llm_semantic_enabled = highlights_cfg.get("llm_semantic_enabled", True)
-            llm_filter_enabled = highlights_cfg.get("llm_filter_enabled", True)
+            llm_filter_enabled = highlights_cfg.get("llm_filter_enabled", False)
             llm_needed = llm_semantic_enabled or llm_filter_enabled
             
             if ai_cfg.get("enabled", True) and llm_needed:
@@ -4063,6 +4383,10 @@ def create_app(
                     
                     JOB_MANAGER._set(job, progress=scaled, message=msg, result=update_timing_result())
                 
+                speech_cfg_for_dag = dict(speech_cfg)
+                if not include_speech:
+                    speech_cfg_for_dag["diarize"] = False
+
                 # Use DAG runner for highlights with proper boundary graph ordering
                 dag_config = {
                     "audio": audio_cfg,
@@ -4070,6 +4394,8 @@ def create_app(
                     "scenes": scenes_cfg,
                     "highlights": highlights_cfg,
                     "audio_events": audio_events_cfg,
+                    "speech": speech_cfg_for_dag,
+                    "diarization": diarization_cfg,
                     "include_chat": True,
                     "include_audio_events": bool(audio_events_cfg.get("enabled", True)),
                     "_llm_complete": llm_complete_fn_highlights,
@@ -5111,7 +5437,13 @@ def create_app(
         from ..project import set_chat_config
 
         sync_offset_ms = int(body.get("sync_offset_ms", 0))
-        set_chat_config(proj, sync_offset_ms=sync_offset_ms)
+        set_chat_config(
+            proj,
+            sync_offset_ms=sync_offset_ms,
+            sync_offset_source="manual",
+            sync_offset_method="manual",
+            sync_offset_updated_at=utc_now_iso(),
+        )
 
         return JSONResponse({"ok": True, "sync_offset_ms": sync_offset_ms})
 
@@ -5159,13 +5491,17 @@ def create_app(
 
                 # Download chat
                 JOB_MANAGER._set(job, progress=0.05, message="Downloading chat replay...")
-                result = download_chat(source_url, proj.chat_raw_path, on_progress=on_progress, check_cancel=check_cancel)
+                result = download_chat(
+                    source_url,
+                    proj.chat_raw_path,
+                    on_progress=on_progress,
+                    check_cancel=check_cancel,
+                )
                 
                 # Check if cancelled after download
                 if job.cancel_requested:
                     JOB_MANAGER._set(job, status="cancelled", message="Download cancelled")
                     return
-                result = download_chat(source_url, proj.chat_raw_path, on_progress=on_progress)
 
                 # Load and normalize
                 JOB_MANAGER._set(job, progress=0.5, message="Normalizing chat messages...")
@@ -5232,6 +5568,91 @@ def create_app(
                 # Update project config
                 set_chat_config(proj, enabled=True, source_url=source_url)
 
+                # Automatically kick off an upgrade pass so new chat signal (and sync) improves clip picks.
+                auto_upgrade_job_id: Optional[str] = None
+                try:
+                    upgrade_job = JOB_MANAGER.create("analyze_upgrade")
+                    auto_upgrade_job_id = upgrade_job.id
+
+                    @with_prevent_sleep("Upgrading analysis")
+                    def upgrade_runner() -> None:
+                        import logging
+
+                        log_u = logging.getLogger("videopipeline.studio")
+                        if upgrade_job.cancel_requested:
+                            return
+
+                        JOB_MANAGER._set(
+                            upgrade_job,
+                            status="running",
+                            progress=0.0,
+                            message="Upgrading analysis (chat sync + best clips)...",
+                        )
+
+                        analysis_cfg = ctx.profile.get("analysis", {}) or {}
+                        dag_config: Dict[str, Any] = {
+                            **analysis_cfg,
+                            "include_chat": True,
+                            "include_audio_events": bool(analysis_cfg.get("audio_events", {}).get("enabled", True)),
+                        }
+
+                        llm_complete_fn = None
+                        try:
+                            ai_cfg = ctx.profile.get("ai", {}).get("director", {}) or {}
+                            if ai_cfg.get("enabled", True):
+                                llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
+                        except Exception:
+                            llm_complete_fn = None
+
+                        def on_upgrade_progress(frac: float, msg: str) -> None:
+                            if upgrade_job.cancel_requested:
+                                return
+                            JOB_MANAGER._set(upgrade_job, progress=frac, message=msg)
+
+                        try:
+                            targets = {"chat_sync", "highlights_candidates"}
+                            # Only run packaging tasks if transcript exists (avoids surprising long Whisper runs).
+                            if proj.transcript_path.exists():
+                                targets.update({"variants", "director"})
+
+                            dag_result = run_analysis(
+                                proj,
+                                targets=targets,
+                                config=dag_config,
+                                on_progress=on_upgrade_progress,
+                                llm_complete=llm_complete_fn,
+                                upgrade_mode=True,
+                            )
+
+                            msg = "Upgrade complete."
+                            if not getattr(dag_result, "success", True):
+                                err = getattr(dag_result, "error", "") or "see logs"
+                                msg = f"Upgrade complete (with warnings): {err}"
+
+                            JOB_MANAGER._set(
+                                upgrade_job,
+                                status="succeeded",
+                                progress=1.0,
+                                message=msg,
+                                result={
+                                    "success": bool(getattr(dag_result, "success", True)),
+                                    "error": getattr(dag_result, "error", None),
+                                    "tasks_run": len(getattr(dag_result, "tasks_run", []) or []),
+                                    "elapsed_seconds": getattr(dag_result, "total_elapsed_seconds", None),
+                                    "targets": sorted(list(targets)),
+                                },
+                            )
+                            log_u.info("[analyze_upgrade] Completed (success=%s)", getattr(dag_result, "success", True))
+                        except Exception as e:
+                            if not upgrade_job.cancel_requested:
+                                JOB_MANAGER._set(upgrade_job, status="failed", message=f"{type(e).__name__}: {e}")
+
+                    import threading as _threading
+                    _threading.Thread(target=upgrade_runner, daemon=True).start()
+                except Exception as e:
+                    import logging
+                    logging.getLogger("videopipeline.studio").warning("[chat] Failed to start analyze_upgrade job: %s", e)
+
                 JOB_MANAGER._set(
                     job,
                     status="succeeded",
@@ -5241,6 +5662,7 @@ def create_app(
                         "message_count": count,
                         "platform": result.platform,
                         "source_url": source_url,
+                        "auto_upgrade_job_id": auto_upgrade_job_id,
                     },
                 )
 
@@ -5274,36 +5696,122 @@ def create_app(
         return JSONResponse({"ok": True})
 
     @app.get("/api/chat/timeline")
-    def api_chat_timeline(max_points: int = 2000) -> JSONResponse:
-        """Get chat spike timeline for visualization."""
+    def api_chat_timeline(
+        start_s: float = 0.0,
+        end_s: Optional[float] = None,
+        max_points: int = 2000,
+    ) -> JSONResponse:
+        """Get chat activity timeline for visualization (supports zoom/pan).
+
+        Query params:
+          - start_s: start time in seconds (video time)
+          - end_s: end time in seconds (video time, default = full duration)
+          - max_points: maximum points to return (downsampled by max-pooling)
+        """
         proj = ctx.require_project()
         if not proj.chat_features_path.exists():
             return JSONResponse({"ok": False, "reason": "no_chat_analysis"}, status_code=404)
 
+        from ..project import get_chat_config, get_project_data
+
+        # Video duration (best-effort; UI also uses <video>.duration)
+        proj_data = get_project_data(proj)
+        duration_s = float(proj_data.get("video", {}).get("duration_seconds", 0.0) or 0.0)
+        if duration_s <= 0 and proj.audio_features_path.exists():
+            try:
+                a = load_npz(proj.audio_features_path)
+                hop_arr = a.get("hop_seconds")
+                hop_a = float(hop_arr[0]) if hop_arr is not None and len(hop_arr) > 0 else 0.5
+                a_scores = a.get("scores")
+                if a_scores is not None and len(a_scores) > 0:
+                    duration_s = max(duration_s, float((len(a_scores) - 1) * hop_a))
+            except Exception:
+                pass
+
+        end_missing = end_s is None
+
+        # Clamp view window
+        s0 = float(start_s or 0.0)
+        s0 = max(0.0, s0)
+        if end_s is not None:
+            s1 = float(end_s)
+        else:
+            # We'll re-clamp after we compute a best-effort duration from chat.
+            s1 = duration_s if duration_s > 0 else (s0 + 1.0)
+        s1 = max(s0, float(s1))
+        if duration_s > 0:
+            s0 = min(s0, duration_s)
+            s1 = min(s1, duration_s)
+        if s1 <= s0:
+            s1 = s0 + 1.0
+
+        # Load chat scores
         data = load_npz(proj.chat_features_path)
-        scores = data.get("scores")
-        if scores is None:
+        raw = data.get("scores_activity")
+        if raw is None:
+            raw = data.get("scores")
+        if raw is None:
             return JSONResponse({"ok": False, "reason": "missing_scores"}, status_code=404)
 
-        scores = scores.astype(float)
-        n = len(scores)
-        if n <= 0:
+        raw = raw.astype(np.float64)
+        if len(raw) <= 0:
             return JSONResponse({"ok": False, "reason": "empty"}, status_code=404)
-
-        step = max(1, int(n / max(1, int(max_points))))
-        idx = np.arange(0, n, step)
-        down = scores[idx]
-        if not np.isfinite(down).all():
-            down = np.where(np.isfinite(down), down, 0.0)
 
         hop_arr = data.get("hop_seconds")
         hop_s = float(hop_arr[0]) if hop_arr is not None and len(hop_arr) > 0 else 0.5
+        hop_s = float(hop_s) if hop_s > 0 else 0.5
+
+        # Apply sync offset: aligned(t_video) = raw(t_video - offset)
+        chat_cfg = get_chat_config(proj)
+        offset_ms = int(chat_cfg.get("sync_offset_ms", 0) or 0)
+        offset_s = float(offset_ms) / 1000.0
+
+        # If duration is still unknown, fall back to chat duration.
+        if duration_s <= 0:
+            duration_s = float((len(raw) - 1) * hop_s)
+
+        # If caller didn't specify end_s, default to full duration (now that we have one).
+        if end_missing:
+            s1 = duration_s
+
+        # Re-clamp now that we may have a duration.
+        if duration_s > 0:
+            s0 = min(s0, duration_s)
+            s1 = min(s1, duration_s)
+        if s1 <= s0:
+            s1 = min(duration_s, s0 + max(1.0, hop_s)) if duration_s > 0 else (s0 + max(1.0, hop_s))
+
+        src_t = np.arange(len(raw), dtype=np.float64) * hop_s
+        # Build target times for the requested view window at the native hop
+        n_view = int(max(1, np.floor((s1 - s0) / hop_s) + 1))
+        tt = s0 + np.arange(n_view, dtype=np.float64) * hop_s
+        aligned = np.interp(tt - offset_s, src_t, raw, left=0.0, right=0.0).astype(np.float64)
+        aligned = np.where(np.isfinite(aligned), aligned, 0.0)
+
+        # Visualization wants "activity", so drop negative baseline.
+        aligned = np.clip(aligned, 0.0, None)
+
+        # Downsample by max-pooling for peak preservation.
+        max_points_i = max(64, int(max_points))
+        if len(aligned) > max_points_i:
+            bin_size = int(np.ceil(len(aligned) / float(max_points_i)))
+            pooled = []
+            for i in range(0, len(aligned), bin_size):
+                pooled.append(float(np.max(aligned[i : i + bin_size])))
+            aligned = np.asarray(pooled, dtype=np.float64)
+            hop_out = hop_s * float(bin_size)
+        else:
+            hop_out = hop_s
 
         return JSONResponse({
             "ok": True,
-            "hop_seconds": hop_s,
-            "indices": idx.tolist(),
-            "scores": down.tolist(),
+            "duration_seconds": duration_s,
+            "start_s": s0,
+            "end_s": s1,
+            "hop_seconds": hop_out,
+            "sync_offset_ms": offset_ms,
+            "indices": list(range(int(len(aligned)))),
+            "scores": aligned.tolist(),
         })
 
     @app.get("/api/chat/messages")
@@ -5428,9 +5936,12 @@ def create_app(
     @app.get("/video")
     async def video(request: Request):
         proj = ctx.require_project()
-        ext = Path(proj.video_path).suffix.lower()
+        # Use preview for browser playback if present; keep source for analysis/export.
+        video_path = Path(proj.video_path)
+        serve_path = proj.preview_video_path if proj.preview_video_path.exists() else video_path
+        ext = serve_path.suffix.lower()
         media_type = "video/mp4" if ext in {".mp4", ".m4v", ".mov"} else "application/octet-stream"
-        return ranged_file_response(request, Path(proj.video_path), media_type=media_type)
+        return ranged_file_response(request, serve_path, media_type=media_type)
 
     @app.post("/api/selections")
     def api_add_selection(body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]

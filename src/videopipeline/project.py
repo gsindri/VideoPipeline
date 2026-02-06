@@ -133,6 +133,16 @@ class Project:
     video_path: Path
 
     @property
+    def video_dir(self) -> Path:
+        """Directory for project-local video files (source + optional preview)."""
+        return self.project_dir / "video"
+
+    @property
+    def preview_video_path(self) -> Path:
+        """Path to a browser-friendly preview video inside the project, if present."""
+        return self.video_dir / "preview.mp4"
+
+    @property
     def project_json_path(self) -> Path:
         return self.project_dir / "project.json"
 
@@ -423,6 +433,7 @@ def create_project_early(
             "source_url": source_url,
             "video": {
                 "path": None,  # Not yet known
+                "preview_path": None,
                 "status": "downloading",
                 "duration_seconds": duration_seconds,
                 "early_audio_path": str(audio_path) if audio_path else None,
@@ -437,7 +448,7 @@ def create_project_early(
     return proj
 
 
-def set_project_video(proj: Project, video_path: Path) -> None:
+def set_project_video(proj: Project, video_path: Path, *, preview_path: Optional[Path] = None) -> None:
     """Update a project with the final video path after download completes.
     
     This copies (or symlinks on Unix) the video into the project's video/ directory
@@ -446,6 +457,7 @@ def set_project_video(proj: Project, video_path: Path) -> None:
     Args:
         proj: Project to update
         video_path: Path to downloaded video file
+        preview_path: Optional browser-friendly preview/proxy video
     """
     import shutil
     import os
@@ -453,7 +465,7 @@ def set_project_video(proj: Project, video_path: Path) -> None:
     video_path = Path(video_path).expanduser().resolve()
     
     # Create video directory in project
-    video_dir = proj.project_dir / "video"
+    video_dir = proj.video_dir
     video_dir.mkdir(parents=True, exist_ok=True)
     
     # Destination path - always use "video.mp4" for consistency
@@ -472,6 +484,32 @@ def set_project_video(proj: Project, video_path: Path) -> None:
                 dest_path.symlink_to(video_path)
             except OSError:
                 shutil.copy2(video_path, dest_path)
+
+    preview_dest: Optional[Path] = None
+    if preview_path is not None:
+        try:
+            pp = Path(preview_path).expanduser().resolve()
+            if pp.exists():
+                preview_dest = video_dir / "preview.mp4"
+                # Copy the preview to the project directory if not already there
+                same = False
+                try:
+                    if preview_dest.exists():
+                        same = preview_dest.samefile(pp)
+                except Exception:
+                    same = False
+                if not preview_dest.exists() or not same:
+                    if os.name == "nt":
+                        shutil.copy2(pp, preview_dest)
+                    else:
+                        try:
+                            if preview_dest.exists():
+                                preview_dest.unlink()
+                            preview_dest.symlink_to(pp)
+                        except OSError:
+                            shutil.copy2(pp, preview_dest)
+        except Exception:
+            preview_dest = None
     
     # Update the project's video_path to point to the project-local copy
     proj.video_path = dest_path
@@ -487,6 +525,7 @@ def set_project_video(proj: Project, video_path: Path) -> None:
     def _upd(d: Dict[str, Any]) -> None:
         d["video"] = {
             "path": str(dest_path),
+            "preview_path": str(preview_dest) if preview_dest and preview_dest.exists() else None,
             "status": "ready",
             "size_bytes": st.st_size,
             "mtime_ns": getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)),
@@ -756,6 +795,10 @@ def set_chat_config(
     *,
     enabled: Optional[bool] = None,
     sync_offset_ms: Optional[int] = None,
+    sync_offset_source: Optional[str] = None,
+    sync_offset_confidence: Optional[float] = None,
+    sync_offset_method: Optional[str] = None,
+    sync_offset_updated_at: Optional[str] = None,
     source_url: Optional[str] = None,
     download_status: Optional[str] = None,
     download_error: Optional[str] = None,
@@ -766,6 +809,10 @@ def set_chat_config(
         proj: Project instance
         enabled: Whether chat is enabled
         sync_offset_ms: Chat sync offset in milliseconds
+        sync_offset_source: "auto" or "manual" (optional)
+        sync_offset_confidence: Confidence score for auto sync (optional)
+        sync_offset_method: Method identifier for auto sync (optional)
+        sync_offset_updated_at: ISO timestamp of last offset update (optional)
         source_url: Source URL used for chat download
         download_status: Status of chat download: 'success', 'failed', 'skipped', or None
         download_error: Error message if download failed
@@ -776,6 +823,14 @@ def set_chat_config(
             d["chat"]["enabled"] = bool(enabled)
         if sync_offset_ms is not None:
             d["chat"]["sync_offset_ms"] = int(sync_offset_ms)
+        if sync_offset_source is not None:
+            d["chat"]["sync_offset_source"] = str(sync_offset_source)
+        if sync_offset_confidence is not None:
+            d["chat"]["sync_offset_confidence"] = float(sync_offset_confidence)
+        if sync_offset_method is not None:
+            d["chat"]["sync_offset_method"] = str(sync_offset_method)
+        if sync_offset_updated_at is not None:
+            d["chat"]["sync_offset_updated_at"] = str(sync_offset_updated_at)
         if source_url is not None:
             d["chat"]["source_url"] = source_url
         if download_status is not None:

@@ -1,6 +1,12 @@
 import numpy as np
 
-from videopipeline.analysis_highlights import ClipConfig, resample_series, shape_clip_bounds, snap_time_to_cuts
+from videopipeline.analysis_highlights import (
+    ClipConfig,
+    _merge_candidate_extras,
+    resample_series,
+    shape_clip_bounds,
+    snap_time_to_cuts,
+)
 
 
 def test_resample_series_linear():
@@ -36,3 +42,51 @@ def test_shape_clip_bounds_uses_valleys():
     )
     assert bounds["start_s"] == 1.0
     assert bounds["end_s"] == 5.0
+
+
+def test_merge_candidate_extras_preserves_ai_and_enrich_fields():
+    prev = [
+        {
+            "rank": 1,
+            "peak_time_s": 100.0,
+            "start_s": 95.0,
+            "end_s": 110.0,
+            "ai": {"title": "MILK FIRST (NO JUDGMENT)", "hook": "MILK FIRST?!"},
+            "hook_text": "MILK FIRST?!",
+            "quote_text": "I pour the milk first.",
+        }
+    ]
+    new = [
+        {
+            "rank": 1,
+            "peak_time_s": 100.3,
+            "start_s": 95.5,
+            "end_s": 110.5,
+        }
+    ]
+    merged = _merge_candidate_extras(new, prev)
+    assert merged[0]["ai"]["title"] == "MILK FIRST (NO JUDGMENT)"
+    assert merged[0]["hook_text"] == "MILK FIRST?!"
+    assert merged[0]["quote_text"] == "I pour the milk first."
+
+
+def test_merge_candidate_extras_does_not_overmatch():
+    prev = [
+        {
+            "rank": 1,
+            "peak_time_s": 10.0,
+            "start_s": 5.0,
+            "end_s": 15.0,
+            "ai": {"title": "OLD"},
+        }
+    ]
+    new = [
+        {
+            "rank": 1,
+            "peak_time_s": 100.0,
+            "start_s": 95.0,
+            "end_s": 110.0,
+        }
+    ]
+    merged = _merge_candidate_extras(new, prev)
+    assert "ai" not in merged[0]

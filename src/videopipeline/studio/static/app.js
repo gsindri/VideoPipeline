@@ -10,6 +10,49 @@ let calibrating = false;
 let isStudioMode = false;
 let currentTab = 'edit';
 
+function readOptionalIntInput(el, { min = 1 } = {}) {
+  if (!el) return null;
+  const raw = String(el.value ?? '').trim();
+  if (!raw) return null;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return null;
+  if (min != null && n < min) return null;
+  return n;
+}
+
+function setOptionalNumberInput(el, value) {
+  if (!el) return;
+  if (value == null || value === '') {
+    el.value = '';
+    return;
+  }
+  const n = Number(value);
+  el.value = Number.isFinite(n) ? String(Math.trunc(n)) : '';
+}
+
+function updateDiarizationControls() {
+  const diarizeEnabled = $('#diarizeEnabled')?.checked ?? false;
+  const minEl = $('#diarizeMinSpeakers');
+  const maxEl = $('#diarizeMaxSpeakers');
+  if (minEl) minEl.disabled = !diarizeEnabled;
+  if (maxEl) maxEl.disabled = !diarizeEnabled;
+}
+
+function applyAnalysisDefaultsFromProfile() {
+  const speech = profile?.analysis?.speech || {};
+  const diar = profile?.analysis?.diarization || {};
+  const diarize = speech.diarize;
+  if ($('#diarizeEnabled') && diarize !== undefined) $('#diarizeEnabled').checked = diarize === true;
+  if ($('#dlDiarizeEnabled') && diarize !== undefined) $('#dlDiarizeEnabled').checked = diarize === true;
+
+  const merged = { ...speech, ...diar };
+  const minSpk = merged.diarize_min_speakers ?? merged.min_speakers ?? null;
+  const maxSpk = merged.diarize_max_speakers ?? merged.max_speakers ?? null;
+  setOptionalNumberInput($('#diarizeMinSpeakers'), minSpk);
+  setOptionalNumberInput($('#diarizeMaxSpeakers'), maxSpk);
+  updateDiarizationControls();
+}
+
 // Publish state
 let publishAccounts = [];
 let publishExports = [];
@@ -73,6 +116,14 @@ function togglePanelCollapse(panel) {
     if (idx > -1) collapsed.splice(idx, 1);
   }
   saveCollapsedPanels(collapsed);
+
+  // Some panels contain canvases that need a rerender once visible again.
+  if (!isCollapsed && panelId === 'chat_timeline') {
+    requestAnimationFrame(() => {
+      renderChatMiniTimeline();
+      updateChatTimelinePlayhead();
+    });
+  }
 }
 
 function initCollapsiblePanels() {
@@ -118,7 +169,6 @@ function updateAnalysisButtonVisibility() {
     'showBtnAudioEvents': 'btnAnalyzeAudioEvents',
     'showBtnSpeech': 'btnAnalyzeSpeech',
     'showBtnContext': 'btnAnalyzeContext',
-    'showBtnReset': 'btnResetAnalysis',
   };
   
   for (const [checkboxId, btnId] of Object.entries(mapping)) {
@@ -161,7 +211,6 @@ function initAnalysisButtonToggles() {
     'showBtnAudioEvents': 'btnAnalyzeAudioEvents',
     'showBtnSpeech': 'btnAnalyzeSpeech',
     'showBtnContext': 'btnAnalyzeContext',
-    'showBtnReset': 'btnResetAnalysis',
   };
   
   for (const [checkboxId, btnId] of Object.entries(mapping)) {
@@ -244,22 +293,194 @@ function fmtDuration(seconds, opts = {}) {
 }
 
 async function apiGet(path) {
-  const r = await fetch(path);
+  const r = await apiFetch(path, {}, { retry401: true });
   if (!r.ok) throw new Error(`${path} -> ${r.status}`);
   return await r.json();
 }
 
 async function apiJson(method, path, body) {
-  const r = await fetch(path, {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const r = await apiFetch(
+    path,
+    {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    },
+    { retry401: true },
+  );
   if (!r.ok) {
     const txt = await r.text();
     throw new Error(`${method} ${path} -> ${r.status} ${txt}`);
   }
   return await r.json();
+}
+
+// =========================================================================
+// API TOKEN SUPPORT (VP_API_TOKEN)
+// =========================================================================
+
+const VP_API_TOKEN_KEY = 'vp_api_token';
+
+function getApiToken() {
+  try {
+    return (sessionStorage.getItem(VP_API_TOKEN_KEY) || localStorage.getItem(VP_API_TOKEN_KEY) || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+function setApiToken(token, { remember = false } = {}) {
+  const t = String(token || '').trim();
+  if (!t) return;
+  try {
+    sessionStorage.removeItem(VP_API_TOKEN_KEY);
+    localStorage.removeItem(VP_API_TOKEN_KEY);
+    if (remember) localStorage.setItem(VP_API_TOKEN_KEY, t);
+    else sessionStorage.setItem(VP_API_TOKEN_KEY, t);
+  } catch {}
+  updateApiTokenLinks();
+}
+
+function forgetApiToken() {
+  try {
+    sessionStorage.removeItem(VP_API_TOKEN_KEY);
+    localStorage.removeItem(VP_API_TOKEN_KEY);
+  } catch {}
+  updateApiTokenLinks();
+}
+
+function apiUrlWithToken(path) {
+  const token = getApiToken();
+  if (!token) return path;
+  const sep = path.includes('?') ? '&' : '?';
+  return `${path}${sep}token=${encodeURIComponent(token)}`;
+}
+
+function updateApiTokenLinks() {
+  // Links opened via navigation (not fetch) can't send Authorization headers.
+  const lnk = $('#lnkViewDiarization');
+  if (lnk) lnk.href = apiUrlWithToken('/api/task_artifact/diarization');
+}
+
+let apiTokenPromptInFlight = null;
+
+function promptForApiToken({ title = 'API Token Required' } = {}) {
+  if (apiTokenPromptInFlight) return apiTokenPromptInFlight;
+
+  const modal = $('#apiTokenModal');
+  const input = $('#apiTokenInput');
+  const remember = $('#apiTokenRemember');
+  const btnSave = $('#btnApiTokenSave');
+  const btnCancel = $('#btnApiTokenCancel');
+  const btnForget = $('#btnApiTokenForget');
+  const errorEl = $('#apiTokenError');
+
+  if (!modal || !input || !btnSave || !btnCancel || !btnForget) {
+    return Promise.reject(new Error('API token UI is missing from index.html'));
+  }
+
+  modal.querySelector('h2').textContent = title;
+  if (errorEl) {
+    errorEl.style.display = 'none';
+    errorEl.textContent = '';
+  }
+  input.value = '';
+  if (remember) remember.checked = false;
+
+  const show = () => { modal.style.display = 'flex'; };
+  const hide = () => { modal.style.display = 'none'; };
+
+  apiTokenPromptInFlight = new Promise((resolve, reject) => {
+    const cleanup = () => {
+      btnSave.onclick = null;
+      btnCancel.onclick = null;
+      btnForget.onclick = null;
+      modal.onclick = null;
+      window.removeEventListener('keydown', onKeyDown);
+      apiTokenPromptInFlight = null;
+    };
+
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        hide();
+        cleanup();
+        reject(new Error('cancelled'));
+      } else if (e.key === 'Enter') {
+        btnSave.click();
+      }
+    };
+
+    btnSave.onclick = () => {
+      const t = String(input.value || '').trim();
+      if (!t) {
+        if (errorEl) {
+          errorEl.textContent = 'Token is required.';
+          errorEl.style.display = 'block';
+        }
+        return;
+      }
+      setApiToken(t, { remember: !!(remember && remember.checked) });
+      hide();
+      cleanup();
+      resolve(t);
+    };
+
+    btnCancel.onclick = () => {
+      hide();
+      cleanup();
+      reject(new Error('cancelled'));
+    };
+
+    btnForget.onclick = () => {
+      forgetApiToken();
+      hide();
+      cleanup();
+      resolve('');
+    };
+
+    // Click outside modal content cancels.
+    modal.onclick = (e) => {
+      if (e.target === modal) {
+        hide();
+        cleanup();
+        reject(new Error('cancelled'));
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    show();
+    input.focus();
+  });
+
+  return apiTokenPromptInFlight;
+}
+
+function initApiTokenUi() {
+  document.querySelectorAll('[data-action="api-token"]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      try {
+        await promptForApiToken({ title: 'API Token' });
+      } catch (_) {}
+    });
+  });
+  updateApiTokenLinks();
+}
+
+async function apiFetch(path, options = {}, { retry401 = true } = {}) {
+  const token = getApiToken();
+  const headers = new Headers(options.headers || {});
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+
+  const r = await fetch(path, { ...options, headers });
+  if (r.status === 401 && retry401) {
+    try {
+      await promptForApiToken();
+    } catch (e) {
+      throw new Error('Unauthorized (API token required)');
+    }
+    return await apiFetch(path, options, { retry401: false });
+  }
+  return r;
 }
 
 // =========================================================================
@@ -809,7 +1030,7 @@ async function startUrlDownload(url) {
     quality_cap: $('#dlQualityCap')?.value ?? 'source',
     whisper_verbose: $('#dlWhisperVerbose')?.checked ?? true,
     verbose_logs: $('#dlVerboseLogs')?.checked ?? false,
-    diarize: $('#diarizeEnabled')?.checked ?? false,
+    diarize: $('#dlDiarizeEnabled')?.checked ?? false,
   };
 
   try {
@@ -833,7 +1054,7 @@ async function startUrlDownload(url) {
 }
 
 function watchHomeJob(jobId) {
-  const es = new EventSource(`/api/jobs/${jobId}/events`);
+  const es = new EventSource(apiUrlWithToken(`/api/jobs/${jobId}/events`));
   es.onmessage = (ev) => {
     try {
       const payload = JSON.parse(ev.data);
@@ -847,6 +1068,10 @@ function watchHomeJob(jobId) {
           project = j.result.project;
           showStudioView();
           initStudioView();
+          // If the backend kicked off an auto-upgrade analysis job, watch it in Studio.
+          if (j.result?.auto_upgrade_job_id) {
+            watchJob(j.result.auto_upgrade_job_id);
+          }
         }
         
         // Close event source when job is finished
@@ -1028,8 +1253,9 @@ function updateJobCard(el, job) {
     }
   }
   
-  // Always update parallel tasks section for running jobs (use innerHTML here but scoped to tasks div)
-  if (job.status === 'running') {
+  // Keep parallel tasks (chat/transcript/audio) updated for URL downloads,
+  // including after completion, so the card shows final statuses.
+  if (job.kind === 'download_url') {
     const tasksEl = el.querySelector('[data-role="tasks"]');
     if (tasksEl) {
       updateParallelTasks(tasksEl, job);
@@ -1523,11 +1749,11 @@ function renderPipelineStatus() {
 	          return { state: 'done', detail: `${speakers} speakers • ${segments} segments${extras}${timeStr}` };
 	        }
 
-	        // If diarization isn't enabled, treat as skipped (it is optional).
-	        const diarizeEnabled = profile?.analysis?.speech?.diarize === true;
-	        if (!diarizeEnabled) {
-	          return { state: 'skipped', detail: 'Disabled (speech.diarize=false)' };
-	        }
+		        // If diarization isn't enabled, treat as skipped (it is optional).
+		        const diarizeEnabled = $('#diarizeEnabled')?.checked ?? (profile?.analysis?.speech?.diarize === true);
+		        if (!diarizeEnabled) {
+		          return { state: 'skipped', detail: 'Disabled (speech.diarize=false)' };
+		        }
 
 	        return { state: 'pending', detail: 'Not yet run' };
 	      }
@@ -1893,8 +2119,7 @@ function renderPipelineStatus() {
       llmScoringBtn.disabled = true;
       llmScoringBtn.innerHTML = '⏳ Running...';
       try {
-        const resp = await fetch(`/api/analyze/llm_semantic?project_id=${project.id}`, { method: 'POST' });
-        const data = await resp.json();
+        const data = await apiJson('POST', `/api/analyze/llm_semantic?project_id=${project.id}`, null);
         if (data.job_id) {
           pollJobStatus(data.job_id, 'LLM Scoring', async () => {
             await loadProjectData(project.id);
@@ -1918,8 +2143,7 @@ function renderPipelineStatus() {
       llmFilterBtn.disabled = true;
       llmFilterBtn.innerHTML = '⏳ Filtering...';
       try {
-        const resp = await fetch(`/api/analyze/llm_filter?project_id=${project.id}`, { method: 'POST' });
-        const data = await resp.json();
+        const data = await apiJson('POST', `/api/analyze/llm_filter?project_id=${project.id}`, null);
         if (data.job_id) {
           pollJobStatus(data.job_id, 'LLM Filter', async () => {
             await loadProjectData(project.id);
@@ -2437,6 +2661,154 @@ function showVariantsModal(rank, ai) {
   });
 }
 
+function showResetAnalysisModal() {
+  // Remove existing modal if any
+  const existing = document.querySelector('.reset-analysis-modal-overlay');
+  if (existing) existing.remove();
+
+  const chatCount = project?.chat_ai_status?.message_count;
+  const hasChat = project?.chat_ai_status?.has_chat || (Number(chatCount || 0) > 0);
+  const transcriptSegCount = project?.analysis?.transcript?.segment_count;
+  const hasTranscript = !!project?.analysis?.transcript || Number(transcriptSegCount || 0) > 0;
+
+  const fmtCount = (n) => {
+    const v = Number(n);
+    if (!Number.isFinite(v)) return '';
+    return v.toLocaleString();
+  };
+
+  return new Promise((resolve) => {
+    const analysis = project?.analysis || {};
+
+    const items = [
+      // Inputs
+      { key: 'transcript', label: 'Transcript', detail: 'Whisper output', status: hasTranscript ? `${fmtCount(transcriptSegCount)} segments` : 'not detected' },
+      { key: 'diarization', label: 'Diarization', detail: 'Speaker turns', status: analysis?.diarization ? 'detected' : 'not detected' },
+      { key: 'chat', label: 'Chat', detail: 'Chat DB + features', status: hasChat ? `${fmtCount(chatCount)} messages` : 'not detected' },
+
+      // Core signals + highlights
+      { key: 'audio', label: 'Audio', detail: 'Energy/RMS timeline', status: analysis?.audio ? 'detected' : 'not detected' },
+      { key: 'vad', label: 'VAD (speech activity)', detail: 'Speech segments + timeline', status: analysis?.vad ? 'detected' : 'not detected' },
+      { key: 'motion', label: 'Motion', detail: 'Frame-diff motion scores', status: analysis?.motion ? 'detected' : 'not detected' },
+      { key: 'scenes', label: 'Scenes', detail: 'Visual cut boundaries', status: analysis?.scenes ? 'detected' : 'not detected' },
+      { key: 'highlights', label: 'Highlights', detail: 'Candidates + scoring', status: analysis?.highlights ? 'detected' : 'not detected' },
+
+      // Post-highlights
+      { key: 'silence', label: 'Silence', detail: 'Silence intervals', status: analysis?.silence ? 'detected' : 'not detected' },
+      { key: 'sentences', label: 'Sentences', detail: 'Sentence boundaries', status: analysis?.sentences ? 'detected' : 'not detected' },
+      { key: 'speech', label: 'Speech features', detail: 'Speech density/rate/etc.', status: analysis?.speech ? 'detected' : 'not detected' },
+      { key: 'reaction_audio', label: 'Reaction audio', detail: 'Prosody/arousal timeline', status: analysis?.reaction_audio ? 'detected' : 'not detected' },
+      { key: 'audio_events', label: 'Audio events', detail: 'Laughter/cheering/etc.', status: analysis?.audio_events ? 'detected' : 'not detected' },
+
+      // Context + AI
+      { key: 'chapters', label: 'Chapters', detail: 'Semantic chapters', status: analysis?.chapters ? 'detected' : 'not detected' },
+      { key: 'boundaries', label: 'Boundaries', detail: 'Merged boundary graph', status: analysis?.boundaries ? 'detected' : 'not detected' },
+      { key: 'variants', label: 'Clip variants', detail: 'Variant windows + strategies', status: (analysis?.variants || analysis?.clip_variants) ? 'detected' : 'not detected' },
+      { key: 'ai_director', label: 'AI director', detail: 'LLM picks/titles/hooks', status: analysis?.ai_director ? 'detected' : 'not detected' },
+      { key: 'director', label: 'Director (rules)', detail: 'Heuristic picks', status: analysis?.director ? 'detected' : 'not detected' },
+
+      // Chat extras
+      { key: 'chat_boundaries', label: 'Chat boundaries', detail: 'Chat valleys', status: analysis?.chat_boundaries ? 'detected' : 'not detected' },
+      { key: 'chat_sync', label: 'Chat sync', detail: 'Chat↔video offset', status: analysis?.chat_sync ? 'detected' : 'not detected' },
+
+      // Internal
+      { key: 'analysis_state', label: 'Task cache', detail: 'Freshness metadata', status: '' },
+    ];
+
+    const overlay = document.createElement('div');
+    overlay.className = 'reset-analysis-modal-overlay';
+    overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);z-index:1000;display:flex;align-items:center;justify-content:center;';
+
+    const modal = document.createElement('div');
+    modal.style.cssText = 'background:var(--bg);padding:24px;border-radius:8px;max-width:620px;max-height:80vh;overflow-y:auto;min-width:420px;border:1px solid var(--border);box-shadow:0 20px 60px rgba(0,0,0,0.5);';
+
+    const itemsHtml = items.map((it) => {
+      const status = it.status ? ` • ${it.status}` : '';
+      return `
+        <label style="display:flex;align-items:flex-start;gap:10px;padding:10px;border-radius:8px;cursor:pointer;border:1px solid rgba(255,255,255,0.06);background:rgba(255,255,255,0.03);">
+          <input type="checkbox" data-reset-key="${it.key}" checked style="margin-top:2px" />
+          <div style="flex:1;">
+            <div style="font-weight:700;">${it.label}</div>
+            <div class="small">${it.detail}${status}</div>
+          </div>
+        </label>
+      `;
+    }).join('');
+
+    modal.innerHTML = `
+      <h3 style="margin:0 0 10px 0;">🗑 Reset analysis</h3>
+      <div class="small" style="margin-bottom:14px;">
+        Uncheck anything you want to keep. Checked items will be reset (deleted). Selections and exports are preserved.
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;margin:10px 0 12px 0;">
+        <button class="keep-all" style="padding:6px 10px;font-size:12px;">Keep all</button>
+        <button class="reset-all" style="padding:6px 10px;font-size:12px;">Reset all</button>
+        <span id="resetSummary" class="small" style="margin-left:auto;"></span>
+      </div>
+
+      <div style="display:grid;gap:8px;margin-bottom:12px;">
+        ${itemsHtml}
+      </div>
+
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:16px;">
+        <div class="small">This cannot be undone.</div>
+        <div style="display:flex;gap:8px;">
+          <button class="close-modal">Cancel</button>
+          <button class="confirm-reset" style="background:#dc2626;border-color:#dc2626;color:#fff;font-weight:700;">Reset</button>
+        </div>
+      </div>
+    `;
+
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    const summaryEl = modal.querySelector('#resetSummary');
+    const confirmBtn = modal.querySelector('.confirm-reset');
+    const resetInputs = Array.from(modal.querySelectorAll('input[type="checkbox"][data-reset-key]'));
+
+    const getResetMap = () => {
+      const reset = {};
+      for (const el of resetInputs) {
+        reset[el.dataset.resetKey] = !!el.checked;
+      }
+      return reset;
+    };
+
+    const updateSummary = () => {
+      const reset = getResetMap();
+      const resetKeys = Object.entries(reset).filter(([, v]) => v).map(([k]) => k);
+      if (summaryEl) summaryEl.textContent = `Resetting: ${resetKeys.length}`;
+      if (confirmBtn) confirmBtn.disabled = resetKeys.length === 0;
+    };
+
+    const close = (result) => {
+      window.removeEventListener('keydown', onKeyDown);
+      overlay.remove();
+      resolve(result);
+    };
+
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') close(null);
+    };
+    window.addEventListener('keydown', onKeyDown);
+
+    modal.querySelector('.close-modal').onclick = () => close(null);
+    modal.querySelector('.confirm-reset').onclick = () => close(getResetMap());
+    modal.querySelector('.keep-all').onclick = () => {
+      resetInputs.forEach(el => el.checked = false);
+      updateSummary();
+    };
+    modal.querySelector('.reset-all').onclick = () => {
+      resetInputs.forEach(el => el.checked = true);
+      updateSummary();
+    };
+    resetInputs.forEach(el => el.addEventListener('change', updateSummary));
+    updateSummary();
+    overlay.onclick = (e) => { if (e.target === overlay) close(null); };
+  });
+}
+
 function renderSelections() {
   const container = $('#selections');
   container.innerHTML = '';
@@ -2771,7 +3143,7 @@ function pollJobStatus(jobId, onComplete, onError) {
 }
 
 function watchJob(jobId) {
-  const es = new EventSource(`/api/jobs/${jobId}/events`);
+  const es = new EventSource(apiUrlWithToken(`/api/jobs/${jobId}/events`));
   es.onmessage = async (ev) => {
     try {
       const payload = JSON.parse(ev.data);
@@ -2785,7 +3157,7 @@ function watchJob(jobId) {
           startJobsTimer();
         }
         
-        if ((j.kind === 'analyze_audio' || j.kind === 'analyze_highlights' || j.kind === 'analyze_speech' || j.kind === 'analyze_context_titles' || j.kind === 'analyze_full') && (j.status === 'succeeded' || j.status === 'failed')) {
+        if ((j.kind === 'analyze_audio' || j.kind === 'analyze_highlights' || j.kind === 'analyze_speech' || j.kind === 'analyze_context_titles' || j.kind === 'analyze_full' || j.kind === 'analyze_upgrade') && (j.status === 'succeeded' || j.status === 'failed')) {
           // refresh project and timeline to show enriched candidates (even on partial failure)
           refreshProject();
           // refresh chat status to update AI Director status
@@ -2799,6 +3171,10 @@ function watchJob(jobId) {
           // refresh chat status after download completes
           await refreshProject();  // refresh project first to get updated chat_ai_status
           loadChatStatus();
+          // If backend kicked off an auto-upgrade analysis job, watch it too.
+          if (j.kind === 'download_chat' && j.result?.auto_upgrade_job_id) {
+            watchJob(j.result.auto_upgrade_job_id);
+          }
           // Also refresh videos list in home view if visible
           if ($('#recentVideos')) {
             loadRecentVideos();
@@ -3698,18 +4074,26 @@ async function startAnalyzeFullJob() {
   const whisperBackend = $('#whisperBackend')?.value || 'auto';
   const whisperVerbose = $('#whisperVerbose')?.checked || false;
   const diarizeEnabled = $('#diarizeEnabled')?.checked || false;
+  const diarizeMinSpeakers = readOptionalIntInput($('#diarizeMinSpeakers'));
+  const diarizeMaxSpeakers = readOptionalIntInput($('#diarizeMaxSpeakers'));
   const traceTfImports = $('#traceTfImports')?.checked || false;
+  
+  const speechCfg = {
+    backend: whisperBackend,
+    strict: whisperBackend !== 'auto',  // Strict mode when explicitly choosing a backend
+    verbose: whisperVerbose,
+    diarize: diarizeEnabled
+  };
+  if (diarizeEnabled) {
+    if (diarizeMinSpeakers != null) speechCfg.diarize_min_speakers = diarizeMinSpeakers;
+    if (diarizeMaxSpeakers != null) speechCfg.diarize_max_speakers = diarizeMaxSpeakers;
+  }
   const res = await apiJson('POST', '/api/analyze/full', {
     highlights: {
       motion_weight_mode: motionMode,
       content_type: contentType
     },
-    speech: {
-      backend: whisperBackend,
-      strict: whisperBackend !== 'auto',  // Strict mode when explicitly choosing a backend
-      verbose: whisperVerbose,
-      diarize: diarizeEnabled
-    },
+    speech: speechCfg,
     debug: {
       trace_tf_imports: traceTfImports
     }
@@ -3724,13 +4108,21 @@ async function startAnalyzeSpeechJob() {
   const whisperBackend = $('#whisperBackend')?.value || 'auto';
   const whisperVerbose = $('#whisperVerbose')?.checked || false;
   const diarizeEnabled = $('#diarizeEnabled')?.checked || false;
+  const diarizeMinSpeakers = readOptionalIntInput($('#diarizeMinSpeakers'));
+  const diarizeMaxSpeakers = readOptionalIntInput($('#diarizeMaxSpeakers'));
+  
+  const speechCfg = {
+    backend: whisperBackend,
+    strict: whisperBackend !== 'auto',  // Strict mode when explicitly choosing a backend
+    verbose: whisperVerbose,
+    diarize: diarizeEnabled
+  };
+  if (diarizeEnabled) {
+    if (diarizeMinSpeakers != null) speechCfg.diarize_min_speakers = diarizeMinSpeakers;
+    if (diarizeMaxSpeakers != null) speechCfg.diarize_max_speakers = diarizeMaxSpeakers;
+  }
   const res = await apiJson('POST', '/api/analyze/speech', {
-    speech: {
-      backend: whisperBackend,
-      strict: whisperBackend !== 'auto',  // Strict mode when explicitly choosing a backend
-      verbose: whisperVerbose,
-      diarize: diarizeEnabled
-    }
+    speech: speechCfg
   });
   const jobId = res.job_id;
   watchJob(jobId);
@@ -3777,6 +4169,10 @@ function wireUI() {
   const v = $('#video');
   const canvas = $('#facecamCanvas');
   const canvasApi = setupFacecamCanvas();
+
+  const diarizeCb = $('#diarizeEnabled');
+  if (diarizeCb) diarizeCb.onchange = updateDiarizationControls;
+  updateDiarizationControls();
 
   v.addEventListener('timeupdate', () => {
     $('#timeReadout').textContent = `Now: ${fmtTime(v.currentTime)} / ${fmtTime(v.duration || 0)}`;
@@ -3871,19 +4267,18 @@ function wireUI() {
   };
 
   $('#btnResetAnalysis').onclick = async () => {
-    const keepChat = confirm('Keep chat data?\n\nClick OK to keep chat data, or Cancel to delete everything including chat.');
-    const keepTranscript = confirm('Keep transcript?\n\nClick OK to keep the transcript (Whisper output), or Cancel to delete it too.');
-    
-    if (!confirm(`Reset all analysis data?\n\nThis will delete:\n- Audio/motion/highlight analysis\n- Scene detection\n- Speech features\n- Audio events\n- Clip variants\n- AI director results\n${keepChat ? '(Keeping chat data)' : '- Chat data'}\n${keepTranscript ? '(Keeping transcript)' : '- Transcript'}\n\nSelections and exports will be preserved.`)) {
-      return;
-    }
-    
+    const reset = await showResetAnalysisModal();
+    if (!reset) return;
+
+    const resetKeys = Object.entries(reset).filter(([, v]) => v).map(([k]) => k);
+    if (resetKeys.length === 0) return;
+
     try {
       const res = await apiJson('POST', '/api/project/reset_analysis', {
-        keep_chat: keepChat,
-        keep_transcript: keepTranscript,
+        reset,
       });
-      alert(`Analysis reset complete!\n\nDeleted ${res.deleted_files.length} files.`);
+      const deleted = Array.isArray(res.deleted_files) ? res.deleted_files.length : 0;
+      alert(`Analysis reset complete!\n\nDeleted ${deleted} files.\nReset: ${resetKeys.join(', ')}`);
       refreshProject();
       refreshTimeline();
       loadChatStatus();  // Refresh AI Analysis Status panel (director, chat emotes)
@@ -4346,7 +4741,7 @@ function startPublishJobsSSE() {
     publishJobsSSE.close();
   }
 
-  publishJobsSSE = new EventSource('/api/publisher/jobs/stream');
+  publishJobsSSE = new EventSource(apiUrlWithToken('/api/publisher/jobs/stream'));
 
   publishJobsSSE.onmessage = (ev) => {
     try {
@@ -4420,6 +4815,7 @@ async function loadChatStatus() {
 
 function updateChatUI() {
   const panel = $('#chatPanel');
+  const timelinePanel = $('#chatTimelinePanel');
   const statusEl = $('#chatStatus');
   const sourceUrlInput = $('#chatSourceUrl');
   const offsetInput = $('#chatOffsetMs');
@@ -4520,6 +4916,7 @@ function updateChatUI() {
   const filterControls = $('#chatFilterControls');
 
   if (!chatStatus || !chatStatus.available) {
+    if (timelinePanel) timelinePanel.style.display = 'none';
     statusEl.innerHTML = 'No chat replay available.' + aiStatusHtml;
     statusEl.className = 'small';
     if (messagesEl) messagesEl.innerHTML = '';
@@ -4538,6 +4935,7 @@ function updateChatUI() {
     return;
   }
 
+  if (timelinePanel) timelinePanel.style.display = 'block';
   statusEl.innerHTML = `Chat: ${chatStatus.message_count.toLocaleString()} messages` + aiStatusHtml;
   statusEl.className = 'small success';
   // Wire up re-learn button
@@ -4726,19 +5124,161 @@ async function clearChat() {
 // =========================================================================
 
 let chatTimelineData = null;
+let chatTimelineOverviewData = null;
+let chatTimelineView = { startS: 0, endS: null };
+let chatTimelineRequestId = 0;
+let chatTimelineDebounce = null;
+let chatTimelineOverviewRequestId = 0;
+let chatMiniTimelineInitialized = false;
+let chatMiniTimelineDrag = {
+  active: false,
+  startX: 0,
+  startStartS: 0,
+  startEndS: 0,
+  moved: false,
+};
+
+function isChatTimelineData(obj) {
+  return (
+    obj &&
+    Array.isArray(obj.scores) &&
+    Number.isFinite(Number(obj.hopSeconds)) &&
+    Number.isFinite(Number(obj.startS ?? 0))
+  );
+}
+
+function chatTimelineDataCoversWindow(data, startS, endS) {
+  if (!isChatTimelineData(data)) return false;
+  const dataStart = Number(data.startS ?? 0);
+  const hop = Number(data.hopSeconds) || 0;
+  const n = Array.isArray(data.scores) ? data.scores.length : 0;
+  const computedEnd = (hop > 0 && n > 0) ? (dataStart + (n - 1) * hop) : dataStart;
+  const dataEnd = Number.isFinite(Number(data.endS)) ? Number(data.endS) : computedEnd;
+  return startS >= dataStart - 1e-6 && endS <= dataEnd + 1e-6;
+}
+
+function getChatTimelineDurationSeconds() {
+  const video = $('#video');
+  const d = (video && isFinite(video.duration) && video.duration > 0) ? video.duration : 0;
+  return d > 0 ? d : (chatTimelineData?.durationSeconds || chatTimelineOverviewData?.durationSeconds || 0);
+}
+
+function getChatTimelineViewWindow() {
+  const durationS = getChatTimelineDurationSeconds();
+  let startS = Number(chatTimelineView?.startS ?? 0);
+  let endS = chatTimelineView?.endS;
+  if (endS == null || !isFinite(endS)) {
+    endS = durationS > 0 ? durationS : (startS + 60.0);
+  } else {
+    endS = Number(endS);
+  }
+  if (durationS > 0) {
+    startS = Math.max(0, Math.min(startS, durationS));
+    endS = Math.max(startS + 0.1, Math.min(endS, durationS));
+  } else {
+    endS = Math.max(startS + 0.1, endS);
+  }
+  return { startS, endS, durationS };
+}
+
+function resetChatTimelineView() {
+  chatTimelineView.startS = 0;
+  const d = getChatTimelineDurationSeconds();
+  chatTimelineView.endS = d > 0 ? d : null;
+}
+
+function scheduleChatTimelineFetch(delayMs = 120) {
+  if (chatTimelineDebounce) clearTimeout(chatTimelineDebounce);
+  chatTimelineDebounce = setTimeout(() => loadChatTimeline(), delayMs);
+}
+
+async function loadChatTimelineOverview() {
+  try {
+    const params = new URLSearchParams();
+    params.set('start_s', '0');
+    params.set('max_points', '2000');
+
+    const reqId = ++chatTimelineOverviewRequestId;
+    const res = await apiGet(`/api/chat/timeline?${params.toString()}`);
+    if (reqId !== chatTimelineOverviewRequestId) return;
+    if (!res.ok) return;
+
+    chatTimelineOverviewData = {
+      hopSeconds: res.hop_seconds,
+      indices: res.indices,
+      scores: res.scores,
+      durationSeconds: res.duration_seconds || 0,
+      startS: res.start_s ?? 0,
+      endS: res.end_s ?? null,
+      syncOffsetMs: res.sync_offset_ms || 0,
+    };
+    renderChatMiniTimeline();
+    updateChatTimelinePlayhead();
+  } catch (e) {
+    // Ignore; overview is only an optimization for smoother panning previews.
+  }
+}
+
+function maybeRefreshChatTimelineOverview() {
+  if (!isChatTimelineData(chatTimelineData)) return;
+  const curOffset = Number(chatTimelineData.syncOffsetMs || 0);
+  const curDur = Number(chatTimelineData.durationSeconds || 0);
+  const hasOverview = isChatTimelineData(chatTimelineOverviewData);
+  const overviewOffset = hasOverview ? Number(chatTimelineOverviewData.syncOffsetMs || 0) : null;
+  const overviewDur = hasOverview ? Number(chatTimelineOverviewData.durationSeconds || 0) : null;
+
+  const needsRefresh =
+    !hasOverview ||
+    (overviewOffset != null && overviewOffset !== curOffset) ||
+    (overviewDur != null && curDur > 0 && Math.abs(overviewDur - curDur) > 0.25);
+
+  if (!needsRefresh) return;
+  if (hasOverview && overviewOffset != null && overviewOffset !== curOffset) {
+    chatTimelineOverviewData = null;
+  }
+  loadChatTimelineOverview();
+}
 
 async function loadChatTimeline() {
   const wrap = $('#chatMiniTimelineWrap');
   try {
-    const res = await apiGet('/api/chat/timeline');
+    const { startS, endS } = getChatTimelineViewWindow();
+    const params = new URLSearchParams();
+    params.set('start_s', startS.toFixed(3));
+    // Only send end_s once user has zoomed/panned; otherwise let backend pick full duration.
+    if (chatTimelineView?.endS != null) {
+      params.set('end_s', endS.toFixed(3));
+    }
+    params.set('max_points', '2000');
+
+    const reqId = ++chatTimelineRequestId;
+    const res = await apiGet(`/api/chat/timeline?${params.toString()}`);
+    if (reqId !== chatTimelineRequestId) return;
+
     if (res.ok) {
       chatTimelineData = {
         hopSeconds: res.hop_seconds,
         indices: res.indices,
         scores: res.scores,
+        durationSeconds: res.duration_seconds || 0,
+        startS: res.start_s ?? 0,
+        endS: res.end_s ?? null,
+        syncOffsetMs: res.sync_offset_ms || 0,
       };
-      renderChatMiniTimeline();
+      const durationS = Number(res.duration_seconds || 0);
+      const isFullDuration =
+        typeof res.start_s === 'number' &&
+        Math.abs(res.start_s) < 1e-6 &&
+        typeof res.end_s === 'number' &&
+        durationS > 0 &&
+        Math.abs(res.end_s - durationS) < 1e-3;
+      if (isFullDuration) chatTimelineOverviewData = { ...chatTimelineData };
+      // Adopt the server-clamped view window.
+      if (typeof res.start_s === 'number') chatTimelineView.startS = res.start_s;
+      if (typeof res.end_s === 'number') chatTimelineView.endS = res.end_s;
       if (wrap) wrap.style.display = 'block';
+      renderChatMiniTimeline();
+      updateChatTimelinePlayhead();
     } else {
       chatTimelineData = null;
       if (wrap) wrap.style.display = 'none';
@@ -4750,30 +5290,68 @@ async function loadChatTimeline() {
   }
 }
 
-function renderChatMiniTimeline() {
+function getChatTimelineRenderData() {
+  const { startS, endS } = getChatTimelineViewWindow();
+  if (chatTimelineDataCoversWindow(chatTimelineData, startS, endS)) return chatTimelineData;
+  if (chatTimelineDataCoversWindow(chatTimelineOverviewData, startS, endS)) return chatTimelineOverviewData;
+  return isChatTimelineData(chatTimelineData) ? chatTimelineData : chatTimelineOverviewData;
+}
+
+function getChatTimelineScoresForView(data, viewStartS, viewEndS) {
+  if (!isChatTimelineData(data)) return [];
+  const scores = data.scores || [];
+  if (!scores.length) return [];
+
+  const hop = Number(data.hopSeconds) || 0;
+  if (!(hop > 0)) return scores;
+
+  const dataStart = Number(data.startS ?? 0);
+  let i0 = Math.floor((viewStartS - dataStart) / hop);
+  let i1 = Math.floor((viewEndS - dataStart) / hop) + 1;
+
+  if (!Number.isFinite(i0)) i0 = 0;
+  if (!Number.isFinite(i1)) i1 = scores.length;
+
+  i0 = Math.max(0, Math.min(i0, scores.length - 1));
+  i1 = Math.max(i0 + 1, Math.min(i1, scores.length));
+  return scores.slice(i0, i1);
+}
+
+function renderChatMiniTimeline(data) {
   const canvas = $('#chatMiniTimeline');
   const wrap = $('#chatMiniTimelineWrap');
-  if (!canvas || !chatTimelineData) return;
+  if (!canvas || !wrap) return;
+
+  const renderData = isChatTimelineData(data) ? data : getChatTimelineRenderData();
+  if (!isChatTimelineData(renderData)) return;
   
   const ctx = canvas.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
   
-  // Set canvas size
-  canvas.width = wrap.clientWidth * dpr;
-  canvas.height = 40 * dpr;
-  ctx.scale(dpr, dpr);
-  
   const width = wrap.clientWidth;
-  const height = 40;
+  const height = wrap.clientHeight;
+  if (!width || !height) return;
+
+  // Set canvas size
+  canvas.width = width * dpr;
+  canvas.height = height * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   
   // Clear
   ctx.fillStyle = '#0a0c0f';
   ctx.fillRect(0, 0, width, height);
   
-  const scores = chatTimelineData.scores;
+  const { startS, endS } = getChatTimelineViewWindow();
+  const scores = chatTimelineDataCoversWindow(renderData, startS, endS) ?
+    getChatTimelineScoresForView(renderData, startS, endS) :
+    (renderData.scores || []);
   if (scores.length === 0) return;
   
-  const maxScore = Math.max(...scores, 0.01);
+  let maxScore = 0.01;
+  for (let i = 0; i < scores.length; i++) {
+    const v = Number(scores[i]);
+    if (Number.isFinite(v) && v > maxScore) maxScore = v;
+  }
   const barWidth = Math.max(1, width / scores.length);
   
   // Draw bars
@@ -4799,31 +5377,147 @@ function updateChatTimelinePlayhead() {
   const video = $('#video');
   
   if (!playhead || !wrap || !video || !chatTimelineData) return;
-  
-  const duration = video.duration || 0;
-  if (duration <= 0) return;
-  
-  const progress = video.currentTime / duration;
-  const x = progress * wrap.clientWidth;
-  
-  playhead.style.left = `${x}px`;
+
+  const { startS, endS } = getChatTimelineViewWindow();
+  const span = endS - startS;
+  if (span <= 0) return;
+
+  const x = ((video.currentTime - startS) / span) * wrap.clientWidth;
+  const clamped = Math.max(0, Math.min(wrap.clientWidth, x));
+
+  playhead.style.left = `${clamped}px`;
+  playhead.style.opacity = (video.currentTime < startS || video.currentTime > endS) ? '0.35' : '1.0';
 }
 
 function initChatMiniTimeline() {
   const wrap = $('#chatMiniTimelineWrap');
   const video = $('#video');
+
+  if (chatMiniTimelineInitialized) return;
+  chatMiniTimelineInitialized = true;
   
   if (wrap) {
-    wrap.onclick = (e) => {
-      if (!video || !chatTimelineData) return;
+    // Zoom with wheel, centered around cursor.
+    wrap.addEventListener('wheel', (e) => {
+      if (!chatTimelineData) return;
+      const d = getChatTimelineDurationSeconds();
+      if (!d || d <= 0) return;
+
+      e.preventDefault();
+
       const rect = wrap.getBoundingClientRect();
       const x = e.clientX - rect.left;
-      const progress = x / rect.width;
-      const duration = video.duration || 0;
-      if (duration > 0) {
-        video.currentTime = progress * duration;
+      const frac = rect.width > 0 ? (x / rect.width) : 0.5;
+
+      const { startS, endS } = getChatTimelineViewWindow();
+      const span = Math.max(0.1, endS - startS);
+      const center = startS + frac * span;
+
+      // Smooth exponential zoom.
+      const zoom = Math.exp(e.deltaY * 0.0015); // deltaY>0 => zoom out
+      const minSpan = 5.0;
+      const maxSpan = Math.max(minSpan, d);
+      let newSpan = span * zoom;
+      newSpan = Math.max(minSpan, Math.min(maxSpan, newSpan));
+
+      let newStart = center - frac * newSpan;
+      let newEnd = newStart + newSpan;
+
+      // Clamp to [0, d]
+      if (newStart < 0) {
+        newEnd -= newStart;
+        newStart = 0;
       }
-    };
+      if (newEnd > d) {
+        const over = newEnd - d;
+        newStart = Math.max(0, newStart - over);
+        newEnd = d;
+      }
+
+      chatTimelineView.startS = newStart;
+      chatTimelineView.endS = newEnd;
+      scheduleChatTimelineFetch(80);
+      updateChatTimelinePlayhead();
+      renderChatMiniTimeline();
+    }, { passive: false });
+
+    // Pan with drag.
+    wrap.addEventListener('mousedown', (e) => {
+      if (!chatTimelineData) return;
+      if (e.button !== 0) return; // left mouse only
+      e.preventDefault();
+      wrap.classList.add('dragging');
+      maybeRefreshChatTimelineOverview();
+      const { startS, endS } = getChatTimelineViewWindow();
+      chatMiniTimelineDrag.active = true;
+      chatMiniTimelineDrag.startX = e.clientX;
+      chatMiniTimelineDrag.startStartS = startS;
+      chatMiniTimelineDrag.startEndS = endS;
+      chatMiniTimelineDrag.moved = false;
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!chatMiniTimelineDrag.active) return;
+      const d = getChatTimelineDurationSeconds();
+      if (!d || d <= 0) return;
+      const rect = wrap.getBoundingClientRect();
+      if (!rect.width) return;
+
+      const dx = e.clientX - chatMiniTimelineDrag.startX;
+      if (Math.abs(dx) > 3) chatMiniTimelineDrag.moved = true;
+
+      const span = chatMiniTimelineDrag.startEndS - chatMiniTimelineDrag.startStartS;
+      const dt = -(dx / rect.width) * span;
+
+      let newStart = chatMiniTimelineDrag.startStartS + dt;
+      let newEnd = chatMiniTimelineDrag.startEndS + dt;
+
+      if (newStart < 0) {
+        newEnd -= newStart;
+        newStart = 0;
+      }
+      if (newEnd > d) {
+        const over = newEnd - d;
+        newStart = Math.max(0, newStart - over);
+        newEnd = d;
+      }
+
+      chatTimelineView.startS = newStart;
+      chatTimelineView.endS = newEnd;
+      renderChatMiniTimeline();
+      updateChatTimelinePlayhead();
+    });
+
+    window.addEventListener('mouseup', () => {
+      if (!chatMiniTimelineDrag.active) return;
+      chatMiniTimelineDrag.active = false;
+      wrap.classList.remove('dragging');
+      if (chatMiniTimelineDrag.moved) {
+        scheduleChatTimelineFetch(0);
+      }
+    });
+
+    // Click-to-seek (in the current view window).
+    wrap.addEventListener('click', (e) => {
+      if (!video || !chatTimelineData) return;
+      if (chatMiniTimelineDrag.moved) {
+        chatMiniTimelineDrag.moved = false;
+        return;
+      }
+      const rect = wrap.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const frac = rect.width > 0 ? (x / rect.width) : 0;
+      const { startS, endS, durationS } = getChatTimelineViewWindow();
+      const t = startS + frac * (endS - startS);
+      const clamped = durationS > 0 ? Math.max(0, Math.min(durationS, t)) : Math.max(0, t);
+      video.currentTime = clamped;
+    });
+
+    // Reset zoom on double-click.
+    wrap.addEventListener('dblclick', () => {
+      resetChatTimelineView();
+      loadChatTimeline();
+    });
   }
   
   if (video) {
@@ -5216,7 +5910,13 @@ async function setChatOffset() {
   try {
     await apiJson('POST', '/api/chat/set_offset', { sync_offset_ms: offset });
     if (chatStatus) chatStatus.sync_offset_ms = offset;
+    if (chatTimelineData) chatTimelineData.syncOffsetMs = offset;
     syncChatMessages(); // Refresh immediately
+    // Refresh timeline so spikes align with video time.
+    scheduleChatTimelineFetch(0);
+    // Refresh overview used for smooth panning previews.
+    chatTimelineOverviewData = null;
+    loadChatTimelineOverview();
   } catch (e) {
     alert(`Failed to set offset: ${e.message}`);
   }
@@ -5277,9 +5977,11 @@ function wireChatUI() {
 }
 
 async function main() {
+  initApiTokenUi();
   try {
     profile = await apiGet('/api/profile');
   } catch (_) {}
+  applyAnalysisDefaultsFromProfile();
 
   // Initialize collapsible panels
   initCollapsiblePanels();
@@ -5308,6 +6010,11 @@ async function main() {
 }
 
 async function initStudioView() {
+  // Reset chat timeline state when switching projects
+  chatTimelineData = null;
+  chatTimelineOverviewData = null;
+  resetChatTimelineView();
+
   renderProjectInfo();
   renderPipelineStatus();
   renderCandidates();

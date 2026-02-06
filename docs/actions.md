@@ -1,0 +1,45 @@
+# ChatGPT Actions + API Token
+
+When exposing Studio over an HTTPS tunnel (ngrok/Cloudflare Tunnel/etc.), you should protect all `/api/*` endpoints with a Bearer token.
+
+## Token location (Windows)
+
+The helper script stores the token at:
+
+- `%LOCALAPPDATA%\\VideoPipeline\\vp_api_token.txt`
+
+The file is **one line**: `64` hex characters (32 bytes).
+
+## Generate / view / copy
+
+- Print the token (stdout only):
+  - `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\\vp_api_token.ps1`
+- Persist it (create the file if missing):
+  - `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\\vp_api_token.ps1 -Persist`
+- Copy to clipboard:
+  - `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\\vp_api_token.ps1 -Persist -Copy`
+
+## Use with Studio
+
+Studio reads the token from the environment variable:
+
+- `VP_API_TOKEN`
+
+See `tools\\studio-launch.bat.example` for an end-to-end launcher that:
+1) activates `.venv`
+2) generates/persists a token (if missing)
+3) sets `VP_API_TOKEN`
+4) launches Studio
+
+## Rotate the token
+
+Delete the token file and generate a new one:
+
+- Delete: `%LOCALAPPDATA%\\VideoPipeline\\vp_api_token.txt`
+- Recreate: run the script with `-Persist`
+
+## Safety
+
+- Never commit tokens to git.
+- Treat the token like a password (anyone with it can call `/api/*` on your Studio server).
+

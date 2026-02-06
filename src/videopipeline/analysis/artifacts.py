@@ -137,6 +137,7 @@ register_artifact("chapters", "chapters.json", "Semantic chapter boundaries (LLM
 # --- Chat-derived ---
 register_artifact("chat_features", "chat_features.npz", "Chat activity timeline")
 register_artifact("chat_boundaries", "chat_boundaries.json", "Chat activity valleys")
+register_artifact("chat_sync", "chat_sync.json", "Estimated chat↔video sync offset")
 
 # --- Video-derived ---
 register_artifact("motion_features", "motion_features.npz", "Frame difference motion scores")

@@ -22,6 +22,8 @@ BUNDLE_PRE_DOWNLOAD: Set[str] = {
     "speech_features",
     "chat_features",
     "chat_boundaries",
+    "chat_sync",
+    "boundary_graph",  # Better early clip start/end snapping (can run partial)
     # Early highlights using available signals
     "highlights_scores",
     "highlights_candidates",
@@ -32,6 +34,7 @@ BUNDLE_PRE_DOWNLOAD: Set[str] = {
 BUNDLE_PRE_DOWNLOAD_NO_CHAT: Set[str] = BUNDLE_PRE_DOWNLOAD - {
     "chat_features",
     "chat_boundaries",
+    "chat_sync",
 }
 
 # Full bundle: Complete analysis including video-based features

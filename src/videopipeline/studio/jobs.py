@@ -113,7 +113,12 @@ class JobManager:
         if message is not None:
             job.message = message
         if result is not None:
-            job.result = result
+            # Merge incremental result updates so callers can update a subset of keys
+            # without accidentally dropping previously-populated fields.
+            try:
+                job.result.update(result)
+            except Exception:
+                job.result = result
         self._emit(job, {"type": "job_update", "job": self._public(job)})
 
     def cancel(self, job_id: str) -> bool:
