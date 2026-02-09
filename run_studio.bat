@@ -37,5 +37,8 @@ if not defined VP_API_TOKEN (
   exit /b 1
 )
 
+REM === Pin Studio port for stable browser origin/token storage ===
+if not defined VP_STUDIO_PORT set "VP_STUDIO_PORT=57820"
+
 REM === Launch Studio ===
 start "" /min python -m videopipeline.launcher

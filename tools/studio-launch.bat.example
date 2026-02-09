@@ -23,7 +23,9 @@ if not defined VP_API_TOKEN (
   exit /b 1
 )
 
+rem Optional: pin Studio to a stable port (helps browser remember API token)
+if not defined VP_STUDIO_PORT set "VP_STUDIO_PORT=57820"
+
 start "" /min python -m videopipeline.launcher
 
 endlocal
-

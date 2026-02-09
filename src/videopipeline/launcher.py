@@ -11,7 +11,6 @@ A Windows-friendly launcher that:
 
 from __future__ import annotations
 
-import io
 import json
 import logging
 import os
@@ -22,7 +21,7 @@ import time
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List
+from typing import List, Optional
 
 # Suppress console windows from GPU libraries on Windows
 # This must be done BEFORE importing torch/tensorflow/etc
@@ -31,31 +30,31 @@ if sys.platform == "win32":
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # TensorFlow
     os.environ.setdefault("ORT_DISABLE_ALL_LOGS", "1")  # ONNX Runtime
     os.environ.setdefault("HIP_LAUNCH_BLOCKING", "0")    # ROCm/HIP
-    
+
     # Monkey-patch subprocess.Popen to always use CREATE_NO_WINDOW
     # This catches any subprocess spawned by child libraries (torch ROCm, etc.)
     import subprocess
     _original_popen = subprocess.Popen
-    
+
     class _SilentPopen(_original_popen):
         def __init__(self, *args, **kwargs):
             if sys.platform == "win32" and "creationflags" not in kwargs:
                 # CREATE_NO_WINDOW = 0x08000000
                 kwargs["creationflags"] = kwargs.get("creationflags", 0) | 0x08000000
             super().__init__(*args, **kwargs)
-    
+
     subprocess.Popen = _SilentPopen
 
 import requests
 import uvicorn
 
-from videopipeline.studio.app import create_app
 from videopipeline.logging_config import setup_logging
-
+from videopipeline.studio.app import create_app
 
 APP_NAME = "VideoPipeline"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765  # used only if --port specified; otherwise we auto-pick
+STUDIO_PORT_ENV = "VP_STUDIO_PORT"
 
 logger = logging.getLogger(__name__)
 
@@ -67,15 +66,15 @@ def _is_frozen() -> bool:
 
 def _fix_frozen_streams() -> None:
     """Fix stdout/stderr when running as frozen exe without console.
-    
+
     When a PyInstaller app runs with --noconsole (or --windowed), stdout/stderr
     are None, which causes uvicorn's logging to crash when calling .isatty().
-    
+
     This redirects them to a log file or a null stream.
     """
     if not _is_frozen():
         return
-    
+
     # Check if streams are broken (None or missing isatty)
     def _needs_fix(stream):
         if stream is None:
@@ -85,7 +84,7 @@ def _fix_frozen_streams() -> None:
             return False
         except (AttributeError, OSError):
             return True
-    
+
     if _needs_fix(sys.stdout) or _needs_fix(sys.stderr):
         # Redirect to log file
         log_path = _log_file()
@@ -168,6 +167,32 @@ def _pick_free_port() -> int:
         return int(s.getsockname()[1])
 
 
+def _port_from_env() -> Optional[int]:
+    """Return the fixed Studio port from env, if valid."""
+    raw = (os.getenv(STUDIO_PORT_ENV) or "").strip()
+    if not raw:
+        return None
+    try:
+        port = int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r (expected integer 1..65535)", STUDIO_PORT_ENV, raw)
+        return None
+    if not (1 <= port <= 65535):
+        logger.warning("Ignoring invalid %s=%r (expected range 1..65535)", STUDIO_PORT_ENV, raw)
+        return None
+    return port
+
+
+def _resolve_port(explicit_port: Optional[int]) -> int:
+    """Resolve the Studio port with precedence: CLI --port > env > random free port."""
+    if explicit_port is not None:
+        return explicit_port
+    env_port = _port_from_env()
+    if env_port is not None:
+        return env_port
+    return _pick_free_port()
+
+
 def _http_ok(url: str, timeout: float = 0.25) -> bool:
     """Check if an HTTP endpoint returns 200 OK."""
     try:
@@ -221,7 +246,7 @@ def _clear_runtime() -> None:
 def _maybe_add_ffmpeg_to_path() -> None:
     """
     Add bundled ffmpeg to PATH if present.
-    
+
     If ffmpeg.exe/ffprobe.exe are placed next to the .exe (or in ./ffmpeg/),
     add that directory to PATH at runtime so ffmpeg lookup works.
     """
@@ -265,7 +290,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     level = getattr(logging, os.getenv("VP_LOG_LEVEL", "INFO").upper(), logging.INFO)
     log_path = Path(os.getenv("VP_LOG_FILE", "")).expanduser() if os.getenv("VP_LOG_FILE") else _log_file()
     setup_logging(level=level, log_file=log_path)
-    
+
     argv = argv if argv is not None else sys.argv[1:]
 
     # Minimal arg parsing (keeps it stable inside PyInstaller)
@@ -299,7 +324,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     _maybe_add_ffmpeg_to_path()
 
-    port = args.port if args.port is not None else _pick_free_port()
+    port = _resolve_port(args.port)
     url = f"http://{args.host}:{port}"
 
     # Create app in HOME mode with default profile (gaming.yaml)

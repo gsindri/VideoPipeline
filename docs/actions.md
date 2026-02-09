@@ -24,12 +24,34 @@ The file is **one line**: `64` hex characters (32 bytes).
 Studio reads the token from the environment variable:
 
 - `VP_API_TOKEN`
+- Optional: set `VP_STUDIO_PORT` (for example `57820`) to keep Studio on a stable local URL.
+  This helps browser-stored token memory survive restarts (`http://127.0.0.1:<port>` stays constant).
 
 See `tools\\studio-launch.bat.example` for an end-to-end launcher that:
 1) activates `.venv`
 2) generates/persists a token (if missing)
 3) sets `VP_API_TOKEN`
 4) launches Studio
+
+## Quick Tunnel (Cloudflare) + copy import URL
+
+If you use Cloudflare Quick Tunnel, the public `trycloudflare.com` hostname changes every time you restart the tunnel.
+
+Use:
+
+- `tools\\studio-quick-tunnel.bat`
+
+It will:
+1) start Studio if needed
+2) auto-detect the correct local port
+3) start a Cloudflare Quick Tunnel
+4) copy the Actions OpenAPI import URL (`/api/actions/openapi.json?token=...`) to your clipboard
+
+Requirements:
+- `cloudflared` in PATH (install with `winget install -e --id Cloudflare.cloudflared`)
+
+Security note:
+- The copied import URL includes your token in the query string. Treat it like a password and don’t share it.
 
 ## Rotate the token
 
@@ -42,4 +64,3 @@ Delete the token file and generate a new one:
 
 - Never commit tokens to git.
 - Treat the token like a password (anyone with it can call `/api/*` on your Studio server).
-
