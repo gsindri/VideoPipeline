@@ -198,7 +198,7 @@ class JobManager:
                     hook_text = hook_cfg.get("text")
                     # Check AI director results for this selection's hook
                     if not hook_text and director_results:
-                        candidate_rank = selection.get("rank")
+                        candidate_rank = selection.get("candidate_rank") or selection.get("rank")
                         if candidate_rank is not None:
                             for dr in director_results:
                                 if dr.get("candidate_rank") == candidate_rank:

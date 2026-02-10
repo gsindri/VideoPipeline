@@ -196,6 +196,12 @@
                 <option value="auto">auto</option>
               </select>
             </label>
+            <label title="Where AI decisions come from. External means you intend to use ChatGPT (via Actions) to do semantic filtering/reranking and packaging (director picks).">Brain:
+              <select id="llmMode">
+                <option value="external" selected>ChatGPT Actions (external)</option>
+                <option value="local">Local LLM</option>
+              </select>
+            </label>
             <div class="dropdown" style="position:relative">
               <button id="btnAnalysisTools" title="Show/hide individual analysis tools">🔧 Tools ▾</button>
               <div id="analysisToolsDropdown" class="dropdown-menu" style="display:none;position:absolute;top:100%;left:0;background:#1a1d24;border:1px solid var(--border);border-radius:6px;padding:8px;z-index:100;min-width:180px;margin-top:4px">

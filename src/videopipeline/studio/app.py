@@ -1557,6 +1557,7 @@ def create_app(
                 speed_mode: str - One of: auto, conservative, balanced, fast, aggressive
                 quality_cap: str - One of: source, 1080, 720, 480
                 verbose_logs: bool (default False) - Enable detailed internal logs (chat/emotes)
+            llm_mode: str - One of: local, external (default local)
             auto_open: bool - Automatically open as project when done (default True)
         
         Returns job_id for tracking progress.
@@ -1572,6 +1573,10 @@ def create_app(
 
         opts = body.get("options") or {}
         auto_open = bool(body.get("auto_open", True))
+        llm_mode_raw = str(body.get("llm_mode") or "").strip().lower()
+        llm_mode = "local" if llm_mode_raw == "" else llm_mode_raw
+        if llm_mode not in {"local", "external"}:
+            raise HTTPException(status_code=400, detail="invalid_llm_mode")
 
         # Parse speed mode
         speed_mode_str = str(opts.get("speed_mode", "auto")).lower()
@@ -2801,44 +2806,47 @@ def create_app(
                                     },
                                 )
 
-                                try:
-                                    from ..chat.features import compute_and_save_chat_features
+                                if llm_mode == "external":
+                                    log.info("[CHAT] External mode enabled; skipping local-LLM emote learning")
+                                else:
+                                    try:
+                                        from ..chat.features import compute_and_save_chat_features
 
-                                    hop_s = float(ctx.profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
-                                    smooth_s = float(ctx.profile.get("analysis", {}).get("highlights", {}).get("chat_smooth_seconds", 3.0))
+                                        hop_s = float(ctx.profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
+                                        smooth_s = float(ctx.profile.get("analysis", {}).get("highlights", {}).get("chat_smooth_seconds", 3.0))
 
-                                    # Get LLM for laugh emote learning
-                                    ai_cfg = ctx.profile.get("ai", {}).get("director", {})
+                                        # Get LLM for laugh emote learning
+                                        ai_cfg = ctx.profile.get("ai", {}).get("director", {})
 
-                                    def on_llm_status(msg: str) -> None:
-                                        JOB_MANAGER._set(job, message=msg)
+                                        def on_llm_status(msg: str) -> None:
+                                            JOB_MANAGER._set(job, message=msg)
 
-                                    llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir, on_status=on_llm_status)
+                                        llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir, on_status=on_llm_status)
 
-                                    def on_feature_status(msg: str) -> None:
-                                        JOB_MANAGER._set(job, message=msg)
+                                        def on_feature_status(msg: str) -> None:
+                                            JOB_MANAGER._set(job, message=msg)
 
-                                    # Extract channel info from URL for global emote persistence
-                                    from ..chat.emote_db import get_channel_for_project
+                                        # Extract channel info from URL for global emote persistence
+                                        from ..chat.emote_db import get_channel_for_project
 
-                                    channel_info = get_channel_for_project(proj, source_url=url)
-                                    channel_id = channel_info[0] if channel_info else None
-                                    platform = channel_info[1] if channel_info else "twitch"
+                                        channel_info = get_channel_for_project(proj, source_url=url)
+                                        channel_id = channel_info[0] if channel_info else None
+                                        platform = channel_info[1] if channel_info else "twitch"
 
-                                    log.info("[CHAT] Computing chat features...")
-                                    compute_and_save_chat_features(
-                                        proj,
-                                        hop_s=hop_s,
-                                        smooth_s=smooth_s,
-                                        on_status=on_feature_status,
-                                        llm_complete=llm_complete_fn,
-                                        channel_id=channel_id,
-                                        platform=platform,
-                                    )
-                                    log.info("[CHAT] Chat features computed")
-                                except Exception as e:
-                                    log.warning("[CHAT] Chat feature computation failed: %s", e)
-                                    # Non-fatal - features can be computed later during analysis
+                                        log.info("[CHAT] Computing chat features...")
+                                        compute_and_save_chat_features(
+                                            proj,
+                                            hop_s=hop_s,
+                                            smooth_s=smooth_s,
+                                            on_status=on_feature_status,
+                                            llm_complete=llm_complete_fn,
+                                            channel_id=channel_id,
+                                            platform=platform,
+                                        )
+                                        log.info("[CHAT] Chat features computed")
+                                    except Exception as e:
+                                        log.warning("[CHAT] Chat feature computation failed: %s", e)
+                                        # Non-fatal - features can be computed later during analysis
 
                         if chat_result.get("imported"):
                             JOB_MANAGER._set(
@@ -2921,18 +2929,35 @@ def create_app(
                                 "include_audio_events": bool(analysis_cfg.get("audio_events", {}).get("enabled", True)),
                             }
 
+                            if llm_mode == "external":
+                                # Ensure no local LLM calls happen during upgrade analysis. ChatGPT-in-the-loop
+                                # workflows use Actions IO/apply endpoints instead.
+                                highlights_cfg = dict(dag_config.get("highlights", {}) or {})
+                                highlights_cfg["llm_semantic_enabled"] = False
+                                highlights_cfg["llm_filter_enabled"] = False
+                                dag_config["highlights"] = highlights_cfg
+
+                                chapters_cfg = dict(dag_config.get("chapters", {}) or {})
+                                chapters_cfg["llm_labeling"] = False
+                                dag_config["chapters"] = chapters_cfg
+
+                                director_cfg = dict(dag_config.get("director", {}) or {})
+                                director_cfg["enabled"] = False
+                                dag_config["director"] = director_cfg
+
                             # Optional LLM support (semantic filtering/reranking + chat emotes).
                             llm_complete_fn = None
-                            try:
-                                ai_cfg = ctx.profile.get("ai", {}).get("director", {}) or {}
-                                highlights_cfg = dag_config.get("highlights", {}) or {}
-                                llm_needed = bool(highlights_cfg.get("llm_semantic_enabled", True)) or bool(
-                                    highlights_cfg.get("llm_filter_enabled", False)
-                                )
-                                if ai_cfg.get("enabled", True) and llm_needed:
-                                    llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
-                            except Exception:
-                                llm_complete_fn = None
+                            if llm_mode != "external":
+                                try:
+                                    ai_cfg = ctx.profile.get("ai", {}).get("director", {}) or {}
+                                    highlights_cfg2 = dag_config.get("highlights", {}) or {}
+                                    llm_needed = bool(highlights_cfg2.get("llm_semantic_enabled", True)) or bool(
+                                        highlights_cfg2.get("llm_filter_enabled", False)
+                                    )
+                                    if ai_cfg.get("enabled", True) and llm_needed:
+                                        llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
+                                except Exception:
+                                    llm_complete_fn = None
 
                             def on_upgrade_progress(frac: float, msg: str) -> None:
                                 if upgrade_job.cancel_requested:
@@ -5680,6 +5705,7 @@ def create_app(
         
         Body:
             source_url: str - Optional URL override. If not provided, uses project's source URL.
+            llm_mode: str - One of: local, external (default local)
         
         Returns job_id for tracking progress.
         """
@@ -5690,6 +5716,10 @@ def create_app(
 
         # Get source URL from body or project
         source_url = str(body.get("source_url") or "").strip()
+        llm_mode_raw = str(body.get("llm_mode") or "").strip().lower()
+        llm_mode = "local" if llm_mode_raw == "" else llm_mode_raw
+        if llm_mode not in {"local", "external"}:
+            raise HTTPException(status_code=400, detail="invalid_llm_mode")
         if not source_url:
             source_url = get_source_url(proj) or ""
 
@@ -5762,12 +5792,17 @@ def create_app(
                 smooth_s = float(ctx.profile.get("analysis", {}).get("highlights", {}).get("chat_smooth_seconds", 3.0))
                 
                 # Get LLM config for laugh emote learning (with auto-start)
-                ai_cfg = ctx.profile.get("ai", {}).get("director", {})
-                
-                def on_server_status(msg: str) -> None:
-                    JOB_MANAGER._set(job, message=msg)
-                
-                llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir, on_status=on_server_status)
+                llm_complete_fn = None
+                if llm_mode == "external":
+                    JOB_MANAGER._set(job, message="External mode enabled; skipping local-LLM emote learning")
+                else:
+                    # Local LLM config for laugh emote learning (with auto-start)
+                    ai_cfg = ctx.profile.get("ai", {}).get("director", {})
+
+                    def on_server_status(msg: str) -> None:
+                        JOB_MANAGER._set(job, message=msg)
+
+                    llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir, on_status=on_server_status)
 
                 def on_feature_progress(frac: float) -> None:
                     JOB_MANAGER._set(job, progress=0.7 + 0.25 * frac)
@@ -5823,13 +5858,28 @@ def create_app(
                             "include_audio_events": bool(analysis_cfg.get("audio_events", {}).get("enabled", True)),
                         }
 
+                        if llm_mode == "external":
+                            highlights_cfg = dict(dag_config.get("highlights", {}) or {})
+                            highlights_cfg["llm_semantic_enabled"] = False
+                            highlights_cfg["llm_filter_enabled"] = False
+                            dag_config["highlights"] = highlights_cfg
+
+                            chapters_cfg = dict(dag_config.get("chapters", {}) or {})
+                            chapters_cfg["llm_labeling"] = False
+                            dag_config["chapters"] = chapters_cfg
+
+                            director_cfg = dict(dag_config.get("director", {}) or {})
+                            director_cfg["enabled"] = False
+                            dag_config["director"] = director_cfg
+
                         llm_complete_fn = None
-                        try:
-                            ai_cfg = ctx.profile.get("ai", {}).get("director", {}) or {}
-                            if ai_cfg.get("enabled", True):
-                                llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
-                        except Exception:
-                            llm_complete_fn = None
+                        if llm_mode != "external":
+                            try:
+                                ai_cfg = ctx.profile.get("ai", {}).get("director", {}) or {}
+                                if ai_cfg.get("enabled", True):
+                                    llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
+                            except Exception:
+                                llm_complete_fn = None
 
                         def on_upgrade_progress(frac: float, msg: str) -> None:
                             if upgrade_job.cancel_requested:
@@ -5840,7 +5890,9 @@ def create_app(
                             targets = {"chat_sync", "highlights_candidates"}
                             # Only run packaging tasks if transcript exists (avoids surprising long Whisper runs).
                             if proj.transcript_path.exists():
-                                targets.update({"variants", "director"})
+                                targets.update({"variants"})
+                                if llm_mode != "external":
+                                    targets.update({"director"})
 
                             dag_result = run_analysis(
                                 proj,

@@ -10,6 +10,48 @@ let calibrating = false;
 let isStudioMode = false;
 let currentTab = 'edit';
 
+// =========================================================================
+// LLM MODE (Local vs External "ChatGPT Actions")
+// =========================================================================
+
+const VP_LLM_MODE_KEY = 'vp_llm_mode';
+
+function normalizeLlmMode(mode) {
+  const m = String(mode || '').trim().toLowerCase();
+  return (m === 'local' || m === 'external') ? m : 'external';
+}
+
+function getLlmMode() {
+  try {
+    const raw = localStorage.getItem(VP_LLM_MODE_KEY);
+    if (raw && raw.trim()) return normalizeLlmMode(raw);
+  } catch {}
+  // Default to external unless user explicitly chose local.
+  return 'external';
+}
+
+function setLlmMode(mode) {
+  const m = normalizeLlmMode(mode);
+  try {
+    localStorage.setItem(VP_LLM_MODE_KEY, m);
+  } catch {}
+  applyLlmModeUiState();
+}
+
+function applyLlmModeUiState() {
+  const sel = $('#llmMode');
+  if (sel) sel.value = getLlmMode();
+}
+
+function initLlmModeUi() {
+  const sel = $('#llmMode');
+  if (!sel) return;
+  applyLlmModeUiState();
+  sel.addEventListener('change', () => {
+    setLlmMode(sel.value);
+  });
+}
+
 function readOptionalIntInput(el, { min = 1 } = {}) {
   if (!el) return null;
   const raw = String(el.value ?? '').trim();
@@ -616,6 +658,13 @@ function wireActionsHelperUI() {
   if (btnRefresh) {
     btnRefresh.onclick = refreshActionsHelper;
   }
+}
+
+function openActionsHelperModal() {
+  const modal = $('#actionsHelperModal');
+  if (!modal) return;
+  modal.style.display = 'flex';
+  refreshActionsHelper().catch(() => {});
 }
 
 // =========================================================================
@@ -1225,6 +1274,7 @@ async function startUrlDownload(url) {
     const res = await apiJson('POST', '/api/ingest/url', {
       url,
       options,
+      llm_mode: getLlmMode(),
       auto_open: true,
     });
 
@@ -2259,7 +2309,7 @@ function renderPipelineStatus() {
   const hasHighlights = highlights?.candidates?.length > 0;
   const llmScoringUsed = highlights?.signals_used?.llm_semantic;
   const llmFilterUsed = highlights?.signals_used?.llm_filter;
-  const showAISection = hasHighlights && (!llmScoringUsed || !llmFilterUsed);
+  const showAISection = hasHighlights && getLlmMode() !== 'external' && (!llmScoringUsed || !llmFilterUsed);
   
   if (showAISection) {
     html += `
@@ -2520,7 +2570,7 @@ async function showTaskDetailsModal(taskId) {
     }
     
     // Add "Apply LLM Scoring" button for highlights task when llm_semantic is not true
-    const showLlmScoringBtn = taskId === 'highlights' && 
+    const showLlmScoringBtn = getLlmMode() !== 'external' && taskId === 'highlights' && 
       data.summary?.signals_used && 
       !data.summary.signals_used.llm_semantic;
     
@@ -2541,7 +2591,7 @@ async function showTaskDetailsModal(taskId) {
     }
     
     // Add "Apply LLM Filter" button when llm_filter is not true (more aggressive than scoring)
-    const showLlmFilterBtn = taskId === 'highlights' && 
+    const showLlmFilterBtn = getLlmMode() !== 'external' && taskId === 'highlights' && 
       data.summary?.signals_used && 
       !data.summary.signals_used.llm_filter;
     
@@ -4227,13 +4277,21 @@ function setupFacecamCanvas() {
 }
 
 async function startAnalyzeJob() {
-  $('#analysisStatus').textContent = 'Starting analysis...';
+  const llmMode = getLlmMode();
+  $('#analysisStatus').textContent = llmMode === 'external' ? 'Starting analysis (external brain)...' : 'Starting analysis...';
   const contentType = $('#contentType')?.value || 'gaming';
-  const res = await apiJson('POST', '/api/analyze/highlights', {
+  const body = {
     highlights: {
       content_type: contentType
     }
-  });
+  };
+  if (llmMode === 'external') {
+    // Ensure we don't attempt any local LLM calls in this run.
+    body.highlights.llm_semantic_enabled = false;
+    body.highlights.llm_filter_enabled = false;
+    body.ai = { enabled: false };
+  }
+  const res = await apiJson('POST', '/api/analyze/highlights', body);
   const jobId = res.job_id;
   watchJob(jobId);
   $('#analysisStatus').textContent = `Analysis running (job ${jobId.slice(0,8)})...`;
@@ -4256,7 +4314,8 @@ async function startAnalyzeAudioEventsJob() {
 }
 
 async function startAnalyzeFullJob() {
-  $('#analysisStatus').textContent = 'Starting full parallel analysis (DAG)...';
+  const llmMode = getLlmMode();
+  $('#analysisStatus').textContent = llmMode === 'external' ? 'Starting full analysis (external brain)...' : 'Starting full parallel analysis (DAG)...';
   const motionMode = $('#motionWeightMode')?.value || 'low';
   const contentType = $('#contentType')?.value || 'gaming';
   const whisperBackend = $('#whisperBackend')?.value || 'auto';
@@ -4276,7 +4335,7 @@ async function startAnalyzeFullJob() {
     if (diarizeMinSpeakers != null) speechCfg.diarize_min_speakers = diarizeMinSpeakers;
     if (diarizeMaxSpeakers != null) speechCfg.diarize_max_speakers = diarizeMaxSpeakers;
   }
-  const res = await apiJson('POST', '/api/analyze/full', {
+  const body = {
     highlights: {
       motion_weight_mode: motionMode,
       content_type: contentType
@@ -4285,7 +4344,17 @@ async function startAnalyzeFullJob() {
     debug: {
       trace_tf_imports: traceTfImports
     }
-  });
+  };
+  if (llmMode === 'external') {
+    // External mode means: local compute runs, but we intentionally avoid local-LLM steps.
+    // ChatGPT (via Actions) can later fetch bounded inputs and write decisions back.
+    body.highlights.llm_semantic_enabled = false;
+    body.highlights.llm_filter_enabled = false;
+    body.include_director = false;
+    body.ai = { enabled: false };
+    body.context = { chapters: { llm_labeling: false } };
+  }
+  const res = await apiJson('POST', '/api/analyze/full', body);
   const jobId = res.job_id;
   watchJob(jobId);
   $('#analysisStatus').textContent = `Full analysis running (job ${jobId.slice(0,8)})...`;
@@ -4318,6 +4387,13 @@ async function startAnalyzeSpeechJob() {
 }
 
 async function startAnalyzeContextJob() {
+  const llmMode = getLlmMode();
+  if (llmMode === 'external') {
+    $('#analysisStatus').textContent = 'External mode: use ChatGPT Actions for packaging/picks.';
+    alert('External mode is enabled.\n\nUse ChatGPT (via Actions) to do packaging/picks:\n- GET /api/actions/ai/candidates\n- GET /api/actions/ai/variants\n- POST /api/actions/ai/apply_director_picks\n- POST /api/actions/export_director_picks\n\nTip: open the Actions Helper to copy the OpenAPI import URL.');
+    openActionsHelperModal();
+    return;
+  }
   $('#analysisStatus').textContent = 'Starting context + titles analysis (AI)...';
   const traceTfImports = $('#traceTfImports')?.checked || false;
   const res = await apiJson('POST', '/api/analyze/context_titles', {
@@ -5284,7 +5360,7 @@ async function downloadChat() {
   }
 
   try {
-    const res = await apiJson('POST', '/api/chat/download', { source_url: sourceUrl });
+    const res = await apiJson('POST', '/api/chat/download', { source_url: sourceUrl, llm_mode: getLlmMode() });
     watchJob(res.job_id);
     $('#chatStatus').textContent = 'Downloading chat...';
   } catch (e) {
@@ -6069,6 +6145,10 @@ function wireRelearnButton() {
   if (!btn) return;
   
   btn.onclick = async () => {
+    if (getLlmMode() === 'external') {
+      alert('External mode is enabled.\n\nLocal chat emote learning is disabled in this mode. Switch Brain to "Local LLM" to use Re-learn.');
+      return;
+    }
     if (!confirm('This will clear the cached emote data and require re-analysis with Analyze (Full) to learn channel-specific emotes using AI.\n\nContinue?')) {
       return;
     }
@@ -6166,6 +6246,7 @@ function wireChatUI() {
 
 async function main() {
   initApiTokenUi();
+  initLlmModeUi();
   try {
     profile = await apiGet('/api/profile');
   } catch (_) {}

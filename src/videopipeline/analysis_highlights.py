@@ -2370,7 +2370,7 @@ def _merge_candidate_extras(
     *,
     peak_tol_s: float = 1.0,
     iou_tol: float = 0.55,
-    preserve_keys: Iterable[str] = ("ai", "hook_text", "quote_text"),
+    preserve_keys: Iterable[str] = ("candidate_id", "ai", "hook_text", "quote_text"),
 ) -> List[Dict[str, Any]]:
     """Best-effort preserve non-score metadata across re-shaping.
 
@@ -2805,6 +2805,16 @@ def compute_highlights_candidates(
         prev_candidates = prev_highlights.get("candidates", []) or []
 
         merged_candidates = _merge_candidate_extras(list(payload.get("candidates", []) or []), list(prev_candidates))
+
+        # Ensure stable IDs for LLM/application layers (Actions) even if ranks reorder.
+        import uuid
+
+        for c in merged_candidates:
+            if not isinstance(c, dict):
+                continue
+            cid = str(c.get("candidate_id") or "").strip()
+            if not cid:
+                c["candidate_id"] = uuid.uuid4().hex
         payload["candidates"] = merged_candidates
 
         highlights_out: Dict[str, Any] = {

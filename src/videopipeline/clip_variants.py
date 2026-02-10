@@ -159,10 +159,12 @@ class CandidateVariants:
     candidate_rank: int
     candidate_peak_time_s: float
     variants: List[ClipVariant]
+    candidate_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "candidate_rank": self.candidate_rank,
+            "candidate_id": self.candidate_id,
             "candidate_peak_time_s": round(self.candidate_peak_time_s, 2),
             "variants": [v.to_dict() for v in self.variants],
         }
@@ -171,6 +173,7 @@ class CandidateVariants:
     def from_dict(cls, d: Dict[str, Any]) -> "CandidateVariants":
         return cls(
             candidate_rank=int(d["candidate_rank"]),
+            candidate_id=str(d.get("candidate_id", "")),
             candidate_peak_time_s=float(d["candidate_peak_time_s"]),
             variants=[ClipVariant.from_dict(v) for v in d.get("variants", [])],
         )
@@ -862,6 +865,7 @@ def generate_variants_for_candidate(
 
     return CandidateVariants(
         candidate_rank=rank,
+        candidate_id=str(candidate.get("candidate_id") or ""),
         candidate_peak_time_s=peak_time_s,
         variants=variants,
     )

@@ -71,7 +71,7 @@ def build_metadata(
         hook = ai_metadata.get("hook")
         title = ai_metadata.get("title")
         caption = ai_metadata.get("description")
-        ai_tags = ai_metadata.get("tags") or []
+        ai_tags = ai_metadata.get("tags") or ai_metadata.get("hashtags") or []
         if ai_tags:
             hashtags = [f"#{t}" if not t.startswith("#") else t for t in ai_tags]
     
@@ -114,7 +114,7 @@ def build_metadata(
         payload["ai_generated"] = {
             "title": ai_metadata.get("title"),
             "description": ai_metadata.get("description"),
-            "tags": ai_metadata.get("tags"),
+            "tags": ai_metadata.get("tags") or ai_metadata.get("hashtags"),
             "hook": ai_metadata.get("hook"),
         }
     return payload
