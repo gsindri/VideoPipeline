@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import ipaddress
 import json
+import os
+import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
+from urllib.parse import urlsplit
 
 import numpy as np
 from fastapi import Body, FastAPI, HTTPException, Request
@@ -95,6 +100,89 @@ class StudioContext:
         return self._project
 
 
+_CF_QUICK_TUNNEL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.IGNORECASE)
+
+
+def _request_base_url(request: Request) -> str:
+    """Best-effort external base URL (respects common proxy headers)."""
+    xf_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+    xf_host = (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
+    host = (xf_host or request.headers.get("host") or request.url.netloc or "").strip()
+    scheme = (xf_proto or request.url.scheme or "http").strip()
+    if host:
+        return f"{scheme}://{host}".rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+
+def _is_local_host(hostname: str) -> bool:
+    h = (hostname or "").strip().lower()
+    if not h:
+        return True
+    if h in {"localhost", "0.0.0.0"}:
+        return True
+    if h.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    return bool(ip.is_loopback or ip.is_private or ip.is_link_local)
+
+
+def _detect_cloudflared_quick_tunnel_base_url() -> Optional[str]:
+    """Scan recent cloudflared Quick Tunnel logs for the trycloudflare URL."""
+    try:
+        temp_dir = Path(tempfile.gettempdir())
+    except Exception:
+        return None
+
+    items: list[tuple[float, Path]] = []
+    for p in temp_dir.glob("vp_cloudflared_quick_tunnel_*.log"):
+        try:
+            items.append((p.stat().st_mtime, p))
+        except Exception:
+            continue
+    candidates = [p for _, p in sorted(items, key=lambda t: t[0], reverse=True)]
+
+    for path in candidates[:10]:
+        try:
+            with path.open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 16_384), os.SEEK_SET)
+                tail = f.read().decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+
+        m = _CF_QUICK_TUNNEL_RE.search(tail)
+        if m:
+            return m.group(0).rstrip("/")
+
+    return None
+
+
+def _detect_public_base_url(request_base_url: str) -> tuple[Optional[str], str]:
+    """Return (public_base_url, source)."""
+    base = (request_base_url or "").strip().rstrip("/")
+    try:
+        host = (urlsplit(base).hostname or "").strip()
+    except Exception:
+        host = ""
+
+    if base and host and (not _is_local_host(host)):
+        return base, "request"
+
+    env_base = (os.environ.get("VP_PUBLIC_BASE_URL") or os.environ.get("VP_TUNNEL_BASE_URL") or "").strip()
+    if env_base:
+        return env_base.rstrip("/"), "env"
+
+    cf = _detect_cloudflared_quick_tunnel_base_url()
+    if cf:
+        return cf, "cloudflared_log"
+
+    return None, "none"
+
+
 def create_app(
     *,
     video_path: Optional[Path] = None,
@@ -104,6 +192,24 @@ def create_app(
     setup_logging()
 
     ctx = StudioContext(video_path=video_path, profile_path=profile_path)
+
+    # Best-effort recovery: mark stale interrupted downloads as failed so they
+    # don't show up as confusing "orphaned" folders in the UI.
+    try:
+        import logging as _logging
+
+        from ..project import recover_stale_downloads
+
+        try:
+            stale_after_s = float(os.getenv("VP_STALE_DOWNLOAD_S", str(6 * 3600)))
+        except Exception:
+            stale_after_s = float(6 * 3600)
+
+        recovered = recover_stale_downloads(stale_after_s=stale_after_s, move_staging_to_trash=True)
+        if recovered:
+            _logging.getLogger("videopipeline.studio").info("Recovered %d stale download project(s)", recovered)
+    except Exception:
+        pass
 
     app = FastAPI(title="VideoPipeline Studio")
     account_store = AccountStore()
@@ -248,6 +354,40 @@ def create_app(
                 "gpu_available": backends.get("openai_whisper_gpu") or backends.get("faster_whisper_gpu") or backends.get("whispercpp_gpu"),
             },
         })
+
+    @app.get("/api/system/actions_helper")
+    def api_system_actions_helper(request: Request) -> JSONResponse:
+        """Expose the current tunnel URL + Actions OpenAPI import URL for the Studio UI."""
+        request_base = _request_base_url(request)
+        tunnel_base, source = _detect_public_base_url(request_base)
+
+        openapi_path = "/api/actions/openapi.json"
+        token_required = bool(api_token)
+
+        import_url: Optional[str] = None
+        import_url_masked: Optional[str] = None
+        if tunnel_base:
+            if token_required:
+                import_url = f"{tunnel_base}{openapi_path}?token={api_token}"
+                if len(api_token) >= 8:
+                    mask = f"{api_token[:4]}...{api_token[-4:]}"
+                else:
+                    mask = "***"
+                import_url_masked = f"{tunnel_base}{openapi_path}?token={mask}"
+            else:
+                import_url = f"{tunnel_base}{openapi_path}"
+                import_url_masked = import_url
+
+        return JSONResponse(
+            {
+                "request_base_url": request_base,
+                "tunnel_base_url": tunnel_base,
+                "tunnel_base_source": source,
+                "openapi_import_url": import_url,
+                "openapi_import_url_masked": import_url_masked,
+                "api_token_required": token_required,
+            }
+        )
 
     @app.get("/api/system/gpu")
     def api_system_gpu() -> JSONResponse:
@@ -1138,11 +1278,12 @@ def create_app(
         })
 
     @app.get("/api/home/videos")
-    def api_home_videos() -> JSONResponse:
+    def api_home_videos(include_incomplete: bool = False) -> JSONResponse:
         """Unified list of all videos (projects + downloads merged).
         
         Returns videos sorted by most recently modified, with project status.
         Includes videos from both downloads folder AND project folders.
+        By default, hides incomplete/failed projects to keep the Home list tidy.
         
         De-duplication: If a video in downloads has a project, we only show the
         project entry (not the download entry separately) to avoid confusion.
@@ -1199,7 +1340,14 @@ def create_app(
                                     pass
                             
                             video_info = proj_data.get("video", {})
-                            source_url = proj_data.get("source_url", "")
+                            source_url = proj_data.get("source_url", "") or (proj_data.get("source", {}) or {}).get("source_url", "")
+                            status = str(proj_data.get("status") or video_info.get("status") or "ready")
+                            status_error = proj_data.get("status_error")
+                            video_status = str(video_info.get("status") or "ready")
+                            video_error = video_info.get("error")
+
+                            if not include_incomplete and status.lower() in {"download_failed", "analysis_failed"}:
+                                continue
                             
                             # Track URL to avoid duplicate from downloads
                             if source_url:
@@ -1220,6 +1368,10 @@ def create_app(
                                 "selections_count": len(proj_data.get("selections", [])),
                                 "exports_count": len(proj_data.get("exports", [])),
                                 "favorite": proj_data.get("favorite", False),
+                                "status": status,
+                                "status_error": status_error,
+                                "video_status": video_status,
+                                "video_error": video_error,
                             })
                         except Exception:
                             continue
@@ -1274,64 +1426,77 @@ def create_app(
                     except Exception:
                         continue
         
-        # Also list orphaned projects (projects without video files)
-        # These are incomplete/failed downloads that left analysis artifacts
-        seen_project_ids = {v.get("project_id") for v in videos if v.get("project_id")}
-        if projects_root.exists():
-            for proj_dir in projects_root.iterdir():
-                if not proj_dir.is_dir():
-                    continue
-                if proj_dir.name in seen_project_ids:
-                    continue  # Already listed via video
-                
-                # Check if this project has any content worth showing
-                project_json = proj_dir / "project.json"
-                analysis_dir = proj_dir / "analysis"
-                if not project_json.exists() and not analysis_dir.exists():
-                    continue  # Empty project folder, skip
-                
-                try:
-                    proj_data = {}
-                    if project_json.exists():
-                        try:
-                            proj_data = json.loads(project_json.read_text(encoding="utf-8"))
-                        except Exception:
-                            pass
-                    
-                    video_info = proj_data.get("video", {})
-                    
-                    # Get mtime from project.json or analysis folder
-                    mtime = 0
-                    if project_json.exists():
-                        mtime = project_json.stat().st_mtime
-                    elif analysis_dir.exists():
-                        mtime = analysis_dir.stat().st_mtime
-                    
-                    # Count analysis files
-                    analysis_count = 0
-                    if analysis_dir.exists():
-                        analysis_count = len(list(analysis_dir.glob("*")))
-                    
-                    videos.append({
-                        "path": None,  # No video file
-                        "filename": f"[Orphaned Project]",
-                        "title": proj_data.get("title", video_info.get("title", f"Project {proj_dir.name[:12]}...")),
-                        "size_bytes": 0,
-                        "mtime": mtime,
-                        "duration_seconds": video_info.get("duration_seconds", 0),
-                        "url": proj_data.get("source_url", ""),
-                        "extractor": proj_data.get("extractor", ""),
-                        # Project info
-                        "has_project": True,
-                        "project_id": proj_dir.name,
-                        "selections_count": len(proj_data.get("selections", [])),
-                        "exports_count": len(proj_data.get("exports", [])),
-                        "favorite": proj_data.get("favorite", False),
-                        "orphaned": True,  # Flag for UI
-                        "analysis_count": analysis_count,
-                    })
-                except Exception:
-                    continue
+        # Optionally list incomplete/failed projects (projects without video files).
+        # These are typically interrupted downloads or missing-media projects.
+        if include_incomplete:
+            seen_project_ids = {v.get("project_id") for v in videos if v.get("project_id")}
+            if projects_root.exists():
+                for proj_dir in projects_root.iterdir():
+                    if not proj_dir.is_dir():
+                        continue
+                    if proj_dir.name in seen_project_ids:
+                        continue  # Already listed via video
+
+                    # Check if this project has any content worth showing
+                    project_json = proj_dir / "project.json"
+                    analysis_dir = proj_dir / "analysis"
+                    if not project_json.exists() and not analysis_dir.exists():
+                        continue  # Empty project folder, skip
+
+                    # Skip if it actually has a video file (should have been listed already).
+                    if (proj_dir / "video" / "video.mp4").exists():
+                        continue
+
+                    try:
+                        proj_data = {}
+                        if project_json.exists():
+                            try:
+                                proj_data = json.loads(project_json.read_text(encoding="utf-8"))
+                            except Exception:
+                                pass
+
+                        video_info = proj_data.get("video", {}) or {}
+                        status = str(proj_data.get("status") or video_info.get("status") or "download_failed")
+                        status_error = proj_data.get("status_error") or video_info.get("error")
+                        video_status = str(video_info.get("status") or status)
+                        video_error = video_info.get("error") or status_error
+
+                        # Get mtime from project.json or analysis folder
+                        mtime = 0
+                        if project_json.exists():
+                            mtime = project_json.stat().st_mtime
+                        elif analysis_dir.exists():
+                            mtime = analysis_dir.stat().st_mtime
+
+                        # Count analysis files
+                        analysis_count = 0
+                        if analysis_dir.exists():
+                            analysis_count = len(list(analysis_dir.glob("*")))
+
+                        videos.append({
+                            "path": None,  # No video file
+                            "filename": "[Incomplete Project]",
+                            "title": proj_data.get("title", video_info.get("title", f"Project {proj_dir.name[:12]}...")),
+                            "size_bytes": 0,
+                            "mtime": mtime,
+                            "duration_seconds": video_info.get("duration_seconds", 0),
+                            "url": proj_data.get("source_url", "") or (proj_data.get("source", {}) or {}).get("source_url", ""),
+                            "extractor": proj_data.get("extractor", ""),
+                            # Project info
+                            "has_project": True,
+                            "project_id": proj_dir.name,
+                            "selections_count": len(proj_data.get("selections", [])),
+                            "exports_count": len(proj_data.get("exports", [])),
+                            "favorite": proj_data.get("favorite", False),
+                            "orphaned": True,  # Back-compat flag: missing media.
+                            "analysis_count": analysis_count,
+                            "status": status,
+                            "status_error": status_error,
+                            "video_status": video_status,
+                            "video_error": video_error,
+                        })
+                    except Exception:
+                        continue
         
         # Sort by mtime descending
         videos.sort(key=lambda v: v["mtime"], reverse=True)
@@ -2893,13 +3058,56 @@ def create_app(
             except CancelledError:
                 # Job was cancelled via callback - clean up
                 log.info("[DOWNLOAD] Job cancelled by user")
+                if early_proj is not None:
+                    try:
+                        from ..project import set_project_status
+
+                        if not (early_proj.video_dir / "video.mp4").exists():
+                            set_project_status(
+                                early_proj,
+                                status="download_failed",
+                                status_error="cancelled",
+                                video_status="download_failed",
+                                video_error="cancelled",
+                            )
+                    except Exception:
+                        pass
                 cleanup_downloads()
                 JOB_MANAGER._set(job, status="cancelled", message="Cancelled by user")
             except ImportError as e:
                 if not job.cancel_requested:
+                    if early_proj is not None:
+                        try:
+                            from ..project import set_project_status
+
+                            if not (early_proj.video_dir / "video.mp4").exists():
+                                set_project_status(
+                                    early_proj,
+                                    status="download_failed",
+                                    status_error=str(e),
+                                    video_status="download_failed",
+                                    video_error=str(e),
+                                )
+                        except Exception:
+                            pass
                     JOB_MANAGER._set(job, status="failed", message=str(e))
             except Exception as e:
                 if not job.cancel_requested:
+                    if early_proj is not None:
+                        try:
+                            from ..project import set_project_status
+
+                            if not (early_proj.video_dir / "video.mp4").exists():
+                                err = f"{type(e).__name__}: {e}"
+                                set_project_status(
+                                    early_proj,
+                                    status="download_failed",
+                                    status_error=err,
+                                    video_status="download_failed",
+                                    video_error=err,
+                                )
+                        except Exception:
+                            pass
                     JOB_MANAGER._set(job, status="failed", message=f"{type(e).__name__}: {e}")
             finally:
                 if release_verbose_logs is not None:
@@ -3837,6 +4045,12 @@ def create_app(
             log = logging.getLogger("videopipeline.studio")
 
             JOB_MANAGER._set(job, status="running", progress=0.0, message="Starting parallel analysis DAG...")
+            try:
+                from ..project import set_project_status
+
+                set_project_status(proj, status="analyzing", status_error=None)
+            except Exception:
+                pass
 
             release_import_trace: Optional[Callable[[], None]] = None
             if trace_tf_imports:
@@ -4632,6 +4846,13 @@ def create_app(
             }
 
             if errors:
+                try:
+                    from ..project import set_project_status
+
+                    # Partial success: surface this as analysis_failed so it shows under "Needs attention".
+                    set_project_status(proj, status="analysis_failed", status_error=f"{len(errors)} error(s)")
+                except Exception:
+                    pass
                 JOB_MANAGER._set(
                     job,
                     status="succeeded",  # Partial success
@@ -4640,6 +4861,12 @@ def create_app(
                     result=result,
                 )
             else:
+                try:
+                    from ..project import set_project_status
+
+                    set_project_status(proj, status="complete", status_error=None)
+                except Exception:
+                    pass
                 JOB_MANAGER._set(
                     job,
                     status="succeeded",

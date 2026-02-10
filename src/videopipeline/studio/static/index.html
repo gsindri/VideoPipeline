@@ -17,6 +17,7 @@
       <h1>VideoPipeline Studio</h1>
       <span class="muted">Home</span>
       <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+        <button data-action="actions-helper" title="Actions helper (tunnel URL + OpenAPI import URL)">⚡ Actions</button>
         <button data-action="api-token" title="Set API token (VP_API_TOKEN)">🔑 API Token</button>
       </div>
     </header>
@@ -85,6 +86,12 @@
 
         <div class="panel home-panel">
           <h2>Videos</h2>
+          <div class="row" style="margin-bottom:10px;gap:15px;align-items:center;flex-wrap:wrap">
+            <label class="small" title="Show failed/incomplete projects (e.g., interrupted downloads).">
+              <input type="checkbox" id="showNeedsAttention" />
+              Show needs attention
+            </label>
+          </div>
           <div id="videoSelectionToolbar" style="display:none;margin-bottom:10px;padding:8px;background:#1a1d24;border-radius:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
             <span id="videoSelectionCount" style="font-size:12px;color:#888">0 selected</span>
             <button id="btnSelectAll" class="small">Select All</button>
@@ -112,6 +119,7 @@
       <button id="btnBackToHome" style="margin-left:20px" title="Back to Home">← Home</button>
       <div style="margin-left:auto;display:flex;gap:10px;align-items:center">
         <button data-action="api-token" title="Set API token (VP_API_TOKEN)">🔑 Token</button>
+        <button data-action="actions-helper" title="Actions helper (tunnel URL + OpenAPI import URL)">⚡ Actions</button>
         <span class="muted">
           Shortcuts: <kbd>Space</kbd> play/pause, <kbd>I</kbd> set start, <kbd>O</kbd> set end, <kbd>[</kbd>/<kbd>]</kbd> nudge ±0.5s
         </span>
@@ -579,6 +587,43 @@
         </div>
       </section>
     </main>
+  </div>
+
+  <!-- Actions helper modal -->
+  <div id="actionsHelperModal" class="token-modal-overlay" style="display:none">
+    <div class="token-modal">
+      <h2>Actions helper</h2>
+      <div class="small" style="color:var(--muted);margin-bottom:12px">
+        Copy the current tunnel URL and the Actions OpenAPI import URL. Import URL is masked on screen, but copy uses the full token.
+      </div>
+
+      <div class="actions-helper">
+        <div class="actions-helper-row">
+          <div class="actions-helper-field">
+            <div class="small" style="margin-bottom:6px">Current tunnel URL</div>
+            <input type="text" id="actionsHelperTunnelUrl" class="actions-helper-input" readonly placeholder="Not detected yet" />
+          </div>
+          <button class="primary actions-helper-copy" id="btnCopyActionsTunnelUrl" disabled>Copy tunnel URL</button>
+        </div>
+
+        <div class="actions-helper-row">
+          <div class="actions-helper-field">
+            <div class="small" style="margin-bottom:6px">Current OpenAPI import URL</div>
+            <input type="text" id="actionsHelperImportUrl" class="actions-helper-input" readonly placeholder="Run tools\\studio-quick-tunnel.bat first" />
+          </div>
+          <button class="primary actions-helper-copy" id="btnCopyActionsImportUrl" disabled>Copy import URL</button>
+        </div>
+
+        <div class="row" style="gap:10px;align-items:center">
+          <button id="btnRefreshActionsHelper" title="Re-detect tunnel URL">↻ Refresh</button>
+          <span class="small" id="actionsHelperStatus">Tip: run <code>tools\\studio-quick-tunnel.bat</code> to start the tunnel and copy the import URL.</span>
+        </div>
+      </div>
+
+      <div class="row" style="justify-content:flex-end;gap:8px;margin-top:14px">
+        <button id="btnActionsHelperClose">Close</button>
+      </div>
+    </div>
   </div>
 
   <!-- API token prompt (shown automatically on 401 if VP_API_TOKEN is set) -->

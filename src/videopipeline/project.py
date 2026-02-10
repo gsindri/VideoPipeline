@@ -117,6 +117,14 @@ def save_json(path: Path, obj: Dict[str, Any]) -> None:
             pass
 
 
+def _strip_or_none(value: Any) -> Optional[str]:
+    try:
+        s = str(value).strip()
+    except Exception:
+        return None
+    return s or None
+
+
 def save_npz(path: Path, **arrays: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path, **arrays)
@@ -354,8 +362,13 @@ def create_or_load_project(video_path: Path, projects_root: Optional[Path] = Non
         initial = {
             "project_id": pdir.name,
             "created_at": utc_now_iso(),
+            "updated_at": utc_now_iso(),
+            "status": "ready",
+            "status_error": None,
             "video": {
                 "path": str(video_path),
+                "status": "ready",
+                "error": None,
                 "size_bytes": st.st_size,
                 "mtime_ns": getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)),
                 "duration_seconds": duration_s,
@@ -430,11 +443,15 @@ def create_project_early(
         initial = {
             "project_id": pdir.name,
             "created_at": utc_now_iso(),
+            "updated_at": utc_now_iso(),
+            "status": "downloading",
+            "status_error": None,
             "source_url": source_url,
             "video": {
                 "path": None,  # Not yet known
                 "preview_path": None,
                 "status": "downloading",
+                "error": None,
                 "duration_seconds": duration_seconds,
                 "early_audio_path": str(audio_path) if audio_path else None,
             },
@@ -448,11 +465,40 @@ def create_project_early(
     return proj
 
 
+def set_project_status(
+    proj: Project,
+    *,
+    status: str,
+    status_error: Optional[str] = None,
+    video_status: Optional[str] = None,
+    video_error: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Update the project's high-level state in project.json.
+
+    The Studio UI uses this to distinguish "failed/incomplete" projects from
+    valid ones without relying on folder existence.
+    """
+
+    def _upd(d: Dict[str, Any]) -> None:
+        d["status"] = str(status)
+        d["status_error"] = _strip_or_none(status_error)
+
+        if video_status is not None or video_error is not None:
+            d.setdefault("video", {})
+            if video_status is not None:
+                d["video"]["status"] = str(video_status)
+            if video_error is not None:
+                d["video"]["error"] = _strip_or_none(video_error)
+
+    return update_project(proj, _upd)
+
+
 def set_project_video(proj: Project, video_path: Path, *, preview_path: Optional[Path] = None) -> None:
     """Update a project with the final video path after download completes.
     
-    This copies (or symlinks on Unix) the video into the project's video/ directory
-    for self-contained storage.
+    Uses a staging + promote flow so the final project video path is only written
+    once the file is fully present (and best-effort validated). This avoids
+    "half-baked" final files if the process crashes mid-copy.
     
     Args:
         proj: Project to update
@@ -462,52 +508,82 @@ def set_project_video(proj: Project, video_path: Path, *, preview_path: Optional
     import shutil
     import os
     
-    video_path = Path(video_path).expanduser().resolve()
+    src_video = Path(video_path).expanduser().resolve()
+    src_preview = Path(preview_path).expanduser().resolve() if preview_path is not None else None
     
     # Create video directory in project
     video_dir = proj.video_dir
     video_dir.mkdir(parents=True, exist_ok=True)
+
+    staging_dir = proj.project_dir / "staging"
+    staging_dir.mkdir(parents=True, exist_ok=True)
     
     # Destination path - always use "video.mp4" for consistency
     dest_path = video_dir / "video.mp4"
-    
-    # Copy the video to the project directory if not already there
-    if not dest_path.exists() or not dest_path.samefile(video_path):
-        # On Windows, just copy; on Unix we could symlink
-        if os.name == "nt":
-            shutil.copy2(video_path, dest_path)
-        else:
-            # Try symlink first, fall back to copy
+
+    def _samefile(a: Path, b: Path) -> bool:
+        try:
+            if not a.exists() or not b.exists():
+                return False
+            return bool(a.samefile(b))
+        except Exception:
+            return False
+
+    def _retry_replace(src: Path, dst: Path) -> None:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            os.replace(src, dst)
+            return
+        for attempt in range(10):
             try:
-                if dest_path.exists():
-                    dest_path.unlink()
-                dest_path.symlink_to(video_path)
+                os.replace(src, dst)
+                return
+            except PermissionError:
+                if attempt < 9:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                raise
+
+    def _stage_and_promote(src: Path, dst: Path, staged: Path) -> None:
+        if _samefile(dst, src):
+            return
+
+        try:
+            if staged.exists() or staged.is_symlink():
+                staged.unlink()
+        except Exception:
+            pass
+
+        if os.name != "nt":
+            # Try symlink first for Unix-like systems, fall back to copy.
+            try:
+                staged.symlink_to(src)
             except OSError:
-                shutil.copy2(video_path, dest_path)
+                shutil.copy2(src, staged)
+        else:
+            shutil.copy2(src, staged)
+
+        # Basic validation: non-zero + ffprobe readable when available.
+        st = staged.stat()
+        if st.st_size <= 0:
+            raise RuntimeError(f"Staged file is empty: {staged}")
+        if shutil.which("ffprobe"):
+            try:
+                _ = ffprobe_duration_seconds(staged)
+            except Exception as e:
+                raise RuntimeError(f"Staged file failed validation: {staged} ({type(e).__name__}: {e})")
+
+        _retry_replace(staged, dst)
+
+    staged_video = staging_dir / "video.mp4.part"
+    _stage_and_promote(src_video, dest_path, staged_video)
 
     preview_dest: Optional[Path] = None
-    if preview_path is not None:
+    if src_preview is not None and src_preview.exists():
+        preview_dest = video_dir / "preview.mp4"
+        staged_preview = staging_dir / "preview.mp4.part"
         try:
-            pp = Path(preview_path).expanduser().resolve()
-            if pp.exists():
-                preview_dest = video_dir / "preview.mp4"
-                # Copy the preview to the project directory if not already there
-                same = False
-                try:
-                    if preview_dest.exists():
-                        same = preview_dest.samefile(pp)
-                except Exception:
-                    same = False
-                if not preview_dest.exists() or not same:
-                    if os.name == "nt":
-                        shutil.copy2(pp, preview_dest)
-                    else:
-                        try:
-                            if preview_dest.exists():
-                                preview_dest.unlink()
-                            preview_dest.symlink_to(pp)
-                        except OSError:
-                            shutil.copy2(pp, preview_dest)
+            _stage_and_promote(src_preview, preview_dest, staged_preview)
         except Exception:
             preview_dest = None
     
@@ -523,16 +599,126 @@ def set_project_video(proj: Project, video_path: Path, *, preview_path: Optional
     st = dest_path.stat()
     
     def _upd(d: Dict[str, Any]) -> None:
+        d["status"] = "ready"
+        d["status_error"] = None
         d["video"] = {
             "path": str(dest_path),
             "preview_path": str(preview_dest) if preview_dest and preview_dest.exists() else None,
             "status": "ready",
+            "error": None,
             "size_bytes": st.st_size,
             "mtime_ns": getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)),
             "duration_seconds": duration_s or d.get("video", {}).get("duration_seconds"),
         }
     
     update_project(proj, _upd)
+
+
+def recover_stale_downloads(
+    projects_root: Optional[Path] = None,
+    *,
+    stale_after_s: float = 6 * 3600,
+    move_staging_to_trash: bool = True,
+) -> int:
+    """Mark stale in-progress ingests as failed (local-only hygiene).
+
+    This prevents interrupted downloads from showing up as mysterious "orphaned"
+    folders by flipping old `status=downloading` projects to `download_failed`.
+
+    Returns:
+        Number of projects updated.
+    """
+    projects_root = projects_root or default_projects_root()
+    if not projects_root.exists():
+        return 0
+
+    now = time.time()
+    updated = 0
+    trash_root = get_outputs_dir() / "trash" if move_staging_to_trash else None
+
+    for proj_dir in projects_root.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        project_json = proj_dir / "project.json"
+        if not project_json.exists():
+            continue
+
+        try:
+            data = load_json(project_json)
+        except Exception:
+            continue
+
+        video_info = data.get("video", {})
+        if not isinstance(video_info, dict):
+            video_info = {}
+
+        status_raw = data.get("status") or video_info.get("status") or ""
+        status = str(status_raw).strip().lower()
+
+        # Detect whether the project has a finalized video file.
+        final_video = proj_dir / "video" / "video.mp4"
+        has_video = bool(final_video.exists())
+        if not has_video:
+            video_path_raw = video_info.get("path")
+            try:
+                if video_path_raw and Path(str(video_path_raw)).expanduser().exists():
+                    has_video = True
+            except Exception:
+                has_video = False
+
+        if has_video:
+            # Reconcile old/partial state to ready when media is present.
+            if status in {"", "created", "downloading"}:
+                try:
+                    proj = Project(project_dir=proj_dir, video_path=final_video if final_video.exists() else Path(video_info.get("path") or ""))
+                    set_project_status(proj, status="ready", status_error=None, video_status="ready", video_error=None)
+                    updated += 1
+                except Exception:
+                    pass
+            continue
+
+        # No video present: only mark stale in-progress projects.
+        try:
+            age_s = now - project_json.stat().st_mtime
+        except Exception:
+            age_s = 0.0
+        if age_s < float(stale_after_s):
+            continue
+
+        if status in {"download_failed", "analysis_failed"}:
+            continue
+        if status not in {"", "created", "downloading"}:
+            continue
+
+        try:
+            proj = Project(project_dir=proj_dir, video_path=proj_dir / "video_pending")
+            set_project_status(
+                proj,
+                status="download_failed",
+                status_error="Interrupted/stale download",
+                video_status="download_failed",
+                video_error="Interrupted/stale download",
+            )
+            updated += 1
+        except Exception:
+            pass
+
+        # Optional: move leftover staging artifacts to a Trash folder.
+        if trash_root is not None:
+            staging_dir = proj_dir / "staging"
+            if staging_dir.exists():
+                try:
+                    for f in staging_dir.glob("*.part"):
+                        dest = trash_root / proj_dir.name / "staging" / f.name
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        try:
+                            os.replace(str(f), str(dest))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+    return updated
 
 
 @contextmanager
@@ -625,6 +811,7 @@ def update_project(proj: Project, updater) -> Dict[str, Any]:
     with _file_lock(lock_file):  # Use defaults: timeout_s=10, stale_s=5
         data = load_json(proj.project_json_path)
         updater(data)
+        data["updated_at"] = utc_now_iso()
         save_json(proj.project_json_path, data)
         return data
 

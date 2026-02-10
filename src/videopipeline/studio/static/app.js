@@ -484,6 +484,141 @@ async function apiFetch(path, options = {}, { retry401 = true } = {}) {
 }
 
 // =========================================================================
+// ACTIONS HELPER (Quick Tunnel + Actions OpenAPI import URL)
+// =========================================================================
+
+let actionsHelperTunnelUrl = '';
+let actionsHelperImportUrl = '';
+
+async function copyTextToClipboard(text) {
+  const t = String(text || '');
+  if (!t) return false;
+  try {
+    await navigator.clipboard.writeText(t);
+    return true;
+  } catch (_) {
+    // Fallback for older/locked-down contexts.
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = t;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      ta.style.top = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
+async function refreshActionsHelper() {
+  const tunnelEl = $('#actionsHelperTunnelUrl');
+  const importEl = $('#actionsHelperImportUrl');
+  const statusEl = $('#actionsHelperStatus');
+  const btnCopyTunnel = $('#btnCopyActionsTunnelUrl');
+  const btnCopyImport = $('#btnCopyActionsImportUrl');
+  const btnRefresh = $('#btnRefreshActionsHelper');
+
+  if (!tunnelEl || !importEl || !statusEl || !btnCopyTunnel || !btnCopyImport) return;
+
+  if (btnRefresh) btnRefresh.disabled = true;
+  statusEl.textContent = 'Detecting tunnel URL...';
+
+  try {
+    const info = await apiGet('/api/system/actions_helper');
+    actionsHelperTunnelUrl = info.tunnel_base_url || '';
+    actionsHelperImportUrl = info.openapi_import_url || '';
+
+    tunnelEl.value = actionsHelperTunnelUrl || '';
+    importEl.value = info.openapi_import_url_masked || actionsHelperImportUrl || '';
+
+    btnCopyTunnel.disabled = !actionsHelperTunnelUrl;
+    btnCopyImport.disabled = !actionsHelperImportUrl;
+
+    if (!actionsHelperTunnelUrl) {
+      statusEl.innerHTML = 'Tunnel URL not detected. Run <code>tools\\\\studio-quick-tunnel.bat</code> and refresh.';
+    } else if (info.tunnel_base_source === 'cloudflared_log') {
+      statusEl.textContent = 'Tunnel URL detected from the latest Cloudflare Quick Tunnel log.';
+    } else if (info.tunnel_base_source === 'env') {
+      statusEl.textContent = 'Tunnel URL loaded from VP_PUBLIC_BASE_URL / VP_TUNNEL_BASE_URL.';
+    } else {
+      statusEl.textContent = 'Tunnel URL detected from the current request origin.';
+    }
+  } catch (e) {
+    actionsHelperTunnelUrl = '';
+    actionsHelperImportUrl = '';
+    tunnelEl.value = '';
+    importEl.value = '';
+    btnCopyTunnel.disabled = true;
+    btnCopyImport.disabled = true;
+    statusEl.textContent = `Failed to load Actions helper info: ${e.message}`;
+  } finally {
+    if (btnRefresh) btnRefresh.disabled = false;
+  }
+}
+
+function wireActionsHelperUI() {
+  const modal = $('#actionsHelperModal');
+  const btnClose = $('#btnActionsHelperClose');
+  const btnCopyTunnel = $('#btnCopyActionsTunnelUrl');
+  const btnCopyImport = $('#btnCopyActionsImportUrl');
+  const btnRefresh = $('#btnRefreshActionsHelper');
+
+  document.querySelectorAll('[data-action="actions-helper"]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      if (!modal) return;
+      modal.style.display = 'flex';
+      await refreshActionsHelper();
+    });
+  });
+
+  const close = () => {
+    if (modal) modal.style.display = 'none';
+  };
+
+  if (btnClose) btnClose.onclick = close;
+
+  if (modal) {
+    modal.onclick = (e) => {
+      if (e.target === modal) close();
+    };
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && modal.style.display !== 'none') close();
+    });
+  }
+
+  if (btnCopyTunnel) {
+    btnCopyTunnel.onclick = async () => {
+      const ok = await copyTextToClipboard(actionsHelperTunnelUrl);
+      if (!ok) return alert('Failed to copy. Please copy manually.');
+      const old = btnCopyTunnel.textContent;
+      btnCopyTunnel.textContent = 'Copied!';
+      setTimeout(() => { btnCopyTunnel.textContent = old; }, 1200);
+    };
+  }
+
+  if (btnCopyImport) {
+    btnCopyImport.onclick = async () => {
+      const ok = await copyTextToClipboard(actionsHelperImportUrl);
+      if (!ok) return alert('Failed to copy. Please copy manually.');
+      const old = btnCopyImport.textContent;
+      btnCopyImport.textContent = 'Copied!';
+      setTimeout(() => { btnCopyImport.textContent = old; }, 1200);
+    };
+  }
+
+  if (btnRefresh) {
+    btnRefresh.onclick = refreshActionsHelper;
+  }
+}
+
+// =========================================================================
 // VIEW SWITCHING
 // =========================================================================
 
@@ -607,17 +742,31 @@ function setupVideoSelectionToolbar() {
         const cb = document.querySelector(`.video-checkbox[data-path="${CSS.escape(path)}"]`);
         return cb && cb.dataset.hasProject === 'true';
       });
+      const hasOrphaned = paths.some(path => {
+        const cb = document.querySelector(`.video-checkbox[data-path="${CSS.escape(path)}"]`);
+        return cb && cb.dataset.orphaned === 'true';
+      });
       
       let msg = `Delete ${paths.length} video(s)?\n\nThis will permanently delete the video files.`;
       if (hasProjects) {
         msg += `\n\nAssociated projects (analysis data, selections, exports) will also be deleted.`;
+      }
+      if (hasOrphaned) {
+        msg += `\n\nSome selected items have no video file; their project folders will be deleted.`;
       }
       
       if (!confirm(msg)) return;
       
       for (const path of paths) {
         try {
-          await apiJson('DELETE', '/api/home/video', { video_path: path, delete_project: true });
+          const cb = document.querySelector(`.video-checkbox[data-path="${CSS.escape(path)}"]`);
+          const isOrphaned = cb && cb.dataset.orphaned === 'true';
+          const projectId = cb?.dataset.projectId || null;
+          if (isOrphaned && projectId) {
+            await apiJson('DELETE', `/api/home/project/${projectId}`, null);
+          } else {
+            await apiJson('DELETE', '/api/home/video', { video_path: path, delete_project: true, project_id: projectId });
+          }
         } catch (err) {
           console.error(`Failed to delete video ${path}:`, err);
         }
@@ -638,7 +787,9 @@ async function loadRecentVideos() {
   updateVideoSelectionToolbar();
 
   try {
-    const res = await apiGet('/api/home/videos');
+    const includeIncomplete = $('#showNeedsAttention')?.checked ?? false;
+    const qs = includeIncomplete ? '?include_incomplete=1' : '';
+    const res = await apiGet(`/api/home/videos${qs}`);
     const videos = res.videos || [];
 
     if (videos.length === 0) {
@@ -649,19 +800,32 @@ async function loadRecentVideos() {
     container.innerHTML = '';
     for (const v of videos) {
       const el = document.createElement('div');
-      el.className = 'item' + (v.favorite ? ' favorite' : '') + (v.orphaned ? ' orphaned' : '');
+      const status = String(v.status || '').toLowerCase();
+      const needsAttention = !!(v.orphaned || status === 'download_failed' || status === 'analysis_failed');
+      el.className = 'item' + (v.favorite ? ' favorite' : '') + (needsAttention ? ' orphaned' : '');
       const dur = fmtTime(v.duration_seconds || 0);
       const sizeMB = ((v.size_bytes || 0) / 1024 / 1024).toFixed(1);
       
       // Build status badges
       let badges = '';
-      if (v.orphaned) {
-        badges += `<span class="badge" style="background:#dc2626;color:#fff">⚠ Orphaned</span> `;
-        if (v.analysis_count > 0) badges += `<span class="badge">${v.analysis_count} files</span> `;
-      } else if (v.favorite) {
+      if (status === 'downloading') {
+        badges += `<span class="badge" style="background:#f59e0b;color:#000">Downloading</span> `;
+      } else if (status === 'download_failed') {
+        badges += `<span class="badge" style="background:#dc2626;color:#fff">Download failed</span> `;
+      } else if (status === 'analyzing') {
+        badges += `<span class="badge" style="background:#38bdf8;color:#000">Analyzing</span> `;
+      } else if (status === 'analysis_failed') {
+        badges += `<span class="badge" style="background:#dc2626;color:#fff">Analysis failed</span> `;
+      } else if (status === 'complete') {
+        badges += `<span class="badge" style="background:#22c55e;color:#000">Complete</span> `;
+      } else if (v.orphaned) {
+        badges += `<span class="badge" style="background:#dc2626;color:#fff">Needs attention</span> `;
+      }
+      if (v.orphaned && v.analysis_count > 0) badges += `<span class="badge">${v.analysis_count} files</span> `;
+      if (v.favorite) {
         badges += `<span class="badge badge-favorite">★ Favorite</span> `;
       }
-      if (v.has_project && !v.orphaned) {
+      if (v.has_project) {
         badges += `<span class="badge" style="background:#22c55e;color:#000">Project</span> `;
         if (v.selections_count > 0) badges += `<span class="badge">${v.selections_count} sel</span> `;
         if (v.exports_count > 0) badges += `<span class="badge">${v.exports_count} exp</span> `;
@@ -670,9 +834,12 @@ async function loadRecentVideos() {
         badges += `<span class="badge" style="background:#6366f1">${v.extractor}</span> `;
       }
       
-      // Handle orphaned projects differently
       const pathDisplay = v.path || `outputs/projects/${v.project_id}/`;
       const checkboxPath = v.path || v.project_id;
+      const errText = String(v.status_error || v.video_error || '').trim();
+      const statusLine = v.orphaned
+        ? `${v.status || 'Missing video file'}${errText ? ` — ${errText}` : ''}`
+        : `${dur} • ${sizeMB} MB`;
       
       el.innerHTML = `
         <div class="item-header">
@@ -682,14 +849,15 @@ async function loadRecentVideos() {
             ${v.favorite ? '★' : '☆'}
           </button>` : ''}
         </div>
-        <div class="meta" style="margin-left:24px">${v.orphaned ? 'No video file' : `${dur} • ${sizeMB} MB`} ${badges}</div>
+        <div class="meta" style="margin-left:24px" title="${errText.replace(/"/g, '&quot;')}">${statusLine} ${badges}</div>
         <div class="meta small" style="opacity:0.7;word-break:break-all;margin-left:24px">${pathDisplay}</div>
         ${v.url ? `<div class="meta small" style="opacity:0.5;word-break:break-all;margin-left:24px">${v.url}</div>` : ''}
         <div class="actions" style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;margin-left:24px">
           ${!v.orphaned ? `<button class="primary btn-open">Open</button>` : ''}
+          ${v.orphaned && v.url ? `<button class="primary btn-retry-download" data-url="${String(v.url).replace(/"/g, '&quot;')}">Retry Download</button>` : ''}
           ${v.has_project && !v.orphaned ? `<button class="btn-delete-all" style="background:#dc2626" data-path="${(v.path || '').replace(/"/g, '&quot;')}" data-project-id="${v.project_id}">Delete All</button>` : ''}
           ${v.has_project && !v.orphaned ? `<button class="btn-delete-project" style="background:#ef4444" data-project-id="${v.project_id}">Delete Project Only</button>` : ''}
-          ${v.orphaned ? `<button class="btn-delete-project" style="background:#ef4444" data-project-id="${v.project_id}">Delete Orphaned Project</button>` : ''}
+          ${v.orphaned ? `<button class="btn-delete-project" style="background:#ef4444" data-project-id="${v.project_id}">Delete Project</button>` : ''}
           ${!v.orphaned && !v.has_project ? `<button class="btn-delete-video" style="background:#dc2626" data-path="${(v.path || '').replace(/"/g, '&quot;')}" data-has-project="false">Delete Video</button>` : ''}
         </div>
       `;
@@ -709,6 +877,16 @@ async function loadRecentVideos() {
       const btnOpen = el.querySelector('.btn-open');
       if (btnOpen) {
         btnOpen.onclick = () => openProjectByPath(v.path);
+      }
+
+      const btnRetry = el.querySelector('.btn-retry-download');
+      if (btnRetry) {
+        btnRetry.onclick = async (e) => {
+          e.stopPropagation();
+          const url = btnRetry.dataset.url || '';
+          if (!url) return;
+          await startUrlDownload(url);
+        };
       }
       
       // Favorite button
@@ -751,7 +929,10 @@ async function loadRecentVideos() {
         btnDeleteProject.onclick = async (e) => {
           e.stopPropagation();
           const projectId = btnDeleteProject.dataset.projectId;
-          if (confirm(`Delete project for "${v.title || v.filename}"?\n\nThis will remove analysis data, selections, and exports. The video file will NOT be deleted.`)) {
+          const msg = v.orphaned
+            ? `Delete project "${v.title || v.filename}"?\n\nThis will remove the project folder (analysis data, selections, exports).`
+            : `Delete project for "${v.title || v.filename}"?\n\nThis will remove analysis data, selections, and exports. The video file will NOT be deleted.`;
+          if (confirm(msg)) {
             try {
               await apiJson('DELETE', `/api/home/project/${projectId}`, null);
               loadRecentVideos(); // Refresh list
@@ -854,6 +1035,7 @@ function wireHomeUI() {
   const btnOpenDialog = $('#btnOpenDialog');
   const btnOpenByPath = $('#btnOpenByPath');
   const videoPathInput = $('#videoPathInput');
+  const showNeedsAttention = $('#showNeedsAttention');
 
   if (btnOpenDialog) {
     btnOpenDialog.onclick = openVideoDialog;
@@ -871,6 +1053,10 @@ function wireHomeUI() {
   const btnBackToHome = $('#btnBackToHome');
   if (btnBackToHome) {
     btnBackToHome.onclick = closeProject;
+  }
+
+  if (showNeedsAttention) {
+    showNeedsAttention.onchange = () => loadRecentVideos();
   }
 
   // URL Download UI
@@ -929,6 +1115,8 @@ function wireHomeUI() {
       localStorage.setItem('vp_dl_verbose_logs', dlVerboseLogs.checked ? '1' : '0');
     };
   }
+
+  wireActionsHelperUI();
 }
 
 function initTraceTfImportsToggle() {

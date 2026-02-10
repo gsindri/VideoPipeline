@@ -1,0 +1,19 @@
+# ── vp-actions-proxy ─────────────────────────────────────────────────
+# Stable reverse-proxy for ChatGPT Actions → Quick Tunnel → Studio.
+#
+# Setup:
+#   1. npx wrangler login
+#   2. npx wrangler kv namespace create VP_UPSTREAM
+#      → paste the printed id below
+#   3. npx wrangler secret put VP_API_TOKEN
+#      → paste your VP_API_TOKEN when prompted
+#   4. npx wrangler deploy
+# ─────────────────────────────────────────────────────────────────────
+
+name = "vp-actions-proxy"
+main = "src/index.ts"
+compatibility_date = "2025-12-01"
+
+[[kv_namespaces]]
+binding = "UPSTREAM"
+id = "4b28584a53f74ab29a5702e255fa53cb"

@@ -26,6 +26,35 @@ function Write-Info([string]$msg) { Write-Host $msg }
 function Write-Warn([string]$msg) { Write-Host $msg -ForegroundColor Yellow }
 function Write-Err ([string]$msg) { Write-Host $msg -ForegroundColor Red }
 
+function Get-EnvInt([string]$name) {
+  $raw = [Environment]::GetEnvironmentVariable($name)
+  if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+  $n = 0
+  if (-not [int]::TryParse(([string]$raw).Trim(), [ref]$n)) { return $null }
+  if ($n -lt 1 -or $n -gt 65535) { return $null }
+  return $n
+}
+
+function Update-WorkerUpstreamKv([string]$publicBase) {
+  $acct = $env:CF_ACCOUNT_ID
+  $ns   = $env:CF_KV_NAMESPACE_ID
+  $tok  = $env:CF_API_TOKEN
+  if ([string]::IsNullOrWhiteSpace($acct) -or [string]::IsNullOrWhiteSpace($ns) -or [string]::IsNullOrWhiteSpace($tok)) {
+    Write-Warn "[proxy] CF_ACCOUNT_ID / CF_KV_NAMESPACE_ID / CF_API_TOKEN not set; skipping KV update."
+    return
+  }
+
+  $uri = "https://api.cloudflare.com/client/v4/accounts/$acct/storage/kv/namespaces/$ns/values/base"
+  $headers = @{ Authorization = "Bearer $tok" }
+
+  try {
+    Invoke-RestMethod -Method Put -Uri $uri -Headers $headers -ContentType "text/plain" -Body $publicBase | Out-Null
+    Write-Host "[proxy] Updated Workers KV: base = $publicBase" -ForegroundColor Cyan
+  } catch {
+    Write-Err "[proxy] KV update failed: $($_.Exception.Message)"
+  }
+}
+
 function Copy-ToClipboard([string]$Text) {
   try {
     Set-Clipboard -Value $Text
@@ -51,6 +80,8 @@ function Copy-ToClipboard([string]$Text) {
 }
 
 try {
+  $exitCode = 0
+  $proc = $null
   # Repo root from this file's location: <repo>\tools\studio_quick_tunnel.ps1
   $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 
@@ -104,7 +135,7 @@ try {
       throw "Venv python not found: $py"
     }
 
-    Write-Info "[studio] Starting Studio (minimized)…"
+    Write-Info "[studio] Starting Studio (minimized)..."
 
     $old = $env:VP_API_TOKEN
     $env:VP_API_TOKEN = $token
@@ -124,9 +155,9 @@ try {
     return $null
   }
 
-  function Get-ListeningPorts([int]$pid) {
+  function Get-ListeningPorts([int]$processId) {
     try {
-      Get-NetTCPConnection -State Listen -OwningProcess $pid |
+      Get-NetTCPConnection -State Listen -OwningProcess $processId |
         Select-Object -ExpandProperty LocalPort -Unique |
         Sort-Object
     } catch {
@@ -151,12 +182,12 @@ try {
     }
   }
 
-  function Find-StudioPort([int]$pid) {
+  function Find-StudioPort([int]$processId) {
     $deadline = (Get-Date).AddSeconds([Math]::Max(5, $WaitSeconds))
     $saw401 = $false
 
     while ((Get-Date) -lt $deadline) {
-      $ports = @(Get-ListeningPorts $pid)
+      $ports = @(Get-ListeningPorts $processId)
 
       foreach ($p in $ports) {
         $code = Probe-OpenApi $p
@@ -185,10 +216,31 @@ try {
     throw "Studio process not found. Start Studio first, or rerun with -StartStudio."
   }
 
-  $pid = [int]$studio.ProcessId
-  Write-Info "[studio] Found Studio PID: $pid"
+  $studioPid = [int]$studio.ProcessId
+  Write-Info "[studio] Found Studio PID: $studioPid"
 
-  $port = Find-StudioPort $pid
+  $port = $null
+
+  # If Studio is configured to use a fixed port, prefer that over PID-based scanning.
+  $fixedPort = Get-EnvInt "VP_STUDIO_PORT"
+  if ($fixedPort) {
+    Write-Info "[studio] VP_STUDIO_PORT is set: $fixedPort"
+    $deadline = (Get-Date).AddSeconds([Math]::Max(5, $WaitSeconds))
+    $saw401 = $false
+    while ((Get-Date) -lt $deadline) {
+      $code = Probe-OpenApi $fixedPort
+      if ($code -eq 200 -or $code -eq 429) { $port = $fixedPort; break }
+      if ($code -eq 401 -or $code -eq 403) { $saw401 = $true }
+      Start-Sleep -Milliseconds 300
+    }
+    if (-not $port -and $saw401) {
+      throw "Studio responded but auth failed (401/403). Token mismatch? Delete %LOCALAPPDATA%\\VideoPipeline\\vp_api_token.txt to rotate."
+    }
+  }
+
+  if (-not $port) {
+    $port = Find-StudioPort $studioPid
+  }
   if (-not $port) {
     throw "Could not identify Studio port within ${WaitSeconds}s. Is Studio healthy?"
   }
@@ -196,50 +248,92 @@ try {
   Write-Info "[studio] Detected Studio port: $port"
   Write-Info "[studio] Local: http://127.0.0.1:$port/"
 
-  Write-Info "[tunnel] Starting Cloudflare Quick Tunnel (protocol=$Protocol)…"
+  Write-Info "[tunnel] Starting Cloudflare Quick Tunnel (protocol=$Protocol)..."
   Write-Info "[tunnel] Press Ctrl+C to stop the tunnel."
 
   $publicBase = $null
   $importUrl  = $null
 
-  # Stream cloudflared output live, but watch for the first trycloudflare URL
-  & cloudflared tunnel --url "http://127.0.0.1:$port" --protocol $Protocol 2>&1 | ForEach-Object {
-    $line = $_.ToString()
+  # Avoid piping cloudflared output through PowerShell (it can behave oddly on Windows).
+  # Instead, write logs to a file and watch for the first trycloudflare URL.
+  $logPath = Join-Path $env:TEMP ("vp_cloudflared_quick_tunnel_{0}.log" -f [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+  try { Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue | Out-Null } catch {}
+  Write-Info "[tunnel] cloudflared log: $logPath"
 
-    if (-not $publicBase -and $line -match 'https://[a-z0-9-]+\.trycloudflare\.com') {
-      $publicBase = $Matches[0]
-      $importUrl = "$publicBase/api/actions/openapi.json?token=$token"
+  $cfArgs = @(
+    "tunnel",
+    "--url", "http://127.0.0.1:$port",
+    "--protocol", $Protocol,
+    "--loglevel", "info",
+    "--logfile", $logPath
+  )
 
-      Write-Host ""
-      Write-Host "[tunnel] Public base URL: $publicBase" -ForegroundColor Cyan
+  $proc = Start-Process -FilePath "cloudflared" -ArgumentList $cfArgs -WorkingDirectory $repoRoot -NoNewWindow -PassThru
 
-      if ($CopyImportUrl) {
-        Copy-ToClipboard -Text $importUrl
-        Write-Host "[actions] OpenAPI import URL copied to clipboard." -ForegroundColor Cyan
-      }
+  $deadline = (Get-Date).AddSeconds([Math]::Max(5, $WaitSeconds))
+  while ((Get-Date) -lt $deadline -and (-not $publicBase)) {
+    if ($proc.HasExited) { break }
+    if (Test-Path -LiteralPath $logPath) {
+      try {
+        $tail = Get-Content -LiteralPath $logPath -Tail 200 -ErrorAction Stop
+        $text = ($tail -join "`n")
+        if ($text -match 'https://[a-z0-9-]+\.trycloudflare\.com') {
+          $publicBase = $Matches[0]
+          $importUrl = "$publicBase/api/actions/openapi.json?token=$token"
 
-      if ($PrintImportUrl) {
-        Write-Host "[actions] OpenAPI import URL:" -ForegroundColor Cyan
-        Write-Host $importUrl
-      } else {
-        $mask = ($token.Substring(0,4) + "…" + $token.Substring($token.Length-4))
-        Write-Host "[actions] Import URL is: $publicBase/api/actions/openapi.json?token=$mask" -ForegroundColor DarkCyan
-        Write-Host "[actions] (Use clipboard for the full URL.)" -ForegroundColor DarkCyan
-      }
+          Write-Host ""
+          Write-Host "[tunnel] Public base URL: $publicBase" -ForegroundColor Cyan
 
-      Write-Host "[actions] In Actions auth: API Key → Bearer → paste the SAME token." -ForegroundColor Cyan
+          Update-WorkerUpstreamKv $publicBase
 
-      if ($OpenImportUrl) {
-        try { Start-Process $importUrl | Out-Null } catch {}
-      }
+          if ($CopyImportUrl) {
+            Copy-ToClipboard -Text $importUrl
+            Write-Host "[actions] OpenAPI import URL copied to clipboard." -ForegroundColor Cyan
+          }
+
+          if ($PrintImportUrl) {
+            Write-Host "[actions] OpenAPI import URL:" -ForegroundColor Cyan
+            Write-Host $importUrl
+          } else {
+            $mask = ($token.Substring(0,4) + "..." + $token.Substring($token.Length-4))
+            Write-Host "[actions] Import URL is: $publicBase/api/actions/openapi.json?token=$mask" -ForegroundColor DarkCyan
+            Write-Host "[actions] (Use clipboard for the full URL.)" -ForegroundColor DarkCyan
+          }
+
+          Write-Host "[actions] In Actions auth: API Key -> Bearer -> paste the SAME token." -ForegroundColor Cyan
+
+          if ($OpenImportUrl) {
+            try { Start-Process $importUrl | Out-Null } catch {}
+          }
+        }
+      } catch {}
     }
-
-    $line
+    Start-Sleep -Milliseconds 250
   }
+
+  if (-not $publicBase) {
+    $code = if ($proc.HasExited) { $proc.ExitCode } else { "running" }
+    $tailText = ""
+    if (Test-Path -LiteralPath $logPath) {
+      try { $tailText = (Get-Content -LiteralPath $logPath -Tail 20 -ErrorAction SilentlyContinue | Out-String) } catch {}
+    }
+    if ([string]::IsNullOrWhiteSpace($tailText)) { $tailText = "(no log output)" }
+    throw "cloudflared did not produce a trycloudflare URL (proc=$($proc.Id) exit=$code). Log tail from ${logPath}:`n$tailText"
+  }
+
+  # Block until cloudflared exits; Ctrl+C will stop the tunnel (see finally).
+  while (-not $proc.HasExited) { Start-Sleep -Milliseconds 300 }
 } catch {
+  $exitCode = 1
   $msg = $_.Exception.Message
   if ([string]::IsNullOrWhiteSpace($msg)) { $msg = "Unknown error" }
   Write-Err $msg
-  exit 1
+} finally {
+  # Ctrl+C stops this script, but doesn't necessarily stop the child process.
+  # Ensure we clean up cloudflared if it's still running.
+  if ($proc -and (-not $proc.HasExited)) {
+    try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue | Out-Null } catch {}
+  }
 }
 
+exit $exitCode

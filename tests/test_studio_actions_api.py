@@ -74,6 +74,42 @@ def test_actions_ingest_url_blocks_ssrf(tmp_path, monkeypatch):
     assert r.json().get("detail") == "url_domain_not_allowed"
 
 
+def test_actions_ingest_url_www_normalization(tmp_path, monkeypatch):
+    """URLs with www. prefix, trailing dots, or mixed case should match the allowlist."""
+    from videopipeline.studio.actions_api import _validate_ingest_url
+
+    allow = {"twitch.tv", "youtube.com"}
+    # www. prefix should be stripped and matched
+    assert _validate_ingest_url("https://www.twitch.tv/videos/123", allow_domains=allow)
+    # trailing dot
+    assert _validate_ingest_url("https://twitch.tv./videos/123", allow_domains=allow)
+    # mixed case
+    assert _validate_ingest_url("https://WWW.TWITCH.TV/videos/123", allow_domains=allow)
+    # subdomain still works
+    assert _validate_ingest_url("https://clips.twitch.tv/SomeClip", allow_domains=allow)
+
+
+def test_actions_allow_domains_env(tmp_path, monkeypatch):
+    """VP_ACTIONS_ALLOW_DOMAINS env var extends the built-in allowlist."""
+    monkeypatch.setenv("VP_ACTIONS_ALLOW_DOMAINS", "example.com, custom.io")
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    # example.com is now allowed (was blocked before)
+    r = client.post("/api/actions/ingest_url", headers=hdr, json={"url": "https://example.com/video"})
+    # Should not be 400/url_domain_not_allowed (may fail for other reasons in test, but domain is accepted)
+    assert r.json().get("detail") != "url_domain_not_allowed"
+
+    # diagnostics should list it
+    r = client.get("/api/actions/diagnostics", headers=hdr)
+    assert r.status_code == 200
+    domains = r.json().get("allowed_domains", [])
+    assert "example.com" in domains
+    assert "custom.io" in domains
+    # defaults are still present
+    assert "twitch.tv" in domains
+
+
 def test_actions_rate_limiting(tmp_path, monkeypatch):
     monkeypatch.setenv("VP_ACTIONS_RL_PER_ACTOR_CAPACITY", "2")
     monkeypatch.setenv("VP_ACTIONS_RL_PER_ACTOR_REFILL_PER_S", "0")
@@ -177,3 +213,134 @@ def test_actions_results_summary_clamps(tmp_path, monkeypatch):
     assert data["meta"]["project_id"] == pid
     assert data["highlights"]["total_candidates"] == 50
     assert len(data["highlights"]["candidates"]) == 30
+
+
+def test_actions_openapi_freeform_object_schemas_have_properties(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    r = client.get("/api/actions/openapi.json", headers=hdr)
+    assert r.status_code == 200
+    spec = r.json()
+    schemas = ((spec.get("components") or {}).get("schemas") or {})
+
+    results_summary = schemas.get("ResultsSummaryResponse")
+    diagnostics = schemas.get("DiagnosticsResponse")
+
+    assert isinstance(results_summary, dict)
+    assert isinstance(diagnostics, dict)
+    assert results_summary.get("type") == "object"
+    assert diagnostics.get("type") == "object"
+    assert results_summary.get("properties") == {}
+    assert diagnostics.get("properties") == {}
+    assert results_summary.get("additionalProperties") is True
+    assert diagnostics.get("additionalProperties") is True
+
+
+def test_actions_run_ingest_analyze_returns_run_id_and_project_id(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    # Patch out the actual downloader + analysis so the background thread is fast.
+    import videopipeline.studio.actions_api as actions_api
+    from videopipeline.ingest.models import IngestResult
+
+    dummy_src = tmp_path / "dummy.mp4"
+    dummy_src.write_bytes(b"")
+
+    def fake_download_url(url: str, *args, **kwargs):
+        on_progress = kwargs.get("on_progress")
+        if on_progress:
+            on_progress(1.0, "done")
+        return IngestResult(video_path=dummy_src, url=url, title="dummy")
+
+    class DummyAnalysisResult:
+        success = True
+        error = None
+        tasks_run = []
+        total_elapsed_seconds = 0.0
+        missing_targets = set()
+
+    monkeypatch.setattr(actions_api, "download_url", fake_download_url)
+    monkeypatch.setattr(actions_api, "run_analysis", lambda *a, **k: DummyAnalysisResult())
+
+    # Chat download/import is best-effort; make it fail fast.
+    import videopipeline.chat.downloader as chat_downloader
+
+    monkeypatch.setattr(chat_downloader, "download_chat", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no chat")))
+
+    r = client.post(
+        "/api/actions/run_ingest_analyze",
+        headers=hdr,
+        json={"url": "https://www.twitch.tv/videos/123", "client_request_id": "run-req-1"},
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert "run_id" in data
+    assert "job_id" in data
+    assert "project_id" in data
+    assert data["run_id"] == data["job_id"]
+
+
+def test_actions_openapi_run_full_export_top_is_consequential(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    r = client.get("/api/actions/openapi.json", headers=hdr)
+    assert r.status_code == 200
+    spec = r.json()
+    paths = spec.get("paths") or {}
+    op = (((paths.get("/api/actions/run_full_export_top") or {}).get("post")) or {})
+    assert op.get("x-openai-isConsequential") is True
+
+
+def test_actions_runs_last_returns_after_creating_run(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    # Make the background run fast.
+    import videopipeline.studio.actions_api as actions_api
+    from videopipeline.ingest.models import IngestResult
+
+    dummy_src = tmp_path / "dummy.mp4"
+    dummy_src.write_bytes(b"")
+
+    monkeypatch.setattr(actions_api, "download_url", lambda url, *a, **k: IngestResult(video_path=dummy_src, url=url, title="dummy"))
+
+    class DummyAnalysisResult:
+        success = True
+        error = None
+        tasks_run = []
+        total_elapsed_seconds = 0.0
+        missing_targets = set()
+
+    monkeypatch.setattr(actions_api, "run_analysis", lambda *a, **k: DummyAnalysisResult())
+
+    r = client.post(
+        "/api/actions/run_ingest_analyze",
+        headers=hdr,
+        json={"url": "https://www.twitch.tv/videos/123", "client_request_id": "run-req-2"},
+    )
+    assert r.status_code == 200
+    run_id = r.json()["run_id"]
+
+    r2 = client.get("/api/actions/runs/last", headers=hdr)
+    assert r2.status_code == 200
+    last = r2.json()
+    assert last["run_id"] == run_id
+    assert last["job_id"] == run_id
+
+
+def test_actions_cancel_sets_cancel_requested(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    from videopipeline.studio.jobs import JOB_MANAGER
+
+    job = JOB_MANAGER.create("dummy")
+    r = client.post(f"/api/actions/jobs/{job.id}/cancel", headers=hdr, json={})
+    assert r.status_code == 200
+
+    j2 = JOB_MANAGER.get(job.id)
+    assert j2 is not None
+    assert j2.cancel_requested is True

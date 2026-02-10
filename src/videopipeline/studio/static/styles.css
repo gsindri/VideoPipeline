@@ -350,6 +350,44 @@ video {
   overflow-y: auto;
 }
 
+/* Actions helper (Quick Tunnel + Actions import URL) */
+.actions-helper {
+  display: grid;
+  gap: 12px;
+}
+
+.actions-helper-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.actions-helper-field {
+  min-width: 0;
+}
+
+.actions-helper-input {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+.actions-helper-copy {
+  padding: 12px 14px;
+  min-width: 170px;
+  font-size: 13px;
+}
+
+@media (max-width: 640px) {
+  .actions-helper-row {
+    grid-template-columns: 1fr;
+  }
+  .actions-helper-copy {
+    width: 100%;
+  }
+}
+
 /* Tab bar styles */
 .tab-bar {
   display: flex;
