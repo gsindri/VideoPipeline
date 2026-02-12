@@ -385,13 +385,48 @@ def _run_chapters(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Call
 
 def _run_chat_features(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Compute chat activity features."""
-    if proj.chat_features_path.exists():
-        return
-    
     # Check if chat data exists
     chat_db = proj.analysis_dir / "chat.sqlite"
     chat_json = proj.analysis_dir / "chat_raw.json"
-    
+
+    # Fast path: keep existing chat features unless they are clearly stale/invalid.
+    # We specifically heal the "all zeros" case that can happen when legacy raw-chat
+    # parsing runs before normalized chat DB import is complete.
+    if proj.chat_features_path.exists():
+        if not chat_db.exists():
+            return
+        try:
+            import numpy as np
+            from ..project import load_npz
+            from ..chat.store import ChatStore
+
+            data = load_npz(proj.chat_features_path)
+            counts = data.get("counts")
+            needs_recompute = False
+            reason = ""
+            if counts is None:
+                needs_recompute = True
+                reason = "missing_counts"
+            else:
+                counts_arr = np.asarray(counts, dtype=np.float64).reshape(-1)
+                if counts_arr.size <= 0:
+                    needs_recompute = True
+                    reason = "empty_counts"
+                elif not np.any(counts_arr > 0):
+                    store = ChatStore(chat_db)
+                    try:
+                        msg_count = int(store.get_message_count())
+                    finally:
+                        store.close()
+                    if msg_count > 0:
+                        needs_recompute = True
+                        reason = "all_zero_counts_with_chat_messages"
+            if not needs_recompute:
+                return
+            logger.warning("[chat_features] Recomputing stale chat features (%s).", reason)
+        except Exception as e:
+            logger.warning("[chat_features] Failed to validate existing chat features (%s); recomputing.", e)
+
     if not chat_db.exists() and not chat_json.exists():
         logger.info("[chat_features] No chat data found; skipping.")
         return  # No chat data

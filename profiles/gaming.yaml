@@ -32,7 +32,7 @@ analysis:
     min_scene_len_seconds: 1.2
     snap_window_seconds: 1.0
   highlights:
-    top: 20
+    top: 45
     min_gap_seconds: 15.0
     skip_start_seconds: 10.0
     smooth_seconds: 1.5

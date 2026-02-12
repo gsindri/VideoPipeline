@@ -15,6 +15,27 @@ let currentTab = 'edit';
 // =========================================================================
 
 const VP_LLM_MODE_KEY = 'vp_llm_mode';
+const VP_CANDIDATE_SOURCE_FILTER_KEY = 'vp_candidate_source_filter';
+
+function normalizeCandidateSourceFilter(mode) {
+  const m = String(mode || '').trim().toLowerCase();
+  return (m === 'all' || m === 'chat' || m === 'non_chat') ? m : 'all';
+}
+
+function getCandidateSourceFilter() {
+  try {
+    return normalizeCandidateSourceFilter(localStorage.getItem(VP_CANDIDATE_SOURCE_FILTER_KEY));
+  } catch {
+    return 'all';
+  }
+}
+
+function setCandidateSourceFilter(mode) {
+  const m = normalizeCandidateSourceFilter(mode);
+  try {
+    localStorage.setItem(VP_CANDIDATE_SOURCE_FILTER_KEY, m);
+  } catch {}
+}
 
 function normalizeLlmMode(mode) {
   const m = String(mode || '').trim().toLowerCase();
@@ -889,19 +910,29 @@ async function loadRecentVideos() {
       const statusLine = v.orphaned
         ? `${v.status || 'Missing video file'}${errText ? ` — ${errText}` : ''}`
         : `${dur} • ${sizeMB} MB`;
+
+      const thumbUrl = v.thumbnail_url ? apiUrlWithToken(String(v.thumbnail_url)) : '';
+      let thumbLabel = 'VID';
+      const ex = String(v.extractor || '').toLowerCase();
+      if (ex.includes('twitch')) thumbLabel = 'TW';
+      else if (ex.includes('youtube')) thumbLabel = 'YT';
+      const thumbHtml = thumbUrl
+        ? `<img class="video-thumb" src="${thumbUrl.replace(/"/g, '&quot;')}" alt="" loading="lazy" />`
+        : `<div class="video-thumb video-thumb--placeholder" title="No thumbnail">${thumbLabel}</div>`;
       
       el.innerHTML = `
         <div class="item-header">
           <input type="checkbox" class="video-checkbox" data-path="${(checkboxPath || '').replace(/"/g, '&quot;')}" data-has-project="${v.has_project}" data-project-id="${v.project_id || ''}" data-orphaned="${v.orphaned || false}" style="margin-right:8px;cursor:pointer" />
+          ${thumbHtml}
           <div class="title" style="flex:1">${v.title || v.filename}</div>
           ${!v.orphaned ? `<button class="btn-favorite ${v.favorite ? 'active' : ''}" title="${v.favorite ? 'Remove from favorites' : 'Add to favorites'}" data-path="${(v.path || '').replace(/"/g, '&quot;')}">
             ${v.favorite ? '★' : '☆'}
           </button>` : ''}
         </div>
-        <div class="meta" style="margin-left:24px" title="${errText.replace(/"/g, '&quot;')}">${statusLine} ${badges}</div>
-        <div class="meta small" style="opacity:0.7;word-break:break-all;margin-left:24px">${pathDisplay}</div>
-        ${v.url ? `<div class="meta small" style="opacity:0.5;word-break:break-all;margin-left:24px">${v.url}</div>` : ''}
-        <div class="actions" style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;margin-left:24px">
+        <div class="meta" style="margin-left:76px" title="${errText.replace(/"/g, '&quot;')}">${statusLine} ${badges}</div>
+        <div class="meta small" style="opacity:0.7;word-break:break-all;margin-left:76px">${pathDisplay}</div>
+        ${v.url ? `<div class="meta small" style="opacity:0.5;word-break:break-all;margin-left:76px">${v.url}</div>` : ''}
+        <div class="actions" style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;margin-left:76px">
           ${!v.orphaned ? `<button class="primary btn-open">Open</button>` : ''}
           ${v.orphaned && v.url ? `<button class="primary btn-retry-download" data-url="${String(v.url).replace(/"/g, '&quot;')}">Retry Download</button>` : ''}
           ${v.has_project && !v.orphaned ? `<button class="btn-delete-all" style="background:#dc2626" data-path="${(v.path || '').replace(/"/g, '&quot;')}" data-project-id="${v.project_id}">Delete All</button>` : ''}
@@ -2705,20 +2736,76 @@ function formatTaskName(taskId) {
   return names[taskId] || taskId;
 }
 
+function toFiniteNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function getCandidateSourceMeta(candidate) {
+  const source = String(candidate?.selection_source || '').trim().toLowerCase();
+  if (source === 'chat_spike') {
+    return { bucket: 'chat', label: 'Chat Spike', badgeClass: 'badge-source-chat', explicit: true };
+  }
+  if (source === 'multi_signal') {
+    return { bucket: 'non_chat', label: 'Multi-Signal', badgeClass: 'badge-source-multi', explicit: true };
+  }
+
+  const b = candidate?.breakdown || {};
+  const chat = Math.max(0, toFiniteNumber(b.chat));
+  const maxOther = Math.max(
+    0,
+    Math.max(0, toFiniteNumber(b.audio)),
+    Math.max(0, toFiniteNumber(b.motion)),
+    Math.max(0, toFiniteNumber(b.audio_events)),
+    Math.max(0, toFiniteNumber(b.speech)),
+    Math.max(0, toFiniteNumber(b.reaction)),
+  );
+  const chatDominant = chat >= 0.20 && chat >= (maxOther * 1.10);
+  if (chatDominant) {
+    return { bucket: 'chat', label: 'Chat-Led', badgeClass: 'badge-source-chat', explicit: false };
+  }
+  return { bucket: 'non_chat', label: 'Multi-Signal', badgeClass: 'badge-source-multi', explicit: false };
+}
+
 function renderCandidates() {
   const container = $('#candidates');
+  const filterEl = $('#candidateSourceFilter');
+  const summaryEl = $('#candidateSourceSummary');
   container.innerHTML = '';
+
+  const filterMode = getCandidateSourceFilter();
+  if (filterEl && filterEl.value !== filterMode) filterEl.value = filterMode;
 
   const highlights = project?.analysis?.highlights;
   const audio = project?.analysis?.audio;
   const aiDirector = project?.analysis?.ai_director;
-  const candidates = highlights?.candidates || audio?.candidates || [];
-  if (candidates.length === 0) {
+  const allCandidates = highlights?.candidates || audio?.candidates || [];
+  if (allCandidates.length === 0) {
+    if (summaryEl) summaryEl.textContent = '';
     container.innerHTML = `<div class="small">No candidates yet. Click "Analyze highlights".</div>`;
     return;
   }
 
-  for (const c of candidates) {
+  const withSource = allCandidates.map(c => ({ c, source: getCandidateSourceMeta(c) }));
+  const chatLedCount = withSource.filter(it => it.source.bucket === 'chat').length;
+  const nonChatCount = withSource.length - chatLedCount;
+  let candidates = withSource;
+  if (filterMode === 'chat') {
+    candidates = withSource.filter(it => it.source.bucket === 'chat');
+  } else if (filterMode === 'non_chat') {
+    candidates = withSource.filter(it => it.source.bucket !== 'chat');
+  }
+
+  if (summaryEl) {
+    summaryEl.textContent = `Showing ${candidates.length}/${withSource.length} • Chat-led ${chatLedCount} • Non-chat ${nonChatCount}`;
+  }
+
+  if (candidates.length === 0) {
+    container.innerHTML = `<div class="small">No candidates match this source filter.</div>`;
+    return;
+  }
+
+  for (const { c, source } of candidates) {
     const el = document.createElement('div');
     el.className = 'item';
     let breakdown = '';
@@ -2768,9 +2855,13 @@ function renderCandidates() {
     // Warning badge if boundary graph wasn't used (may start mid-sentence)
     const boundaryWarning = c.used_boundary_graph === false ? 
       '<span class="badge" style="background:#854d0e;color:#fef08a;margin-left:6px" title="May start mid-sentence (no boundary data)">⚠ rough cut</span>' : '';
+    const sourceHint = source.explicit
+      ? 'Source bucket used in external candidate feed'
+      : 'Inferred from candidate score breakdown';
+    const sourceBadge = `<span class="badge ${source.badgeClass}" title="${sourceHint}">${source.label}</span>`;
     
     el.innerHTML = `
-      <div class="title">#${c.rank} • score ${c.score.toFixed(2)} <span class="badge">peak ${fmtTime(c.peak_time_s)}</span>${boundaryWarning}</div>
+      <div class="title">#${c.rank} • score ${c.score.toFixed(2)} <span class="badge">peak ${fmtTime(c.peak_time_s)}</span>${sourceBadge}${boundaryWarning}</div>
       <div class="meta">Clip: ${fmtTime(c.start_s)} → ${fmtTime(c.end_s)} (${(c.end_s - c.start_s).toFixed(1)}s)${breakdown}</div>
       ${aiHtml}
       <div class="actions">
@@ -3638,6 +3729,7 @@ function getSegmentScoreClass(score) {
 
 function buildSegmentTooltip(candidate) {
   const breakdown = candidate.breakdown || {};
+  const source = getCandidateSourceMeta(candidate);
   const reasons = [];
   
   // Build reason text based on breakdown
@@ -3672,6 +3764,7 @@ function buildSegmentTooltip(candidate) {
   return `
     <div class="tooltip-title">#${candidate.rank} • Score: ${candidate.score.toFixed(2)}</div>
     <div class="tooltip-reason">${reasonText}</div>
+    <div class="tooltip-reason">Source: ${source.label}${source.explicit ? '' : ' (inferred)'}</div>
     <div style="margin-top:4px;font-size:10px;color:#9aa4b2">
       ${fmtTime(candidate.start_s)} → ${fmtTime(candidate.end_s)} (${(candidate.end_s - candidate.start_s).toFixed(1)}s)
     </div>
@@ -4390,7 +4483,7 @@ async function startAnalyzeContextJob() {
   const llmMode = getLlmMode();
   if (llmMode === 'external') {
     $('#analysisStatus').textContent = 'External mode: use ChatGPT Actions for packaging/picks.';
-    alert('External mode is enabled.\n\nUse ChatGPT (via Actions) to do packaging/picks:\n- GET /api/actions/ai/candidates\n- GET /api/actions/ai/variants\n- POST /api/actions/ai/apply_director_picks\n- POST /api/actions/export_director_picks\n\nTip: open the Actions Helper to copy the OpenAPI import URL.');
+    alert('External mode is enabled.\n\nUse ChatGPT (via Actions) to do packaging/picks:\n- GET /api/actions/ai/candidates (default mix: top 30 + 15 chat-spike)\n- GET /api/actions/ai/variants\n- POST /api/actions/ai/apply_director_picks\n- POST /api/actions/export_director_picks\n\nTip: open the Actions Helper to copy the OpenAPI import URL.');
     openActionsHelperModal();
     return;
   }
@@ -4437,6 +4530,15 @@ function wireUI() {
   const diarizeCb = $('#diarizeEnabled');
   if (diarizeCb) diarizeCb.onchange = updateDiarizationControls;
   updateDiarizationControls();
+
+  const candidateSourceFilter = $('#candidateSourceFilter');
+  if (candidateSourceFilter) {
+    candidateSourceFilter.value = getCandidateSourceFilter();
+    candidateSourceFilter.onchange = () => {
+      setCandidateSourceFilter(candidateSourceFilter.value);
+      renderCandidates();
+    };
+  }
 
   v.addEventListener('timeupdate', () => {
     $('#timeReadout').textContent = `Now: ${fmtTime(v.currentTime)} / ${fmtTime(v.duration || 0)}`;

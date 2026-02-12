@@ -222,6 +222,10 @@ def download_url(
             "restrictfilenames": True,
             "progress_hooks": [progress_hook],
             "writeinfojson": True,
+            # Best-effort: download the platform thumbnail as a sidecar file.
+            # This is used by Studio as a "video icon" when available.
+            "writethumbnail": True,
+            "write_all_thumbnails": False,
             # Ensure yt-dlp doesn't write directly to stdout/stderr (prevents
             # progress lines from interleaving with our app logs).
             "logger": _NoopYtDlpLogger(),
@@ -335,6 +339,14 @@ def download_url(
         if p.exists():
             info_json_path = p
             break
+
+    # Find downloaded thumbnail (yt-dlp sidecar). This may be .webp/.jpg/.png.
+    thumbnail_path = None
+    for ext in (".webp", ".jpg", ".jpeg", ".png"):
+        p = video_path.with_suffix(ext)
+        if p.exists():
+            thumbnail_path = p
+            break
     
     # Step 5: Post-process
     if on_progress:
@@ -370,6 +382,7 @@ def download_url(
         video_path=video_path,
         info_json_path=info_json_path,
         preview_path=preview_path,
+        thumbnail_path=thumbnail_path,
         title=title,
         url=url,
         extractor=info.get("extractor", ""),

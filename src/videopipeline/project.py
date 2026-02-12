@@ -493,7 +493,13 @@ def set_project_status(
     return update_project(proj, _upd)
 
 
-def set_project_video(proj: Project, video_path: Path, *, preview_path: Optional[Path] = None) -> None:
+def set_project_video(
+    proj: Project,
+    video_path: Path,
+    *,
+    preview_path: Optional[Path] = None,
+    thumbnail_path: Optional[Path] = None,
+) -> None:
     """Update a project with the final video path after download completes.
     
     Uses a staging + promote flow so the final project video path is only written
@@ -510,6 +516,7 @@ def set_project_video(proj: Project, video_path: Path, *, preview_path: Optional
     
     src_video = Path(video_path).expanduser().resolve()
     src_preview = Path(preview_path).expanduser().resolve() if preview_path is not None else None
+    src_thumb = Path(thumbnail_path).expanduser().resolve() if thumbnail_path is not None else None
     
     # Create video directory in project
     video_dir = proj.video_dir
@@ -586,6 +593,61 @@ def set_project_video(proj: Project, video_path: Path, *, preview_path: Optional
             _stage_and_promote(src_preview, preview_dest, staged_preview)
         except Exception:
             preview_dest = None
+
+    # Copy thumbnail into project (if provided by yt-dlp).
+    thumb_dest: Optional[Path] = None
+    if src_thumb is not None and src_thumb.exists() and src_thumb.is_file():
+        try:
+            # Keep original extension; browsers commonly support .webp/.jpg/.png.
+            ext = src_thumb.suffix.lower()
+            if ext not in {".webp", ".jpg", ".jpeg", ".png"}:
+                ext = ".webp"
+            thumb_dest = video_dir / f"thumb{ext}"
+            staged_thumb = staging_dir / f"thumb{ext}.part"
+            _stage_and_promote(src_thumb, thumb_dest, staged_thumb)
+        except Exception:
+            thumb_dest = None
+
+    # Fallback: generate a thumbnail from the video using ffmpeg when available.
+    # (This is a best-effort improvement for platforms without a sidecar thumbnail.)
+    if thumb_dest is None:
+        try:
+            if shutil.which("ffmpeg"):
+                # Prefer the preview proxy if present (usually faster to decode).
+                src_for_thumb = preview_dest if preview_dest and preview_dest.exists() else dest_path
+                # Pick a point a bit into the video to avoid blank intro frames.
+                try:
+                    dur = float(ffprobe_duration_seconds(src_for_thumb) or 0.0)
+                except Exception:
+                    dur = 0.0
+                ss = 10.0
+                if dur > 0:
+                    ss = max(1.0, min(30.0, dur * 0.05))
+                thumb_dest = video_dir / "thumb.jpg"
+                # ffmpeg will overwrite; keep output small for UI.
+                cmd = [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-ss",
+                    str(ss),
+                    "-i",
+                    str(src_for_thumb),
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    "scale=320:-2",
+                    str(thumb_dest),
+                ]
+                import subprocess
+
+                subprocess.run(cmd, check=False)
+                if not (thumb_dest.exists() and thumb_dest.stat().st_size > 0):
+                    thumb_dest = None
+        except Exception:
+            thumb_dest = None
     
     # Update the project's video_path to point to the project-local copy
     proj.video_path = dest_path
@@ -604,6 +666,7 @@ def set_project_video(proj: Project, video_path: Path, *, preview_path: Optional
         d["video"] = {
             "path": str(dest_path),
             "preview_path": str(preview_dest) if preview_dest and preview_dest.exists() else None,
+            "thumbnail_path": str(thumb_dest.relative_to(proj.project_dir)) if thumb_dest and thumb_dest.exists() else None,
             "status": "ready",
             "error": None,
             "size_bytes": st.st_size,

@@ -501,6 +501,134 @@ def test_actions_ai_candidates_returns_transcript_excerpt(tmp_path, monkeypatch)
     assert excerpt["truncated"] is True
 
 
+def test_actions_ai_candidates_defaults_to_hybrid_top_plus_chat(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    pid = hashlib.sha256("twitch_234_hybrid".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "video").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "video" / "video.mp4").write_bytes(b"")
+
+    candidates = []
+    for rank in range(1, 51):
+        # Keep global score descending by rank.
+        score = 1000.0 - float(rank)
+        # Make late-ranked items chat-heavy so they surface in chat bucket.
+        chat_signal = float(rank - 30) if rank > 30 else 0.0
+        candidates.append(
+            {
+                "rank": rank,
+                "candidate_id": f"cid{rank}",
+                "score": score,
+                "start_s": float(rank),
+                "end_s": float(rank + 6),
+                "peak_time_s": float(rank + 2),
+                "breakdown": {"chat": chat_signal},
+                "raw_signals": {"chat": chat_signal},
+            }
+        )
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(proj_dir / "video" / "video.mp4"), "duration_seconds": 120.0},
+        "analysis": {"highlights": {"candidates": candidates}},
+        "layout": {},
+        "selections": [],
+        "exports": [],
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+
+    # Omit top_n/chat_top_n so endpoint applies the new hybrid defaults.
+    r = client.get(f"/api/actions/ai/candidates?project_id={pid}&chat_lines=0", headers=hdr)
+    assert r.status_code == 200
+    data = r.json()
+
+    assert data["limits"]["top_n"] == 30
+    assert data["limits"]["chat_top_n"] == 15
+    assert data["strategy"]["mode"] == "hybrid_top_plus_chat"
+    assert len(data["candidates"]) == 45
+
+    chat_spike = [c for c in data["candidates"] if c.get("selection_source") == "chat_spike"]
+    assert len(chat_spike) == 15
+    assert any(int(c.get("rank") or 0) > 30 for c in chat_spike)
+
+
+def test_actions_ai_candidates_explicit_top_n_defaults_to_hybrid_and_supports_top_only_override(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    pid = hashlib.sha256("twitch_234_legacy".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "video").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "video" / "video.mp4").write_bytes(b"")
+
+    candidates = []
+    for rank in range(1, 7):
+        candidates.append(
+            {
+                "rank": rank,
+                "candidate_id": f"cid{rank}",
+                "score": float(100 - rank),
+                "start_s": float(rank),
+                "end_s": float(rank + 5),
+                "peak_time_s": float(rank + 2),
+                "raw_signals": {"chat": float(100 if rank == 6 else 0)},
+            }
+        )
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(proj_dir / "video" / "video.mp4"), "duration_seconds": 60.0},
+        "analysis": {"highlights": {"candidates": candidates}},
+        "layout": {},
+        "selections": [],
+        "exports": [],
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+
+    # Explicit top_n now defaults to hybrid behavior (+chat bucket).
+    r = client.get(
+        f"/api/actions/ai/candidates?project_id={pid}&top_n=3&chat_lines=0",
+        headers=hdr,
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["limits"]["top_n"] == 3
+    assert data["limits"]["chat_top_n"] == 15
+    assert data["strategy"]["mode"] == "hybrid_top_plus_chat"
+    assert len(data["candidates"]) == 6
+    assert any(c.get("selection_source") == "chat_spike" for c in data["candidates"])
+
+    # Explicit top-only override.
+    r2 = client.get(
+        f"/api/actions/ai/candidates?project_id={pid}&top_n=3&chat_top_n=0&chat_lines=0",
+        headers=hdr,
+    )
+    assert r2.status_code == 200
+    data2 = r2.json()
+    assert data2["limits"]["top_n"] == 3
+    assert data2["limits"]["chat_top_n"] == 0
+    assert data2["strategy"]["mode"] == "top_only"
+    assert len(data2["candidates"]) == 3
+    assert all(c.get("selection_source") == "multi_signal" for c in data2["candidates"])
+
+    # Alias compatibility for macro-style `chat_top`.
+    r3 = client.get(
+        f"/api/actions/ai/candidates?project_id={pid}&top_n=3&chat_top=1&chat_lines=0",
+        headers=hdr,
+    )
+    assert r3.status_code == 200
+    data3 = r3.json()
+    assert data3["limits"]["chat_top_n"] == 1
+    assert data3["strategy"]["mode"] == "hybrid_top_plus_chat"
+    assert len(data3["candidates"]) == 4
+
+
 def test_actions_ai_variants_filters_and_limits(tmp_path, monkeypatch):
     client = _make_client(tmp_path, monkeypatch, token="secret")
     hdr = {"Authorization": "Bearer secret"}

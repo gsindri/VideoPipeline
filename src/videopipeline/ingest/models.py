@@ -189,6 +189,7 @@ class IngestResult:
     video_path: Path
     info_json_path: Optional[Path] = None
     preview_path: Optional[Path] = None
+    thumbnail_path: Optional[Path] = None
     
     # Metadata from yt-dlp
     title: str = ""
@@ -211,6 +212,7 @@ class IngestResult:
             "video_path": str(self.video_path),
             "info_json_path": str(self.info_json_path) if self.info_json_path else None,
             "preview_path": str(self.preview_path) if self.preview_path else None,
+            "thumbnail_path": str(self.thumbnail_path) if self.thumbnail_path else None,
             "title": self.title,
             "url": self.url,
             "extractor": self.extractor,

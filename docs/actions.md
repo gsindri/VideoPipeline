@@ -64,3 +64,16 @@ Delete the token file and generate a new one:
 
 - Never commit tokens to git.
 - Treat the token like a password (anyone with it can call `/api/*` on your Studio server).
+
+## External AI Candidate Defaults
+
+`GET /api/actions/ai/candidates` now defaults to a hybrid candidate feed for ChatGPT Actions:
+
+- Top `30` candidates by fused multi-signal score
+- Plus `15` additional chat-spike candidates (deduped from the top set)
+
+If you explicitly pass `top_n` and omit `chat_top_n`, the endpoint still applies the hybrid feed (`+15` chat-spike by default).
+To force top-only behavior, pass `chat_top_n=0`.
+
+Compatibility note:
+- `chat_top` is accepted as an alias for `chat_top_n`.

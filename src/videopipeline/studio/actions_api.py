@@ -1162,6 +1162,14 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
                         "parameters": [
                             {"name": "project_id", "in": "query", "required": True, "schema": {"type": "string"}},
                             {"name": "top_n", "in": "query", "required": False, "schema": {"type": "integer"}},
+                            {"name": "chat_top_n", "in": "query", "required": False, "schema": {"type": "integer"}},
+                            {
+                                "name": "chat_top",
+                                "in": "query",
+                                "required": False,
+                                "schema": {"type": "integer"},
+                                "description": "Alias for chat_top_n.",
+                            },
                             {"name": "window_s", "in": "query", "required": False, "schema": {"type": "number"}},
                             {"name": "max_chars", "in": "query", "required": False, "schema": {"type": "integer"}},
                             {"name": "chat_lines", "in": "query", "required": False, "schema": {"type": "integer"}},
@@ -1537,7 +1545,8 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
 
             src = Path(video_result.video_path)
             prev = Path(video_result.preview_path) if getattr(video_result, "preview_path", None) else None
-            set_project_video(proj, src, preview_path=prev)
+            thumb = Path(video_result.thumbnail_path) if getattr(video_result, "thumbnail_path", None) else None
+            set_project_video(proj, src, preview_path=prev, thumbnail_path=thumb)
             set_source_url(proj, url)
 
             # Optional chat download/import (best-effort).
@@ -2406,7 +2415,8 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
 
                 src = Path(video_result.video_path)
                 prev = Path(video_result.preview_path) if getattr(video_result, "preview_path", None) else None
-                set_project_video(proj, src, preview_path=prev)
+                thumb = Path(video_result.thumbnail_path) if getattr(video_result, "thumbnail_path", None) else None
+                set_project_video(proj, src, preview_path=prev, thumbnail_path=thumb)
                 set_source_url(proj, url)
 
                 # Optional chat download/import (best-effort).
@@ -2785,6 +2795,33 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
             return s, False
         return (s[:max_chars].rstrip() + "…"), True
 
+    def _num_or_default(value: Any, default: float = 0.0) -> float:
+        try:
+            v = float(value)
+        except Exception:
+            return float(default)
+        if v != v:  # NaN guard
+            return float(default)
+        return float(v)
+
+    def _candidate_key(cand: Dict[str, Any], idx: int) -> Tuple[str, Any]:
+        cid = str(cand.get("candidate_id") or "").strip().lower()
+        if cid:
+            return ("id", cid)
+        rank = _clamp_int(cand.get("rank"), default=0, min_v=0, max_v=10**9)
+        if rank > 0:
+            return ("rank", rank)
+        return ("idx", idx)
+
+    def _candidate_chat_signal(cand: Dict[str, Any]) -> float:
+        raw = cand.get("raw_signals")
+        if isinstance(raw, dict) and "chat" in raw:
+            return _num_or_default(raw.get("chat"), 0.0)
+        breakdown = cand.get("breakdown")
+        if isinstance(breakdown, dict) and "chat" in breakdown:
+            return _num_or_default(breakdown.get("chat"), 0.0)
+        return 0.0
+
     def _get_chat_excerpt(
         *,
         proj: Project,
@@ -2930,16 +2967,33 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
     def ai_candidates(
         request: Request,
         project_id: str,
-        top_n: int = 12,
+        top_n: Optional[int] = None,
+        chat_top_n: Optional[int] = None,
+        chat_top: Optional[int] = None,
         window_s: float = 4.0,
         max_chars: int = 800,
         chat_lines: int = 8,
     ):
-        """Fetch AI-ready highlight candidates with bounded transcript/chat context."""
+        """Fetch AI-ready highlight candidates with bounded transcript/chat context.
+
+        Default strategy (when top_n/chat_top_n/chat_top omitted):
+          - top 30 by fused multi-signal score
+          - plus 15 chat-spike outliers (deduped)
+        """
         _rate_limit(request)
         pid = _validate_project_id(project_id)
 
-        top_n = _clamp_int(top_n, default=12, min_v=1, max_v=30)
+        top_n_provided = top_n is not None
+        # `chat_top` is a compatibility alias for macro prompts.
+        chat_top_n_effective = chat_top_n if chat_top_n is not None else chat_top
+        chat_top_n_provided = chat_top_n_effective is not None
+        top_n = _clamp_int(top_n, default=30, min_v=1, max_v=50) if top_n_provided else 30
+        if chat_top_n_provided:
+            chat_top_n_i = _clamp_int(chat_top_n_effective, default=15, min_v=0, max_v=30)
+        else:
+            # Default to hybrid feed even when top_n is provided.
+            # Callers can force top-only with chat_top_n=0.
+            chat_top_n_i = 15
         window_s = max(0.0, min(30.0, float(window_s)))
         max_chars = _clamp_int(max_chars, default=800, min_v=200, max_v=4000)
         chat_lines = _clamp_int(chat_lines, default=8, min_v=0, max_v=50)
@@ -2954,8 +3008,35 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
         }
 
         highlights = (proj_data.get("analysis", {}) or {}).get("highlights", {}) or {}
-        candidates = [c for c in (highlights.get("candidates") or []) if isinstance(c, dict)]
-        candidates = candidates[:top_n]
+        all_candidates = [c for c in (highlights.get("candidates") or []) if isinstance(c, dict)]
+        indexed_candidates = list(enumerate(all_candidates))
+
+        selected: list[Tuple[Dict[str, Any], str]] = []
+        selected_keys = set()
+        for idx, cand in indexed_candidates[:top_n]:
+            k = _candidate_key(cand, idx)
+            if k in selected_keys:
+                continue
+            selected_keys.add(k)
+            selected.append((cand, "multi_signal"))
+
+        chat_spike_count = 0
+        if chat_top_n_i > 0:
+            leftovers = [(idx, cand) for idx, cand in indexed_candidates if _candidate_key(cand, idx) not in selected_keys]
+            leftovers.sort(
+                key=lambda it: (
+                    _candidate_chat_signal(it[1]),
+                    _num_or_default(it[1].get("score"), 0.0),
+                ),
+                reverse=True,
+            )
+            for idx, cand in leftovers[:chat_top_n_i]:
+                k = _candidate_key(cand, idx)
+                if k in selected_keys:
+                    continue
+                selected_keys.add(k)
+                selected.append((cand, "chat_spike"))
+                chat_spike_count += 1
 
         # Transcript is optional (pipeline may not have produced it yet).
         tr = None
@@ -2967,7 +3048,7 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
             tr = None
 
         out: list[Dict[str, Any]] = []
-        for cand in candidates:
+        for cand, source_bucket in selected:
             start_s = float(cand.get("start_s") or 0.0)
             end_s = float(cand.get("end_s") or (start_s + 0.01))
             excerpt_start = max(0.0, start_s - window_s)
@@ -3011,6 +3092,8 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
                     "reasons": cand.get("reasons") or cand.get("reason"),
                     "llm_reason": cand.get("llm_reason"),
                     "llm_quote": cand.get("llm_quote"),
+                    "selection_source": source_bucket,
+                    "chat_signal": _candidate_chat_signal(cand),
                     "transcript_excerpt": transcript_excerpt,
                     "chat_excerpt": chat_excerpt,
                 }
@@ -3021,12 +3104,20 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
                 "meta": meta,
                 "limits": {
                     "top_n": top_n,
+                    "chat_top_n": chat_top_n_i,
                     "window_s": window_s,
                     "max_chars": max_chars,
                     "chat_lines": chat_lines,
                 },
+                "strategy": {
+                    "mode": "hybrid_top_plus_chat" if chat_top_n_i > 0 else "top_only",
+                    "multi_signal_count": len([1 for _, src in selected if src == "multi_signal"]),
+                    "chat_spike_count": chat_spike_count,
+                    "total_selected": len(selected),
+                    "total_candidates_available": len(all_candidates),
+                },
                 "candidates": out,
-                "total_candidates": len([c for c in (highlights.get("candidates") or []) if isinstance(c, dict)]),
+                "total_candidates": len(all_candidates),
             }
         )
 

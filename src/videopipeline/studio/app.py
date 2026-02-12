@@ -1311,6 +1311,15 @@ def create_app(
         videos: List[Dict[str, Any]] = []
         seen_paths: set = set()
         seen_urls: set = set()  # Track URLs we've already added via project
+
+        def _thumb_url_for_project(project_id: str, thumb_path: Optional[Path]) -> Optional[str]:
+            if not project_id or not thumb_path or not thumb_path.exists():
+                return None
+            try:
+                v = int(thumb_path.stat().st_mtime)
+            except Exception:
+                v = 0
+            return f"/api/home/project_thumbnail/{project_id}?v={v}"
         
         # First pass: add all project videos (these take priority)
         projects_root = default_projects_root()
@@ -1345,6 +1354,22 @@ def create_app(
                             status_error = proj_data.get("status_error")
                             video_status = str(video_info.get("status") or "ready")
                             video_error = video_info.get("error")
+                            # Best-effort thumbnail: prefer recorded path, otherwise look for standard names.
+                            thumb_path = None
+                            try:
+                                rel = (video_info or {}).get("thumbnail_path")
+                                if rel:
+                                    cand = (proj_dir / str(rel)).resolve()
+                                    if proj_dir.resolve() in cand.parents and cand.exists():
+                                        thumb_path = cand
+                            except Exception:
+                                thumb_path = None
+                            if thumb_path is None:
+                                for ext in (".webp", ".jpg", ".jpeg", ".png"):
+                                    cand = proj_dir / "video" / f"thumb{ext}"
+                                    if cand.exists():
+                                        thumb_path = cand
+                                        break
 
                             if not include_incomplete and status.lower() in {"download_failed", "analysis_failed"}:
                                 continue
@@ -1356,12 +1381,13 @@ def create_app(
                             videos.append({
                                 "path": str(f),
                                 "filename": f.name,
-                                "title": proj_data.get("title", video_info.get("title", f.stem)),
+                                "title": (proj_data.get("title") or (video_info or {}).get("title") or f.stem),
                                 "size_bytes": st.st_size,
                                 "mtime": st.st_mtime,
                                 "duration_seconds": video_info.get("duration_seconds", 0),
                                 "url": source_url,
                                 "extractor": proj_data.get("extractor", ""),
+                                "thumbnail_url": _thumb_url_for_project(proj_dir.name, thumb_path),
                                 # Project info - always has project since it's in project folder
                                 "has_project": True,
                                 "project_id": proj_dir.name,
@@ -1410,12 +1436,13 @@ def create_app(
                         videos.append({
                             "path": str(f),
                             "filename": f.name,
-                            "title": info.get("title", f.stem),
+                            "title": (info.get("title") or f.stem),
                             "size_bytes": st.st_size,
                             "mtime": st.st_mtime,
                             "duration_seconds": info.get("duration_seconds", 0),
                             "url": video_url,
                             "extractor": info.get("extractor", ""),
+                            "thumbnail_url": None,
                             # No project yet
                             "has_project": False,
                             "project_id": None,
@@ -1476,12 +1503,13 @@ def create_app(
                         videos.append({
                             "path": None,  # No video file
                             "filename": "[Incomplete Project]",
-                            "title": proj_data.get("title", video_info.get("title", f"Project {proj_dir.name[:12]}...")),
+                            "title": (proj_data.get("title") or (video_info or {}).get("title") or f"Project {proj_dir.name[:12]}..."),
                             "size_bytes": 0,
                             "mtime": mtime,
                             "duration_seconds": video_info.get("duration_seconds", 0),
                             "url": proj_data.get("source_url", "") or (proj_data.get("source", {}) or {}).get("source_url", ""),
                             "extractor": proj_data.get("extractor", ""),
+                            "thumbnail_url": None,
                             # Project info
                             "has_project": True,
                             "project_id": proj_dir.name,
@@ -1502,6 +1530,53 @@ def create_app(
         videos.sort(key=lambda v: v["mtime"], reverse=True)
         
         return JSONResponse({"videos": videos[:30]})
+
+    @app.get("/api/home/project_thumbnail/{project_id}")
+    def api_home_project_thumbnail(project_id: str) -> FileResponse:
+        """Return a project thumbnail image if present (best-effort)."""
+        from ..project import default_projects_root
+
+        pid = str(project_id or "").strip()
+        if not pid:
+            raise HTTPException(status_code=400, detail="project_id_required")
+
+        projects_root = default_projects_root().resolve()
+        proj_dir = (projects_root / pid).resolve()
+        if projects_root not in proj_dir.parents or not proj_dir.exists():
+            raise HTTPException(status_code=404, detail="project_not_found")
+
+        def _safe(p: Path) -> Path:
+            rp = p.resolve()
+            if rp != proj_dir and proj_dir not in rp.parents:
+                raise HTTPException(status_code=400, detail="invalid_thumbnail_path")
+            return rp
+
+        thumb: Optional[Path] = None
+        project_json = proj_dir / "project.json"
+        if project_json.exists():
+            try:
+                d = json.loads(project_json.read_text(encoding="utf-8"))
+                rel = (d.get("video", {}) or {}).get("thumbnail_path")
+                if rel:
+                    cand = _safe(proj_dir / str(rel))
+                    if cand.exists():
+                        thumb = cand
+            except Exception:
+                thumb = None
+
+        if thumb is None:
+            for ext in (".webp", ".jpg", ".jpeg", ".png"):
+                cand = proj_dir / "video" / f"thumb{ext}"
+                if cand.exists():
+                    thumb = _safe(cand)
+                    break
+
+        if thumb is None or not thumb.exists():
+            raise HTTPException(status_code=404, detail="thumbnail_not_found")
+
+        suf = thumb.suffix.lower()
+        media_type = "image/webp" if suf == ".webp" else ("image/png" if suf == ".png" else "image/jpeg")
+        return FileResponse(str(thumb), media_type=media_type)
 
     @app.post("/api/home/open_dialog")
     def api_home_open_dialog():
@@ -2694,11 +2769,12 @@ def create_app(
                     # Analysis/export should use the source video; browser playback can use preview.
                     source_video = Path(video_result.video_path)
                     preview_video = Path(video_result.preview_path) if video_result.preview_path else None
+                    source_thumb = Path(video_result.thumbnail_path) if getattr(video_result, "thumbnail_path", None) else None
                     
                     # If we created an early project during DAG analysis, use it and update video path
                     if early_proj:
                         from ..project import set_project_video
-                        set_project_video(early_proj, source_video, preview_path=preview_video)
+                        set_project_video(early_proj, source_video, preview_path=preview_video, thumbnail_path=source_thumb)
                         proj = early_proj
                         ctx._project = proj  # Update context to use this project
                         log.info(f"[DAG] Updated early project with source video: {source_video}")
@@ -2707,13 +2783,48 @@ def create_app(
                         # Use set_project_video to ensure video is copied into project
                         from ..project import create_project_early, set_project_video
                         proj = create_project_early(url, source_url=url)  # Create based on URL
-                        set_project_video(proj, source_video, preview_path=preview_video)  # Copy source + preview into project
+                        set_project_video(proj, source_video, preview_path=preview_video, thumbnail_path=source_thumb)  # Copy source + preview into project
                         ctx._project = proj
                     log.info(f"[DOWNLOAD] Project ready: {proj.project_dir}")
                     
                     # Store the source URL for chat download later
                     from ..project import set_source_url
                     set_source_url(proj, url)
+
+                    # Persist a contextual name + source metadata for Home.
+                    # Keep `title` user-editable by only filling it when it's missing/generic.
+                    try:
+                        from ..project import update_project
+
+                        src_title = str(getattr(video_result, "title", "") or "").strip()
+                        src_extractor = str(getattr(video_result, "extractor", "") or "").strip()
+
+                        def _upd_meta(d: Dict[str, Any]) -> None:
+                            d.setdefault("source_url", url)
+                            d.setdefault("source", {})
+                            if isinstance(d.get("source"), dict):
+                                d["source"]["source_url"] = url
+                                if src_title:
+                                    d["source"]["title"] = src_title
+                                if src_extractor:
+                                    d["source"]["extractor"] = src_extractor
+
+                            if src_extractor:
+                                d.setdefault("extractor", src_extractor)
+
+                            if src_title:
+                                cur = str(d.get("title") or "").strip()
+                                cur_l = cur.lower()
+                                # Only auto-fill when the existing title is empty/generic.
+                                if (not cur) or cur_l in {"video", "[incomplete project]"} or cur.startswith("Project "):
+                                    d["title"] = src_title
+                                d.setdefault("video", {})
+                                if isinstance(d.get("video"), dict):
+                                    d["video"].setdefault("title", src_title)
+
+                        update_project(proj, _upd_meta)
+                    except Exception:
+                        pass
                     
                     # If chat was downloaded and NOT already imported by DAG, import it
                     chat_already_imported = bool(getattr(proj, "chat_db_path", None) and proj.chat_db_path.exists())
@@ -2785,37 +2896,71 @@ def create_app(
                         else:
                             log.warning("[CHAT] Chat temp file missing: %s", chat_temp)
 
-                        # Compute LLM-based chat features if chat is available in project
+                        # Compute chat features if chat is available in project.
+                        # In external LLM mode we still compute timeline/features; we only skip local LLM calls.
                         if getattr(proj, "chat_db_path", None) and proj.chat_db_path.exists():
-                            # Avoid recomputing chat_features if the DAG (or a chat-only analysis run)
-                            # already produced it. This keeps logs clean and prevents confusing
-                            # "AI learning" messages when nothing is actually learned.
-                            if getattr(proj, "chat_features_path", None) and proj.chat_features_path.exists():
+                            recompute_reason: Optional[str] = None
+                            chat_features_path = getattr(proj, "chat_features_path", None)
+                            if not chat_features_path or not chat_features_path.exists():
+                                recompute_reason = "missing_chat_features"
+                            else:
+                                try:
+                                    cf = load_npz(chat_features_path)
+                                    counts = cf.get("counts")
+                                    if counts is None:
+                                        recompute_reason = "missing_counts"
+                                    else:
+                                        counts_arr = np.asarray(counts, dtype=np.float64).reshape(-1)
+                                        if counts_arr.size <= 0:
+                                            recompute_reason = "empty_counts"
+                                        elif not np.any(counts_arr > 0):
+                                            from ..chat.store import ChatStore
+
+                                            store = ChatStore(proj.chat_db_path)
+                                            try:
+                                                msg_count = int(store.get_message_count())
+                                            finally:
+                                                store.close()
+                                            if msg_count > 0:
+                                                recompute_reason = "all_zero_counts_with_chat_messages"
+                                except Exception as e:
+                                    recompute_reason = f"invalid_chat_features:{type(e).__name__}"
+
+                            if recompute_reason is None:
                                 log.debug("[CHAT] Chat features already exist (chat_features.npz); skipping recompute")
                             else:
+                                mode_uses_local_llm = (llm_mode != "external")
+                                status_msg = (
+                                    "Learning chat emotes with AI..."
+                                    if mode_uses_local_llm
+                                    else "Computing chat features (external mode)..."
+                                )
+                                status_detail = (
+                                    "Learning channel-specific emotes..."
+                                    if mode_uses_local_llm
+                                    else "Computing timeline with seed/channel emotes..."
+                                )
                                 JOB_MANAGER._set(
                                     job,
                                     progress=0.97,
-                                    message="Learning chat emotes with AI...",
+                                    message=status_msg,
                                     result={
                                         "video_status": "complete",
-                                        "chat_status": "ai_learning",
-                                        "chat_message": "Learning channel-specific emotes...",
+                                        "chat_status": "ai_learning" if mode_uses_local_llm else "analyzing",
+                                        "chat_message": status_detail,
                                         "transcript_status": transcript_status.get("status", "pending"),
                                         "transcript_progress": transcript_status.get("progress", 0),
                                     },
                                 )
 
-                                if llm_mode == "external":
-                                    log.info("[CHAT] External mode enabled; skipping local-LLM emote learning")
-                                else:
-                                    try:
-                                        from ..chat.features import compute_and_save_chat_features
+                                try:
+                                    from ..chat.features import compute_and_save_chat_features
 
-                                        hop_s = float(ctx.profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
-                                        smooth_s = float(ctx.profile.get("analysis", {}).get("highlights", {}).get("chat_smooth_seconds", 3.0))
+                                    hop_s = float(ctx.profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
+                                    smooth_s = float(ctx.profile.get("analysis", {}).get("highlights", {}).get("chat_smooth_seconds", 3.0))
 
-                                        # Get LLM for laugh emote learning
+                                    llm_complete_fn = None
+                                    if mode_uses_local_llm:
                                         ai_cfg = ctx.profile.get("ai", {}).get("director", {})
 
                                         def on_llm_status(msg: str) -> None:
@@ -2823,30 +2968,30 @@ def create_app(
 
                                         llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir, on_status=on_llm_status)
 
-                                        def on_feature_status(msg: str) -> None:
-                                            JOB_MANAGER._set(job, message=msg)
+                                    def on_feature_status(msg: str) -> None:
+                                        JOB_MANAGER._set(job, message=msg)
 
-                                        # Extract channel info from URL for global emote persistence
-                                        from ..chat.emote_db import get_channel_for_project
+                                    # Extract channel info from URL for global emote persistence
+                                    from ..chat.emote_db import get_channel_for_project
 
-                                        channel_info = get_channel_for_project(proj, source_url=url)
-                                        channel_id = channel_info[0] if channel_info else None
-                                        platform = channel_info[1] if channel_info else "twitch"
+                                    channel_info = get_channel_for_project(proj, source_url=url)
+                                    channel_id = channel_info[0] if channel_info else None
+                                    platform = channel_info[1] if channel_info else "twitch"
 
-                                        log.info("[CHAT] Computing chat features...")
-                                        compute_and_save_chat_features(
-                                            proj,
-                                            hop_s=hop_s,
-                                            smooth_s=smooth_s,
-                                            on_status=on_feature_status,
-                                            llm_complete=llm_complete_fn,
-                                            channel_id=channel_id,
-                                            platform=platform,
-                                        )
-                                        log.info("[CHAT] Chat features computed")
-                                    except Exception as e:
-                                        log.warning("[CHAT] Chat feature computation failed: %s", e)
-                                        # Non-fatal - features can be computed later during analysis
+                                    log.info("[CHAT] Computing chat features (reason=%s)...", recompute_reason)
+                                    compute_and_save_chat_features(
+                                        proj,
+                                        hop_s=hop_s,
+                                        smooth_s=smooth_s,
+                                        on_status=on_feature_status,
+                                        llm_complete=llm_complete_fn,
+                                        channel_id=channel_id,
+                                        platform=platform,
+                                    )
+                                    log.info("[CHAT] Chat features computed")
+                                except Exception as e:
+                                    log.warning("[CHAT] Chat feature computation failed: %s", e)
+                                    # Non-fatal - features can be computed later during analysis
 
                         if chat_result.get("imported"):
                             JOB_MANAGER._set(
