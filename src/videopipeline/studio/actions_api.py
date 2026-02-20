@@ -3862,25 +3862,60 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
                 d["selections"] = sels
 
             key_to_id: Dict[Tuple[Any, Any], str] = {}
+            time_to_id: Dict[Tuple[int, int], str] = {}
+
+            def _norm_rank(v: Any) -> Optional[int]:
+                if v is None:
+                    return None
+                try:
+                    vv = int(v)
+                except Exception:
+                    return None
+                return vv if vv > 0 else None
+
+            def _norm_time_key(start_v: Any, end_v: Any) -> Optional[Tuple[int, int]]:
+                try:
+                    start = float(start_v)
+                    end = float(end_v)
+                except Exception:
+                    return None
+                if not (end > start):
+                    return None
+                return (int(round(start * 1000.0)), int(round(end * 1000.0)))
+
             for s in sels:
                 if not isinstance(s, dict):
                     continue
-                key = (s.get("candidate_rank"), s.get("variant_id"))
+                rank = _norm_rank(s.get("candidate_rank") or s.get("rank"))
+                variant_id = str(s.get("variant_id") or s.get("best_variant_id") or s.get("chosen_variant_id") or "").strip()
+                key = (rank, variant_id)
                 sid = s.get("id")
-                if sid and key not in key_to_id and key[0] is not None and key[1] is not None:
+                if sid and key not in key_to_id and key[0] is not None and key[1]:
                     key_to_id[key] = str(sid)
+                tk = _norm_time_key(s.get("start_s"), s.get("end_s"))
+                if sid and tk is not None and tk not in time_to_id:
+                    time_to_id[tk] = str(sid)
 
             for p in picks:
-                key = (p.get("candidate_rank"), p.get("variant_id"))
-                if key[0] is None or key[1] is None:
+                rank = _norm_rank(p.get("candidate_rank") or p.get("rank"))
+                variant_id = str(p.get("variant_id") or p.get("best_variant_id") or p.get("chosen_variant_id") or "").strip()
+                tk = _norm_time_key(p.get("start_s"), p.get("end_s"))
+                if tk is None:
                     continue
-                sid = key_to_id.get(key)
+
+                sid: Optional[str] = None
+                if rank is not None and variant_id:
+                    sid = key_to_id.get((rank, variant_id))
+                if not sid:
+                    sid = time_to_id.get(tk)
                 if sid:
                     export_ids.append(sid)
                     continue
 
                 sid = uuid.uuid4().hex
-                key_to_id[key] = sid
+                if rank is not None and variant_id:
+                    key_to_id[(rank, variant_id)] = sid
+                time_to_id[tk] = sid
                 created_ids.append(sid)
                 export_ids.append(sid)
 
@@ -3893,9 +3928,9 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
                         "title": str(p.get("title") or ""),
                         "notes": str(p.get("hook") or ""),
                         "template": str(p.get("template") or template_default),
-                        "candidate_rank": p.get("candidate_rank"),
+                        "candidate_rank": rank,
                         "candidate_peak_time_s": p.get("peak_time_s"),
-                        "variant_id": p.get("variant_id"),
+                        "variant_id": variant_id,
                         "director_confidence": p.get("confidence"),
                     }
                 )

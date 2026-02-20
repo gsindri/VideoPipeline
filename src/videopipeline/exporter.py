@@ -241,10 +241,15 @@ def filtergraph_for_template(
 
 
 def _escape_drawtext_text(text: str) -> str:
+    # Keep overlay text as a single line; line breaks often cause filter parse surprises.
+    text = str(text).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
     return (
         text.replace("\\", "\\\\")
         .replace(":", "\\:")
         .replace("'", "\\'")
+        .replace(",", "\\,")
+        .replace(";", "\\;")
+        .replace("%", "\\%")
         .replace("[", "\\[")
         .replace("]", "\\]")
     )
@@ -270,13 +275,7 @@ def _resolve_hook_font(font: str) -> Optional[Path]:
     return p if p.exists() else None
 
 
-def build_ffmpeg_command(spec: ExportSpec) -> list[str]:
-    _require_cmd("ffmpeg")
-
-    duration = max(0.01, float(spec.end_s - spec.start_s))
-    if duration <= 0.01:
-        raise ValueError("end_s must be > start_s")
-
+def _build_video_filtergraph(spec: ExportSpec) -> str:
     source_width = None
     source_height = None
     if spec.layout_facecam is not None or spec.template in {"vertical_streamer_pip", "vertical_streamer_split"}:
@@ -294,7 +293,7 @@ def build_ffmpeg_command(spec: ExportSpec) -> list[str]:
         pip_spec=spec.layout_pip,
     )
 
-    # Optional subtitles burned-in
+    # Optional subtitles burned-in.
     if spec.subtitles_ass is not None:
         subs = _escape_path_for_ffmpeg_filter(spec.subtitles_ass)
         if vf == "null":
@@ -302,6 +301,7 @@ def build_ffmpeg_command(spec: ExportSpec) -> list[str]:
         else:
             vf = f"{vf},subtitles='{subs}'"
 
+    # Optional hook text overlay.
     if spec.hook_text is not None and spec.hook_text.enabled:
         hook = spec.hook_text
         if hook.text:
@@ -313,6 +313,7 @@ def build_ffmpeg_command(spec: ExportSpec) -> list[str]:
                 draw = (
                     "drawtext="
                     f"fontfile='{fontfile}':"
+                    "expansion=none:"
                     f"text='{text}':"
                     f"fontsize={int(hook.fontsize)}:"
                     "fontcolor=white:borderw=3:bordercolor=black@0.8:"
@@ -324,6 +325,67 @@ def build_ffmpeg_command(spec: ExportSpec) -> list[str]:
                     vf = draw
                 else:
                     vf = f"{vf},{draw}"
+
+    return vf
+
+
+def _append_video_filters(cmd: list[str], vf: str, *, map_audio: bool) -> None:
+    if vf == "null":
+        return
+    use_complex = ";" in vf
+    if use_complex:
+        # Label final output via an explicit pass-through filter. Appending
+        # "[vout]" directly to the previous filter can be misparsed when the
+        # preceding filter has quoted expressions (e.g. drawtext enable=...).
+        cmd += ["-filter_complex", f"{vf},null[vout]", "-map", "[vout]"]
+        if map_audio:
+            cmd += ["-map", "0:a?"]
+        return
+    cmd += ["-vf", vf]
+
+
+def _preflight_filtergraph(spec: ExportSpec) -> None:
+    """Validate that the generated video filter graph parses before full encode."""
+    _require_cmd("ffmpeg")
+    vf = _build_video_filtergraph(spec)
+    if vf == "null":
+        return
+
+    duration = max(0.2, min(1.5, float(spec.end_s - spec.start_s)))
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-v",
+        "error",
+        "-ss",
+        f"{spec.start_s:.3f}",
+        "-i",
+        str(spec.video_path),
+        "-t",
+        f"{duration:.3f}",
+    ]
+    _append_video_filters(cmd, vf, map_audio=False)
+    cmd += ["-an", "-frames:v", "1", "-f", "null", "-"]
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        **_subprocess_flags(),
+    )
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"ffmpeg filtergraph validation failed (exit={result.returncode}). {err[:1200]}")
+
+
+def build_ffmpeg_command(spec: ExportSpec) -> list[str]:
+    _require_cmd("ffmpeg")
+
+    duration = max(0.01, float(spec.end_s - spec.start_s))
+    if duration <= 0.01:
+        raise ValueError("end_s must be > start_s")
+
+    vf = _build_video_filtergraph(spec)
 
     cmd: list[str] = [
         "ffmpeg",
@@ -339,13 +401,7 @@ def build_ffmpeg_command(spec: ExportSpec) -> list[str]:
     ]
 
     # Filters & frame rate
-    use_complex = vf != "null" and ";" in vf
-    if vf != "null":
-        if use_complex:
-            vf = f"{vf}[vout]"
-            cmd += ["-filter_complex", vf, "-map", "[vout]", "-map", "0:a?"]
-        else:
-            cmd += ["-vf", vf]
+    _append_video_filters(cmd, vf, map_audio=True)
 
     cmd += ["-r", str(spec.fps)]
 
@@ -410,6 +466,10 @@ def run_ffmpeg_export(
             loudness normalization for more accurate results. Adds ~30-50% time.
     """
     duration = max(0.01, float(spec.end_s - spec.start_s))
+
+    if on_progress:
+        on_progress(0.0, "validating filter graph")
+    _preflight_filtergraph(spec)
     
     # Two-pass loudness normalization: measure first, then encode with measured values
     if spec.normalize_audio and two_pass_loudnorm:

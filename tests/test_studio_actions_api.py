@@ -899,3 +899,75 @@ def test_actions_export_director_picks_creates_job(tmp_path, monkeypatch):
     job = JOB_MANAGER.get(job_id)
     assert job is not None
     assert job.status == "succeeded"
+
+
+def test_actions_export_director_picks_accepts_legacy_pick_shape(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    import time
+    from videopipeline.studio.jobs import JOB_MANAGER
+
+    pid = hashlib.sha256("twitch_239".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "video").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "exports").mkdir(parents=True, exist_ok=True)
+    video_path = proj_dir / "video" / "video.mp4"
+    video_path.write_bytes(b"")
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(video_path), "duration_seconds": 60.0},
+        "analysis": {"highlights": {"candidates": []}},
+        "layout": {},
+        "selections": [],
+        "exports": [],
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+
+    # Legacy-ish pick: uses rank + best_variant_id instead of candidate_rank + variant_id.
+    director_json = {
+        "created_at": "now",
+        "pick_count": 1,
+        "picks": [
+            {
+                "rank": 2,
+                "best_variant_id": "medium",
+                "start_s": 12.0,
+                "end_s": 28.0,
+                "duration_s": 16.0,
+                "title": "t",
+                "hook": "h",
+                "confidence": 0.8,
+            },
+        ],
+    }
+    (proj_dir / "analysis" / "director.json").write_text(json.dumps(director_json), encoding="utf-8")
+
+    # Avoid running ffmpeg in tests.
+    def fake_start_export(*, proj, selection, export_dir, **kwargs):
+        job = JOB_MANAGER.create("export")
+        JOB_MANAGER._set(job, status="succeeded", progress=1.0, message="done", result={"output": str(export_dir / "dummy.mp4")})
+        return job
+
+    monkeypatch.setattr(JOB_MANAGER, "start_export", fake_start_export)
+
+    r = client.post(
+        "/api/actions/export_director_picks",
+        headers=hdr,
+        json={"project_id": pid, "limit": 1, "client_request_id": "export-dir-legacy-1"},
+    )
+    assert r.status_code == 200
+    job_id = r.json()["job_id"]
+
+    for _ in range(200):
+        job = JOB_MANAGER.get(job_id)
+        if job and job.status in {"succeeded", "failed", "cancelled"}:
+            break
+        time.sleep(0.01)
+
+    job = JOB_MANAGER.get(job_id)
+    assert job is not None
+    assert job.status == "succeeded"
