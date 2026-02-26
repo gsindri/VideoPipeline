@@ -16,7 +16,8 @@ param(
   [switch]$CopyImportUrl,
   [switch]$OpenImportUrl,
   [switch]$PrintImportUrl,
-  [int]$WaitSeconds = 30,
+  [switch]$Detach,
+  [int]$WaitSeconds = 120,
   [string]$Protocol = "http2"
 )
 
@@ -48,7 +49,7 @@ function Update-WorkerUpstreamKv([string]$publicBase) {
   $headers = @{ Authorization = "Bearer $tok" }
 
   try {
-    Invoke-RestMethod -Method Put -Uri $uri -Headers $headers -ContentType "text/plain" -Body $publicBase | Out-Null
+    Invoke-RestMethod -Method Put -Uri $uri -Headers $headers -ContentType "text/plain" -Body $publicBase -TimeoutSec 12 | Out-Null
     Write-Host "[proxy] Updated Workers KV: base = $publicBase" -ForegroundColor Cyan
   } catch {
     Write-Err "[proxy] KV update failed: $($_.Exception.Message)"
@@ -56,11 +57,7 @@ function Update-WorkerUpstreamKv([string]$publicBase) {
 }
 
 function Copy-ToClipboard([string]$Text) {
-  try {
-    Set-Clipboard -Value $Text
-    return
-  } catch {}
-  # Fallback: spawn clip.exe and write to stdin (no newline).
+  # Use clip.exe with timeout to avoid occasional Set-Clipboard stalls.
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = "clip.exe"
   $psi.UseShellExecute = $false
@@ -72,7 +69,10 @@ function Copy-ToClipboard([string]$Text) {
   try {
     $p.StandardInput.Write($Text)
     $p.StandardInput.Close()
-    $p.WaitForExit()
+    if (-not $p.WaitForExit(5000)) {
+      try { $p.Kill() } catch {}
+      throw "clip.exe timed out"
+    }
     if ($p.ExitCode -ne 0) { throw "clip.exe failed (exit $($p.ExitCode))" }
   } finally {
     try { $p.Dispose() } catch {}
@@ -82,6 +82,7 @@ function Copy-ToClipboard([string]$Text) {
 try {
   $exitCode = 0
   $proc = $null
+  $keepTunnelRunning = $false
   # Repo root from this file's location: <repo>\tools\studio_quick_tunnel.ps1
   $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 
@@ -249,7 +250,6 @@ try {
   Write-Info "[studio] Local: http://127.0.0.1:$port/"
 
   Write-Info "[tunnel] Starting Cloudflare Quick Tunnel (protocol=$Protocol)..."
-  Write-Info "[tunnel] Press Ctrl+C to stop the tunnel."
 
   $publicBase = $null
   $importUrl  = $null
@@ -268,7 +268,8 @@ try {
     "--logfile", $logPath
   )
 
-  $proc = Start-Process -FilePath "cloudflared" -ArgumentList $cfArgs -WorkingDirectory $repoRoot -NoNewWindow -PassThru
+  # Run cloudflared hidden to avoid terminal UI freezes from heavy stdout updates.
+  $proc = Start-Process -FilePath "cloudflared" -ArgumentList $cfArgs -WorkingDirectory $repoRoot -WindowStyle Hidden -PassThru
 
   $deadline = (Get-Date).AddSeconds([Math]::Max(5, $WaitSeconds))
   while ((Get-Date) -lt $deadline -and (-not $publicBase)) {
@@ -321,8 +322,17 @@ try {
     throw "cloudflared did not produce a trycloudflare URL (proc=$($proc.Id) exit=$code). Log tail from ${logPath}:`n$tailText"
   }
 
-  # Block until cloudflared exits; Ctrl+C will stop the tunnel (see finally).
-  while (-not $proc.HasExited) { Start-Sleep -Milliseconds 300 }
+  if (-not $proc.HasExited) {
+    if ($Detach) {
+      $keepTunnelRunning = $true
+      Write-Host ("[tunnel] Detached. cloudflared PID: {0}" -f $proc.Id) -ForegroundColor Cyan
+      Write-Host ("[tunnel] Log file: {0}" -f $logPath) -ForegroundColor DarkCyan
+      Write-Host "[tunnel] To stop later: taskkill /F /IM cloudflared.exe" -ForegroundColor DarkCyan
+    } else {
+      Write-Host ("[tunnel] Running (PID {0}). Press Enter to stop the tunnel." -f $proc.Id) -ForegroundColor Cyan
+      try { [void](Read-Host) } catch {}
+    }
+  }
 } catch {
   $exitCode = 1
   $msg = $_.Exception.Message
@@ -331,7 +341,7 @@ try {
 } finally {
   # Ctrl+C stops this script, but doesn't necessarily stop the child process.
   # Ensure we clean up cloudflared if it's still running.
-  if ($proc -and (-not $proc.HasExited)) {
+  if ($proc -and (-not $proc.HasExited) -and (-not $keepTunnelRunning)) {
     try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue | Out-Null } catch {}
   }
 }

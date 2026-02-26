@@ -89,3 +89,9 @@ logs/
 !samples/
 !samples/**/*
 /_shots
+
+# ---------------------------------------
+# Machine-specific launcher scripts
+# ---------------------------------------
+tools/codex-tabs.bat
+tools/test-wt.bat
