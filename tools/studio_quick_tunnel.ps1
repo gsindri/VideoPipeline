@@ -12,6 +12,7 @@
 [CmdletBinding()]
 param(
   [switch]$StartStudio,
+  [string]$StudioProfile = "",
   [switch]$CopyToken,
   [switch]$CopyImportUrl,
   [switch]$OpenImportUrl,
@@ -107,7 +108,27 @@ try {
     Write-Info "[token] VP_API_TOKEN copied to clipboard."
   }
 
-  function Get-StudioProc {
+  function Resolve-StudioProfilePath([string]$raw) {
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+    $trimmed = ([string]$raw).Trim().Trim('"')
+    if ([string]::IsNullOrWhiteSpace($trimmed)) { return $null }
+    $candidate = $trimmed
+    if (-not [System.IO.Path]::IsPathRooted($candidate)) {
+      $candidate = Join-Path $repoRoot $candidate
+    }
+    try {
+      return (Resolve-Path -LiteralPath $candidate).Path
+    } catch {
+      throw "Studio profile not found: $candidate"
+    }
+  }
+
+  $resolvedStudioProfile = Resolve-StudioProfilePath $StudioProfile
+  if ($resolvedStudioProfile) {
+    Write-Info "[studio] Requested profile: $resolvedStudioProfile"
+  }
+
+  function Get-StudioProc([string]$profilePath = $null) {
     # Choose the newest python/pythonw process whose command line contains videopipeline.launcher
     $cands = Get-CimInstance Win32_Process |
       Where-Object {
@@ -115,6 +136,11 @@ try {
         ($_.Name -match '^python(w)?\.exe$') -and
         ($_.CommandLine -match 'videopipeline\.launcher')
       }
+
+    if ($profilePath) {
+      $needle = [regex]::Escape($profilePath)
+      $cands = $cands | Where-Object { $_.CommandLine -match $needle }
+    }
 
     if (-not $cands) { return $null }
 
@@ -126,29 +152,56 @@ try {
   }
 
   function Start-StudioIfNeeded {
-    $existing = Get-StudioProc
+    if ($resolvedStudioProfile) {
+      $existing = Get-StudioProc -profilePath $resolvedStudioProfile
+    } else {
+      $existing = Get-StudioProc
+    }
     if ($existing) { return $existing }
 
     if (-not $StartStudio) { return $null }
+
+    if ($resolvedStudioProfile) {
+      $otherStudio = Get-StudioProc
+      if ($otherStudio) {
+        $fixedPort = Get-EnvInt "VP_STUDIO_PORT"
+        if ($fixedPort) {
+          throw "Studio is already running on VP_STUDIO_PORT=$fixedPort with a different profile. Close Studio first, or unset VP_STUDIO_PORT to allow a second instance."
+        }
+      }
+    }
 
     $py = Join-Path $repoRoot ".venv\Scripts\python.exe"
     if (!(Test-Path -LiteralPath $py)) {
       throw "Venv python not found: $py"
     }
 
-    Write-Info "[studio] Starting Studio (minimized)..."
+    if ($resolvedStudioProfile) {
+      Write-Info "[studio] Starting Studio with profile (minimized)..."
+    } else {
+      Write-Info "[studio] Starting Studio (minimized)..."
+    }
+
+    $launcherArgs = @("-m", "videopipeline.launcher")
+    if ($resolvedStudioProfile) {
+      $launcherArgs += @("--profile", $resolvedStudioProfile, "--no-reuse")
+    }
 
     $old = $env:VP_API_TOKEN
     $env:VP_API_TOKEN = $token
     try {
-      Start-Process -FilePath $py -ArgumentList @("-m", "videopipeline.launcher") -WorkingDirectory $repoRoot -WindowStyle Minimized | Out-Null
+      Start-Process -FilePath $py -ArgumentList $launcherArgs -WorkingDirectory $repoRoot -WindowStyle Minimized | Out-Null
     } finally {
       $env:VP_API_TOKEN = $old
     }
 
     $deadline = (Get-Date).AddSeconds([Math]::Max(5, $WaitSeconds))
     while ((Get-Date) -lt $deadline) {
-      $p = Get-StudioProc
+      if ($resolvedStudioProfile) {
+        $p = Get-StudioProc -profilePath $resolvedStudioProfile
+      } else {
+        $p = Get-StudioProc
+      }
       if ($p) { return $p }
       Start-Sleep -Milliseconds 300
     }

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-
 import pytest
 
 from videopipeline.ingest.models import (
@@ -37,6 +35,13 @@ from videopipeline.ingest.postprocess import (
     needs_preview,
     needs_remux,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tuning_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import videopipeline.ingest.tuner as tuner
+
+    monkeypatch.setattr(tuner, "tuning_file_path", lambda: tmp_path / "tuning.json")
 
 
 # =============================================================================
@@ -219,15 +224,12 @@ class TestTuningPersistence:
         assert tuning.N == 4
         assert tuning.max_N == 16
 
-    def test_update_and_load(self, tmp_path: Path):
+    def test_update_and_load(self):
         """Can save and load tuning state."""
-        from videopipeline.ingest.tuner import tuning_file_path
-
-        with patch("videopipeline.ingest.tuner.tuning_file_path", return_value=tmp_path / "tuning.json"):
-            update_domain_tuning("test.com", 12, "ok")
-            tuning = get_domain_tuning("test.com")
-            assert tuning.N == 12
-            assert tuning.last_result == "ok"
+        update_domain_tuning("test.com", 12, "ok")
+        tuning = get_domain_tuning("test.com")
+        assert tuning.N == 12
+        assert tuning.last_result == "ok"
 
 
 # =============================================================================

@@ -5,6 +5,16 @@ from typing import Any, Dict, Optional
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_diarization_batch_cache(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    from videopipeline.transcription import diarization as dia
+
+    cache_path = tmp_path / "diarization_batch_cache.json"
+    monkeypatch.setattr(dia, "_batch_cache_path", lambda: cache_path)
+    monkeypatch.setattr(dia, "_batch_size_cache", {})
+    monkeypatch.setattr(dia, "_batch_size_cache_loaded", False)
+
+
 def test_configure_pyannote_batches_uses_instantiate_nested_config() -> None:
     from videopipeline.transcription import diarization as dia
 
@@ -42,9 +52,6 @@ def test_configure_pyannote_batches_returns_false_without_instantiate() -> None:
 
 def test_autotune_batch_sizes_retries_and_caches(monkeypatch: pytest.MonkeyPatch) -> None:
     from videopipeline.transcription import diarization as dia
-
-    # Ensure a clean cache for this test.
-    monkeypatch.setattr(dia, "_batch_size_cache", {})
 
     class FakePipeline:
         def __init__(self) -> None:
@@ -88,4 +95,3 @@ def test_autotune_batch_sizes_retries_and_caches(monkeypatch: pytest.MonkeyPatch
     )
     assert tuned2 == (8, 8)
     assert len(p.instantiate_calls) == 3  # cached; no additional calls
-

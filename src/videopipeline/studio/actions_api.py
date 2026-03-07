@@ -14,6 +14,8 @@ from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from ..analysis import run_analysis
+from ..analysis_director import DirectorConfig
+from ..analysis_highlights import CONTENT_TYPE_GUIDANCE
 from ..ai.helpers import get_llm_complete_fn
 from ..ingest import IngestRequest, QualityCap, SpeedMode
 from ..ingest.ytdlp_runner import DownloadCancelled, download_url
@@ -26,6 +28,12 @@ from ..project import (
     save_json,
     set_project_status,
     set_source_url,
+)
+from .dag_config import (
+    apply_llm_mode_to_dag_config,
+    build_dag_config,
+    dag_config_needs_llm,
+    normalize_llm_mode as _normalize_llm_mode_raw,
 )
 from .jobs import JOB_MANAGER, with_prevent_sleep
 
@@ -306,35 +314,10 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
     last_run_by_actor: Dict[str, str] = {}
 
     def _normalize_llm_mode(value: Any) -> str:
-        mode = str(value or "local").strip().lower()
-        if mode not in {"local", "external"}:
+        try:
+            return _normalize_llm_mode_raw(value)
+        except ValueError:
             raise HTTPException(status_code=400, detail="invalid_llm_mode")
-        return mode
-
-    def _apply_llm_mode_to_dag_config(dag_config: Dict[str, Any], *, llm_mode: str) -> Dict[str, Any]:
-        """Force config changes needed to ensure no local LLM calls occur."""
-        mode = _normalize_llm_mode(llm_mode)
-        if mode != "external":
-            return dag_config
-
-        cfg = dict(dag_config or {})
-
-        # Ensure all LLM-backed analysis steps are either disabled or forced into
-        # non-LLM modes; the external LLM loop runs via Actions IO endpoints.
-        highlights_cfg = dict(cfg.get("highlights", {}) or {})
-        highlights_cfg["llm_semantic_enabled"] = False
-        highlights_cfg["llm_filter_enabled"] = False
-        cfg["highlights"] = highlights_cfg
-
-        chapters_cfg = dict(cfg.get("chapters", {}) or {})
-        chapters_cfg["llm_labeling"] = False
-        cfg["chapters"] = chapters_cfg
-
-        director_cfg = dict(cfg.get("director", {}) or {})
-        director_cfg["enabled"] = False
-        cfg["director"] = director_cfg
-
-        return cfg
 
     def _rate_limit(request: Request) -> str:
         actor_key = _request_actor_key(request)
@@ -1682,22 +1665,18 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
             if "whisper_verbose" in overrides:
                 speech_cfg["verbose"] = bool(overrides.get("whisper_verbose"))
 
-            dag_config: Dict[str, Any] = {
-                **analysis_cfg,
-                "speech": speech_cfg,
-                "include_chat": True,
-                "include_audio_events": bool(analysis_cfg.get("audio_events", {}).get("enabled", True)),
-            }
-            dag_config = _apply_llm_mode_to_dag_config(dag_config, llm_mode=llm_mode)
+            dag_config = build_dag_config(
+                analysis_cfg,
+                section_overrides={"speech": speech_cfg},
+                include_chat=True,
+            )
+            dag_config = apply_llm_mode_to_dag_config(dag_config, llm_mode=llm_mode)
 
             llm_complete_fn = None
             if llm_mode != "external":
                 try:
                     ai_cfg = profile.get("ai", {}).get("director", {}) or {}
-                    highlights_cfg = dag_config.get("highlights", {}) or {}
-                    llm_needed = bool(highlights_cfg.get("llm_semantic_enabled", True)) or bool(
-                        highlights_cfg.get("llm_filter_enabled", False)
-                    )
+                    llm_needed = dag_config_needs_llm(dag_config)
                     if ai_cfg.get("enabled", True) and llm_needed:
                         llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
                 except Exception:
@@ -2538,22 +2517,18 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
                 if "whisper_verbose" in overrides:
                     speech_cfg["verbose"] = bool(overrides.get("whisper_verbose"))
 
-                dag_config: Dict[str, Any] = {
-                    **analysis_cfg,
-                    "speech": speech_cfg,
-                    "include_chat": True,
-                    "include_audio_events": bool(analysis_cfg.get("audio_events", {}).get("enabled", True)),
-                }
-                dag_config = _apply_llm_mode_to_dag_config(dag_config, llm_mode=llm_mode)
+                dag_config = build_dag_config(
+                    analysis_cfg,
+                    section_overrides={"speech": speech_cfg},
+                    include_chat=True,
+                )
+                dag_config = apply_llm_mode_to_dag_config(dag_config, llm_mode=llm_mode)
 
                 llm_complete_fn = None
                 if llm_mode != "external":
                     try:
                         ai_cfg = profile.get("ai", {}).get("director", {}) or {}
-                        highlights_cfg = dag_config.get("highlights", {}) or {}
-                        llm_needed = bool(highlights_cfg.get("llm_semantic_enabled", True)) or bool(
-                            highlights_cfg.get("llm_filter_enabled", False)
-                        )
+                        llm_needed = dag_config_needs_llm(dag_config)
                         if ai_cfg.get("enabled", True) and llm_needed:
                             llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
                     except Exception:
@@ -2821,6 +2796,118 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
         if isinstance(breakdown, dict) and "chat" in breakdown:
             return _num_or_default(breakdown.get("chat"), 0.0)
         return 0.0
+
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            v = float(value)
+            if v == v:
+                return v
+        except Exception:
+            pass
+        return float(default)
+
+    def _trim_copy_text(value: Any, *, max_chars: int) -> str:
+        s = str(value or "").replace("\n", " ").replace("\r", " ").strip()
+        if max_chars <= 0 or len(s) <= max_chars:
+            return s
+        cut = s[: max_chars - 1]
+        if " " in cut:
+            cut = cut.rsplit(" ", 1)[0]
+        return (cut + "…").strip()
+
+    def _clean_hashtag(value: Any) -> str:
+        tag = str(value or "").strip()
+        if not tag:
+            return ""
+        tag = re.sub(r"[^0-9A-Za-z_]+", "", tag)
+        if not tag:
+            return ""
+        if not tag.startswith("#"):
+            tag = "#" + tag
+        return tag
+
+    def _normalize_hashtags(raw: Any, *, defaults: Optional[list[str]] = None, min_n: int = 3, max_n: int = 8) -> list[str]:
+        if isinstance(raw, str):
+            parts = re.split(r"[\s,]+", raw.strip())
+        elif isinstance(raw, list):
+            parts = raw
+        else:
+            parts = []
+
+        out: list[str] = []
+        seen = set()
+        for p in parts:
+            t = _clean_hashtag(p)
+            if not t:
+                continue
+            key = t.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(t)
+            if len(out) >= max_n:
+                break
+
+        seed = list(defaults or ["#clips", "#gaming", "#stream"])
+        for d in seed:
+            if len(out) >= min_n:
+                break
+            t = _clean_hashtag(d)
+            if not t:
+                continue
+            key = t.lower()
+            if key in seen:
+                continue
+            out.append(t)
+            seen.add(key)
+
+        return out[:max_n]
+
+    def _director_config_from_profile() -> DirectorConfig:
+        analysis_cfg = profile.get("analysis", {}) or {}
+        ai_cfg = (profile.get("ai", {}) or {}).get("director", {}) or {}
+        raw: Dict[str, Any] = dict((analysis_cfg.get("director", {}) or {}))
+        if "enabled" not in raw:
+            raw["enabled"] = bool(ai_cfg.get("enabled", True))
+        if "platform" not in raw and ai_cfg.get("platform") is not None:
+            raw["platform"] = ai_cfg.get("platform")
+        if "fallback_to_rules" not in raw and ai_cfg.get("fallback_to_rules") is not None:
+            raw["fallback_to_rules"] = ai_cfg.get("fallback_to_rules")
+        return DirectorConfig.from_dict(raw)
+
+    def _director_default_template(cfg: DirectorConfig) -> str:
+        allowed = [str(x) for x in list(cfg.allowed_templates or []) if str(x).strip()]
+        if cfg.default_template in allowed:
+            return str(cfg.default_template)
+        if allowed:
+            return str(allowed[0])
+        return str((profile.get("export", {}) or {}).get("template") or "vertical_streamer_pip")
+
+    def _load_chapter_ranges(proj: Project) -> list[tuple[float, float]]:
+        path = proj.analysis_dir / "chapters.json"
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        out: list[tuple[float, float]] = []
+        for c in (data.get("chapters") or []):
+            if not isinstance(c, dict):
+                continue
+            a = _safe_float(c.get("start_s"), -1.0)
+            b = _safe_float(c.get("end_s"), -1.0)
+            if b > a >= 0.0:
+                out.append((a, b))
+        return out
+
+    def _chapter_index_for_time(chapters: list[tuple[float, float]], t: float) -> Optional[int]:
+        for i, (a, b) in enumerate(chapters):
+            if a <= t < b:
+                return i
+        if chapters and t >= chapters[-1][0]:
+            return len(chapters) - 1
+        return None
 
     def _get_chat_excerpt(
         *,
@@ -3099,6 +3186,13 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
                 }
             )
 
+        analysis_cfg = profile.get("analysis", {}) or {}
+        highlights_cfg = analysis_cfg.get("highlights", {}) or {}
+        content_type = str(highlights_cfg.get("content_type", "gaming") or "gaming").strip().lower()
+        guide = CONTENT_TYPE_GUIDANCE.get(content_type) or CONTENT_TYPE_GUIDANCE.get("gaming", {})
+        director_cfg = _director_config_from_profile()
+        director_template_default = _director_default_template(director_cfg)
+
         return JSONResponse(
             {
                 "meta": meta,
@@ -3115,6 +3209,30 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
                     "chat_spike_count": chat_spike_count,
                     "total_selected": len(selected),
                     "total_candidates_available": len(all_candidates),
+                },
+                "ai_guidance": {
+                    "semantic_scoring": {
+                        "content_type": content_type,
+                        "description": guide.get("description", ""),
+                        "high_value": list(guide.get("high_value", []) or []),
+                        "low_value": list(guide.get("low_value", []) or []),
+                        "instruction": (
+                            "Use transcript/chat context and signal data together; keep high-signal moments high unless "
+                            "content is clearly weak."
+                        ),
+                    },
+                    "director_constraints": {
+                        "top_n": int(director_cfg.top_n),
+                        "min_gap_s": float(director_cfg.min_gap_s),
+                        "max_overlap_ratio": float(director_cfg.max_overlap_ratio),
+                        "max_overlap_s": float(director_cfg.max_overlap_s),
+                        "title_max_chars": int(director_cfg.title_max_chars),
+                        "hook_max_chars": int(director_cfg.hook_max_chars),
+                        "description_max_chars": int(director_cfg.description_max_chars),
+                        "allowed_templates": list(director_cfg.allowed_templates or []),
+                        "default_template": director_template_default,
+                        "chapter_diversity_max_per_chapter": 2,
+                    },
                 },
                 "candidates": out,
                 "total_candidates": len(all_candidates),
@@ -3514,7 +3632,7 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
                 chapter_id = int(cid)
             except Exception:
                 continue
-            if chapter_id <= 0:
+            if chapter_id < 0:
                 continue
             labels[chapter_id] = {
                 "title": it.get("title"),
@@ -3622,20 +3740,22 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
         now = utc_now_iso()
         picks: list[Dict[str, Any]] = []
         missing: list[Dict[str, Any]] = []
+        director_cfg = _director_config_from_profile()
+        allowed_templates = set(str(x) for x in list(director_cfg.allowed_templates or []) if str(x).strip())
+        template_default = _director_default_template(director_cfg)
+        chapter_ranges = _load_chapter_ranges(proj)
+        used_intervals: list[tuple[float, float, float]] = []  # start, end, peak
+        used_chapters: Dict[int, int] = {}
+        max_picks = max(1, int(director_cfg.top_n))
 
         def _norm_tags(raw: Any) -> list[str]:
-            if raw is None:
-                return []
-            if isinstance(raw, str):
-                # allow "#a #b" or "a,b"
-                parts = re.split(r"[\s,]+", raw.strip())
-                return [p.strip() for p in parts if p.strip()]
-            if isinstance(raw, list):
-                return [str(x).strip() for x in raw if str(x).strip()]
-            return []
+            return _normalize_hashtags(raw, defaults=list(director_cfg.hashtags or []), min_n=3, max_n=8)
 
         for idx, p in enumerate(picks_in, start=1):
             if not isinstance(p, dict):
+                continue
+            if len(picks) >= max_picks:
+                missing.append({"index": idx, "error": "top_n_limit"})
                 continue
             cand_id = str(p.get("candidate_id") or "").strip()
             cand_rank = 0
@@ -3684,9 +3804,83 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
             confidence = max(0.0, min(1.0, confidence))
 
             cand = cand_by_rank.get(cand_rank) or {}
-            peak_time = float(cand.get("peak_time_s") or getattr(cv, "candidate_peak_time_s", 0.0) or 0.0)
+            start_s = float(getattr(v, "start_s", 0.0))
+            end_s = float(getattr(v, "end_s", 0.0))
+            if end_s <= start_s:
+                missing.append({"candidate_rank": cand_rank, "candidate_id": cand_id or None, "variant_id": variant_id, "error": "invalid_variant_range"})
+                continue
+            duration_s = max(1e-6, end_s - start_s)
+            peak_time = float(cand.get("peak_time_s") or getattr(cv, "candidate_peak_time_s", 0.0) or ((start_s + end_s) / 2.0))
             if not cand_id:
                 cand_id = str(cand.get("candidate_id") or getattr(cv, "candidate_id", "") or "").strip()
+
+            too_close = False
+            too_close_error = ""
+            for (a0, a1, _ap) in used_intervals:
+                overlap_s = max(0.0, min(a1, end_s) - max(a0, start_s))
+                if overlap_s <= 0.0:
+                    continue
+                overlap_ratio = overlap_s / max(duration_s, 1e-6)
+                if overlap_s >= float(director_cfg.max_overlap_s) or overlap_ratio >= float(director_cfg.max_overlap_ratio):
+                    too_close = True
+                    too_close_error = "overlap_guard"
+                    break
+            if not too_close:
+                for (_a0, _a1, prev_peak) in used_intervals:
+                    if abs(prev_peak - peak_time) < float(director_cfg.min_gap_s):
+                        too_close = True
+                        too_close_error = "min_gap_guard"
+                        break
+            if too_close:
+                missing.append(
+                    {
+                        "candidate_rank": cand_rank,
+                        "candidate_id": cand_id or None,
+                        "variant_id": variant_id,
+                        "error": too_close_error or "too_close",
+                    }
+                )
+                continue
+
+            raw_ch_idx = p.get("chapter_index")
+            ch_idx: Optional[int] = None
+            if raw_ch_idx is not None:
+                try:
+                    parsed = int(raw_ch_idx)
+                    if parsed >= 0:
+                        ch_idx = parsed
+                except Exception:
+                    ch_idx = None
+            if ch_idx is None and chapter_ranges:
+                ch_idx = _chapter_index_for_time(chapter_ranges, peak_time)
+            if ch_idx is not None:
+                used_chapters.setdefault(ch_idx, 0)
+                if used_chapters[ch_idx] >= 2:
+                    missing.append(
+                        {
+                            "candidate_rank": cand_rank,
+                            "candidate_id": cand_id or None,
+                            "variant_id": variant_id,
+                            "error": "chapter_diversity_cap",
+                        }
+                    )
+                    continue
+
+            title = _trim_copy_text(
+                p.get("title") or cand.get("title") or cand.get("hook_text") or "Highlight",
+                max_chars=int(director_cfg.title_max_chars),
+            )
+            hook = _trim_copy_text(
+                p.get("hook") or cand.get("hook_text") or title,
+                max_chars=int(director_cfg.hook_max_chars),
+            )
+            description = _trim_copy_text(
+                p.get("description") or title,
+                max_chars=int(director_cfg.description_max_chars),
+            )
+            template = str(p.get("template") or "").strip()
+            if not template or (allowed_templates and template not in allowed_templates):
+                template = template_default
 
             pick = {
                 "rank": len(picks) + 1,
@@ -3694,29 +3888,40 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
                 "candidate_id": cand_id or None,
                 "peak_time_s": peak_time,
                 "variant_id": variant_id,
-                "start_s": float(getattr(v, "start_s", 0.0)),
-                "end_s": float(getattr(v, "end_s", 0.0)),
-                "duration_s": float(getattr(v, "duration_s", 0.0)),
-                "title": str(p.get("title") or ""),
-                "hook": str(p.get("hook") or ""),
-                "description": str(p.get("description") or ""),
+                "start_s": start_s,
+                "end_s": end_s,
+                "duration_s": float(getattr(v, "duration_s", duration_s) or duration_s),
+                "title": title,
+                "hook": hook,
+                "description": description,
                 "hashtags": tags,
-                "template": str(p.get("template") or (profile.get("export", {}) or {}).get("template") or "vertical_blur"),
+                "template": template,
                 "packaging_source": "chatgpt_actions",
                 "packaging_error": None,
                 "confidence": confidence,
                 "reasons": reasons_out,
-                "chapter_index": p.get("chapter_index"),
+                "chapter_index": ch_idx,
                 "signals": cand.get("meta", {}),
             }
             picks.append(pick)
+            used_intervals.append((start_s, end_s, peak_time))
+            if ch_idx is not None:
+                used_chapters[ch_idx] = used_chapters.get(ch_idx, 0) + 1
 
         if not picks:
             raise HTTPException(status_code=400, detail="no_valid_picks")
 
         payload = {
             "created_at": now,
-            "config": {"source": "chatgpt_actions"},
+            "config": {
+                "source": "chatgpt_actions",
+                "top_n": int(director_cfg.top_n),
+                "min_gap_s": float(director_cfg.min_gap_s),
+                "max_overlap_ratio": float(director_cfg.max_overlap_ratio),
+                "max_overlap_s": float(director_cfg.max_overlap_s),
+                "default_template": template_default,
+                "allowed_templates": list(director_cfg.allowed_templates or []),
+            },
             "pick_count": len(picks),
             "packaging_counts": {"chatgpt_actions": len(picks)},
             "picks": picks,
@@ -3856,7 +4061,7 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
         def _upd(d: Dict[str, Any]) -> None:
             nonlocal created_ids, export_ids
             d.setdefault("selections", [])
-            sels = d.get("selections") or []
+            sels = d.get("selections")
             if not isinstance(sels, list):
                 sels = []
                 d["selections"] = sels

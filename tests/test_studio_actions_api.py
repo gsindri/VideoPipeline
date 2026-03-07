@@ -1,5 +1,6 @@
 import hashlib
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -32,10 +33,29 @@ def _make_client(tmp_path: Path, monkeypatch, *, token: str | None = None) -> Te
     if token is not None:
         monkeypatch.setenv("VP_API_TOKEN", token)
 
+    projects_root = tmp_path / "outputs" / "projects"
+
+    import videopipeline.project as project_mod
+    import videopipeline.studio.actions_api as actions_api
     from videopipeline.studio.app import create_app
+
+    monkeypatch.setattr(project_mod, "default_projects_root", lambda: projects_root)
+    monkeypatch.setattr(actions_api, "default_projects_root", lambda: projects_root)
 
     app = create_app(video_path=None, profile_path=None)
     return TestClient(app)
+
+
+def _wait_for_terminal_job_state(job_id: str, *, timeout_s: float = 2.0):
+    from videopipeline.studio.jobs import JOB_MANAGER
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        job = JOB_MANAGER.get(job_id)
+        if job and job.status in {"succeeded", "failed", "cancelled"}:
+            return job
+        time.sleep(0.01)
+    return JOB_MANAGER.get(job_id)
 
 
 def test_auth_disabled_allows_api(tmp_path, monkeypatch):
@@ -389,7 +409,6 @@ def test_actions_analyze_full_external_llm_skips_local_llm(tmp_path, monkeypatch
     client = _make_client(tmp_path, monkeypatch, token="secret")
     hdr = {"Authorization": "Bearer secret"}
 
-    import time
     import videopipeline.studio.actions_api as actions_api
     from videopipeline.studio.jobs import JOB_MANAGER
 
@@ -435,14 +454,7 @@ def test_actions_analyze_full_external_llm_skips_local_llm(tmp_path, monkeypatch
     assert r.status_code == 200
     job_id = r.json()["job_id"]
 
-    # Wait for background job to finish
-    for _ in range(200):
-        job = JOB_MANAGER.get(job_id)
-        if job and job.status in {"succeeded", "failed", "cancelled"}:
-            break
-        time.sleep(0.01)
-
-    job = JOB_MANAGER.get(job_id)
+    job = _wait_for_terminal_job_state(job_id)
     assert job is not None
     assert job.status == "succeeded"
     assert called["n"] == 0
@@ -827,6 +839,137 @@ def test_actions_ai_apply_director_picks_writes_director_json(tmp_path, monkeypa
     assert director["picks"][0]["variant_id"] == "medium"
 
 
+def test_actions_ai_apply_director_picks_enforces_overlap_and_normalizes_packaging(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    pid = hashlib.sha256("twitch_237_overlap".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(proj_dir / "video" / "video.mp4"), "duration_seconds": 120.0},
+        "analysis": {
+            "highlights": {
+                "candidates": [
+                    {"rank": 1, "candidate_id": "cid1", "score": 1.0, "start_s": 10.0, "end_s": 20.0, "peak_time_s": 15.0},
+                    {"rank": 2, "candidate_id": "cid2", "score": 0.9, "start_s": 12.0, "end_s": 22.0, "peak_time_s": 17.0},
+                ]
+            }
+        },
+        "layout": {},
+        "selections": [],
+        "exports": [],
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+
+    variants_json = {
+        "created_at": "now",
+        "candidates": [
+            {
+                "candidate_rank": 1,
+                "candidate_peak_time_s": 15.0,
+                "variants": [
+                    {"variant_id": "medium", "start_s": 10.0, "end_s": 30.0, "duration_s": 20.0},
+                ],
+            },
+            {
+                "candidate_rank": 2,
+                "candidate_peak_time_s": 17.0,
+                "variants": [
+                    {"variant_id": "medium", "start_s": 12.0, "end_s": 32.0, "duration_s": 20.0},
+                ],
+            },
+        ],
+    }
+    (proj_dir / "analysis" / "variants.json").write_text(json.dumps(variants_json), encoding="utf-8")
+
+    r = client.post(
+        "/api/actions/ai/apply_director_picks",
+        headers=hdr,
+        json={
+            "project_id": pid,
+            "client_request_id": "apply-dir-overlap-1",
+            "picks": [
+                {
+                    "candidate_id": "cid1",
+                    "variant_id": "medium",
+                    "title": "A" * 120,
+                    "hook": "H" * 140,
+                    "description": "D" * 420,
+                    "hashtags": ["clips"],
+                    "template": "bad_template_name",
+                },
+                {
+                    "candidate_id": "cid2",
+                    "variant_id": "medium",
+                    "title": "second",
+                },
+            ],
+        },
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["pick_count"] == 1
+    assert any(m.get("error") == "overlap_guard" for m in data.get("missing", []))
+
+    director = json.loads((proj_dir / "analysis" / "director.json").read_text(encoding="utf-8"))
+    assert director["pick_count"] == 1
+    pick = director["picks"][0]
+    assert pick["candidate_id"] == "cid1"
+    assert len(pick["title"]) <= 60
+    assert len(pick["hook"]) <= 80
+    assert len(pick["description"]) <= 220
+    assert len(pick["hashtags"]) >= 3
+    assert all(str(t).startswith("#") for t in pick["hashtags"])
+    assert pick["template"] in {"vertical_streamer_pip", "vertical_blur", "original"}
+
+
+def test_actions_ai_apply_chapter_labels_accepts_chapter_zero(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    pid = hashlib.sha256("twitch_240_ch0".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(proj_dir / "video" / "video.mp4"), "duration_seconds": 60.0},
+        "analysis": {"highlights": {"candidates": []}},
+        "layout": {},
+        "selections": [],
+        "exports": [],
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+    chapters_json = {
+        "generated_at": "now",
+        "chapter_count": 1,
+        "chapters": [{"id": 0, "start_s": 0.0, "end_s": 60.0, "title": "old", "summary": "", "keywords": []}],
+    }
+    (proj_dir / "analysis" / "chapters.json").write_text(json.dumps(chapters_json), encoding="utf-8")
+
+    r = client.post(
+        "/api/actions/ai/apply_chapter_labels",
+        headers=hdr,
+        json={
+            "project_id": pid,
+            "client_request_id": "apply-ch0-1",
+            "items": [{"chapter_id": 0, "title": "new title"}],
+        },
+    )
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["updated_count"] == 1
+
+    updated = json.loads((proj_dir / "analysis" / "chapters.json").read_text(encoding="utf-8"))
+    assert updated["chapters"][0]["id"] == 0
+    assert updated["chapters"][0]["title"] == "new title"
+
+
 def test_actions_openapi_export_director_picks_is_consequential(tmp_path, monkeypatch):
     client = _make_client(tmp_path, monkeypatch, token="secret")
     hdr = {"Authorization": "Bearer secret"}
@@ -843,7 +986,6 @@ def test_actions_export_director_picks_creates_job(tmp_path, monkeypatch):
     client = _make_client(tmp_path, monkeypatch, token="secret")
     hdr = {"Authorization": "Bearer secret"}
 
-    import time
     from videopipeline.studio.jobs import JOB_MANAGER
 
     pid = hashlib.sha256("twitch_238".encode("utf-8")).hexdigest()
@@ -890,13 +1032,7 @@ def test_actions_export_director_picks_creates_job(tmp_path, monkeypatch):
     assert r.status_code == 200
     job_id = r.json()["job_id"]
 
-    for _ in range(200):
-        job = JOB_MANAGER.get(job_id)
-        if job and job.status in {"succeeded", "failed", "cancelled"}:
-            break
-        time.sleep(0.01)
-
-    job = JOB_MANAGER.get(job_id)
+    job = _wait_for_terminal_job_state(job_id)
     assert job is not None
     assert job.status == "succeeded"
 
@@ -905,7 +1041,6 @@ def test_actions_export_director_picks_accepts_legacy_pick_shape(tmp_path, monke
     client = _make_client(tmp_path, monkeypatch, token="secret")
     hdr = {"Authorization": "Bearer secret"}
 
-    import time
     from videopipeline.studio.jobs import JOB_MANAGER
 
     pid = hashlib.sha256("twitch_239".encode("utf-8")).hexdigest()
@@ -962,12 +1097,6 @@ def test_actions_export_director_picks_accepts_legacy_pick_shape(tmp_path, monke
     assert r.status_code == 200
     job_id = r.json()["job_id"]
 
-    for _ in range(200):
-        job = JOB_MANAGER.get(job_id)
-        if job and job.status in {"succeeded", "failed", "cancelled"}:
-            break
-        time.sleep(0.01)
-
-    job = JOB_MANAGER.get(job_id)
+    job = _wait_for_terminal_job_state(job_id)
     assert job is not None
     assert job.status == "succeeded"

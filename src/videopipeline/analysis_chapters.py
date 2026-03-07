@@ -8,15 +8,6 @@ This is distinct from analysis_scenes.py which detects visual shot cuts.
 """
 from __future__ import annotations
 
-# Workaround for PyTorch 2.9+ where torch.distributed.is_initialized was removed/moved
-# Must be applied BEFORE importing sentence-transformers or related packages
-try:
-    import torch.distributed as _dist
-    if not hasattr(_dist, 'is_initialized'):
-        _dist.is_initialized = lambda: False
-except ImportError:
-    pass  # torch not installed
-
 import json
 import logging
 import time as _time
@@ -47,24 +38,38 @@ class ChapterConfig:
         max_chapter_len_s: Maximum chapter length in seconds (default 900s = 15 min)
         embedding_model: Sentence-transformers model for embeddings
                         "all-mpnet-base-v2" (quality) or "all-MiniLM-L6-v2" (speed)
-        changepoint_method: Ruptures method ("pelt", "binseg", "window")
-        changepoint_penalty: Penalty for PELT/Binseg (higher = fewer chapters)
+        changepoint_method: Segmentation method ("auto", "pelt", "binseg", "window")
+        changepoint_penalty: Initial penalty for PELT/Binseg (higher = fewer chapters)
+        changepoint_auto_tune: Auto-tune changepoint strength to avoid 0/over-fragmented splits
+        min_changepoints: Minimum raw changepoints to target before fallback
+        target_chapter_len_s: Preferred chapter length for adaptive tuning
+        target_chapters_min: Optional hard lower bound for chapter count
+        target_chapters_max: Optional hard upper bound for chapter count
+        target_chapters_ideal: Optional preferred chapter count (overrides auto estimate)
         snap_to_silence_window_s: Snap boundaries to silence within ±N seconds
         llm_labeling: Whether to use LLM for chapter titles/summaries
         llm_endpoint: LLM server endpoint (uses same pattern as AI Director)
         llm_model_name: Model name for LLM
+        llm_api_key: Optional API key (falls back to OPENAI_API_KEY when omitted)
         llm_timeout_s: Timeout for LLM requests
         max_chars_per_chapter: Max transcript chars to send to LLM per chapter
     """
     min_chapter_len_s: float = 60.0
     max_chapter_len_s: float = 900.0
     embedding_model: str = "all-mpnet-base-v2"
-    changepoint_method: str = "pelt"
+    changepoint_method: str = "auto"
     changepoint_penalty: float = 10.0
+    changepoint_auto_tune: bool = True
+    min_changepoints: int = 1
+    target_chapter_len_s: float = 600.0
+    target_chapters_min: Optional[int] = None
+    target_chapters_max: Optional[int] = None
+    target_chapters_ideal: Optional[int] = None
     snap_to_silence_window_s: float = 10.0
     llm_labeling: bool = True
     llm_endpoint: str = "http://127.0.0.1:11435"
     llm_model_name: str = "local-gguf-vulkan"
+    llm_api_key: Optional[str] = None
     llm_timeout_s: float = 30.0
     max_chars_per_chapter: int = 6000
 
@@ -115,6 +120,14 @@ class Chapter:
 def _load_sentence_transformer(model_name: str):
     """Load a sentence-transformers model (lazy import for optional dependency)."""
     try:
+        try:
+            import torch.distributed as _dist
+
+            if not hasattr(_dist, "is_initialized"):
+                _dist.is_initialized = lambda: False
+        except ImportError:
+            pass
+
         # Import directly to avoid sentence_transformers/__init__.py side-effects (cross-encoder, datasets, etc.).
         from sentence_transformers.SentenceTransformer import SentenceTransformer
         logger.info(f"Loading sentence transformer model: {model_name}")
@@ -225,6 +238,226 @@ def _detect_changepoints_cosine(
     return changepoints
 
 
+def _detect_changepoints_binseg_fixed(
+    embeddings: np.ndarray,
+    n_bkps: int,
+) -> List[int]:
+    """Detect changepoints with a fixed BinSeg breakpoint count."""
+    try:
+        import ruptures as rpt
+    except ImportError:
+        raise ImportError(
+            "ruptures is required for semantic chapter detection. "
+            "Install with: pip install ruptures"
+        )
+
+    n_samples = len(embeddings)
+    if n_samples < 3 or n_bkps <= 0:
+        return []
+
+    capped = min(max(1, int(n_bkps)), max(1, n_samples - 2))
+    algo = rpt.Binseg(model="rbf", min_size=2).fit(embeddings)
+    changepoints = algo.predict(n_bkps=capped)
+    if changepoints and changepoints[-1] == n_samples:
+        changepoints = changepoints[:-1]
+    return changepoints
+
+
+def _estimate_target_chapter_range(
+    duration_s: float,
+    cfg: ChapterConfig,
+) -> Tuple[int, int, int]:
+    """Estimate target chapter count range for adaptive changepoint tuning."""
+    safe_min_len = max(1.0, float(cfg.min_chapter_len_s))
+    safe_max_len = max(safe_min_len, float(cfg.max_chapter_len_s))
+    safe_duration = max(safe_max_len, float(duration_s))
+
+    # Hard bounds implied by chapter length constraints.
+    min_by_len = max(1, int(np.ceil(safe_duration / safe_max_len)))
+    max_by_len = max(min_by_len, int(np.floor(safe_duration / safe_min_len)))
+
+    preferred_len = min(max(float(cfg.target_chapter_len_s), safe_min_len), safe_max_len)
+    auto_ideal = max(1, int(round(safe_duration / preferred_len)))
+    auto_ideal = max(min_by_len, min(max_by_len, auto_ideal))
+
+    spread = max(1, int(round(auto_ideal * 0.5)))
+    auto_min = max(min_by_len, auto_ideal - spread)
+    auto_max = min(max_by_len, auto_ideal + spread)
+
+    min_target = int(cfg.target_chapters_min) if cfg.target_chapters_min is not None else auto_min
+    max_target = int(cfg.target_chapters_max) if cfg.target_chapters_max is not None else auto_max
+    min_target = max(min_by_len, min_target)
+    max_target = min(max_by_len, max(max_target, min_target))
+
+    if cfg.target_chapters_ideal is not None:
+        ideal = int(cfg.target_chapters_ideal)
+    else:
+        ideal = auto_ideal
+    ideal = max(min_target, min(max_target, ideal))
+
+    return min_target, max_target, ideal
+
+
+def _generate_penalty_candidates(initial_penalty: float) -> List[float]:
+    """Generate robust penalty candidates around an initial value."""
+    base = max(1e-3, float(initial_penalty))
+    multipliers = [
+        64.0, 32.0, 16.0, 8.0, 4.0, 2.0, 1.0,
+        0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125,
+    ]
+    fixed = [
+        3.0, 2.5, 2.0, 1.8, 1.6, 1.5, 1.4, 1.3, 1.2, 1.1, 1.0,
+        0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.05, 0.02, 0.01,
+    ]
+
+    values: List[float] = [base * m for m in multipliers] + fixed + [base]
+    dedup: List[float] = []
+    seen = set()
+    for v in values:
+        vv = max(1e-3, min(1e4, float(v)))
+        key = round(vv, 6)
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(vv)
+    return dedup
+
+
+def _detect_changepoints_pelt_adaptive(
+    embeddings: np.ndarray,
+    *,
+    initial_penalty: float,
+    target_min: int,
+    target_max: int,
+    target_ideal: int,
+) -> Tuple[List[int], Dict[str, Any]]:
+    """Auto-tune PELT penalty to avoid zero or unstable changepoint counts."""
+    penalties = _generate_penalty_candidates(initial_penalty)
+    tested: List[Tuple[float, int, List[int]]] = []
+    for pen in penalties:
+        cps = _detect_changepoints_ruptures(embeddings, method="pelt", penalty=pen)
+        tested.append((pen, len(cps), cps))
+
+    def _penalty_distance(pen: float) -> float:
+        return abs(np.log(max(pen, 1e-6)) - np.log(max(initial_penalty, 1e-6)))
+
+    in_range_nonzero = [
+        t for t in tested
+        if target_min <= t[1] <= target_max and (t[1] > 0 or target_ideal == 0)
+    ]
+
+    if in_range_nonzero:
+        selected = min(
+            in_range_nonzero,
+            key=lambda t: (abs(t[1] - target_ideal), _penalty_distance(t[0])),
+        )
+        reason = "in_target_range"
+    else:
+        nonzero = [t for t in tested if t[1] > 0]
+        if nonzero:
+            selected = min(
+                nonzero,
+                key=lambda t: (
+                    abs(t[1] - target_ideal),
+                    0 if t[1] >= target_min else 1,
+                    _penalty_distance(t[0]),
+                ),
+            )
+            reason = "closest_nonzero"
+        else:
+            selected = min(tested, key=lambda t: _penalty_distance(t[0]))
+            reason = "all_zero"
+
+    selected_pen, selected_count, selected_cps = selected
+    diagnostics = {
+        "requested_method": "pelt",
+        "selected_method": "pelt",
+        "selected_penalty": selected_pen,
+        "selected_count": selected_count,
+        "selection_reason": reason,
+        "target_count_min": target_min,
+        "target_count_max": target_max,
+        "target_count_ideal": target_ideal,
+        "tested_penalties": [
+            {"penalty": round(p, 6), "count": c}
+            for p, c, _ in tested
+        ],
+    }
+    return selected_cps, diagnostics
+
+
+def _detect_changepoints_cosine_adaptive(
+    embeddings: np.ndarray,
+    *,
+    target_min: int,
+    target_max: int,
+    target_ideal: int,
+) -> Tuple[List[int], Dict[str, Any]]:
+    """Adaptive cosine fallback when ruptures is unavailable."""
+    thresholds = [0.6, 0.55, 0.5, 0.45, 0.4, 0.35, 0.3, 0.25, 0.2, 0.15, 0.1]
+    tested: List[Tuple[float, int, List[int]]] = []
+    for th in thresholds:
+        cps = _detect_changepoints_cosine(embeddings, threshold=th, window_size=1)
+        tested.append((th, len(cps), cps))
+
+    in_range_nonzero = [
+        t for t in tested
+        if target_min <= t[1] <= target_max and (t[1] > 0 or target_ideal == 0)
+    ]
+    if in_range_nonzero:
+        selected = min(in_range_nonzero, key=lambda t: abs(t[1] - target_ideal))
+        reason = "in_target_range"
+    else:
+        nonzero = [t for t in tested if t[1] > 0]
+        if nonzero:
+            selected = min(nonzero, key=lambda t: abs(t[1] - target_ideal))
+            reason = "closest_nonzero"
+        else:
+            selected = tested[-1]
+            reason = "all_zero"
+
+    threshold, count, cps = selected
+    diagnostics = {
+        "requested_method": "cosine_fallback",
+        "selected_method": "cosine",
+        "selected_threshold": threshold,
+        "selected_count": count,
+        "selection_reason": reason,
+        "target_count_min": target_min,
+        "target_count_max": target_max,
+        "target_count_ideal": target_ideal,
+        "tested_thresholds": [
+            {"threshold": th, "count": c}
+            for th, c, _ in tested
+        ],
+    }
+    return cps, diagnostics
+
+
+def _prune_changepoints_by_time_gap(
+    changepoints: List[int],
+    units: List[Tuple[float, float, str]],
+    min_gap_s: float,
+) -> List[int]:
+    """Drop changepoints that are too close together in time."""
+    if not changepoints:
+        return []
+
+    cleaned = sorted(set(int(i) for i in changepoints if 0 < int(i) < len(units)))
+    if not cleaned:
+        return []
+
+    min_gap = max(1.0, float(min_gap_s))
+    pruned: List[int] = []
+    last_t = -1e9
+    for idx in cleaned:
+        t = float(units[idx][0])
+        if t - last_t >= min_gap:
+            pruned.append(idx)
+            last_t = t
+    return pruned
+
+
 # ============================================================================
 # Boundary Snapping
 # ============================================================================
@@ -274,10 +507,11 @@ def _snap_to_silence(
 def _label_chapter_with_llm(
     transcript_text: str,
     cfg: ChapterConfig,
+    *,
+    llm_complete: Optional[Callable[[str], str]] = None,
 ) -> Dict[str, Any]:
     """Use LLM to generate title, summary, and keywords for a chapter."""
-    from .ai.llm_client import LLMClient, LLMClientConfig
-    
+
     # Truncate transcript if too long
     if len(transcript_text) > cfg.max_chars_per_chapter:
         transcript_text = transcript_text[:cfg.max_chars_per_chapter] + "..."
@@ -294,19 +528,44 @@ Transcript:
 Respond ONLY with valid JSON, no other text."""
 
     try:
-        client = LLMClient(
-            LLMClientConfig(
-                endpoint=cfg.llm_endpoint,
-                timeout_s=cfg.llm_timeout_s,
+        result: Any
+        if llm_complete is not None:
+            raw = llm_complete(prompt)
+            if isinstance(raw, dict):
+                result = raw
+            else:
+                raw_text = str(raw or "").strip()
+                if raw_text.startswith("```"):
+                    lines = raw_text.splitlines()
+                    if lines and lines[0].strip().startswith("```"):
+                        lines = lines[1:]
+                    if lines and lines[-1].strip() == "```":
+                        lines = lines[:-1]
+                    raw_text = "\n".join(lines).strip()
+                    if raw_text.lower().startswith("json"):
+                        raw_text = raw_text[4:].lstrip()
+                result = json.loads(raw_text)
+        else:
+            from .ai.llm_client import LLMClient, LLMClientConfig
+
+            client = LLMClient(
+                LLMClientConfig(
+                    endpoint=cfg.llm_endpoint,
+                    model_name=cfg.llm_model_name,
+                    api_key=cfg.llm_api_key,
+                    timeout_s=cfg.llm_timeout_s,
+                )
             )
-        )
-        
-        result = client.complete(
-            prompt=prompt,
-            max_tokens=256,
-            temperature=0.3,
-            json_mode=True,
-        )
+
+            result = client.complete(
+                prompt=prompt,
+                max_tokens=256,
+                temperature=0.3,
+                json_mode=True,
+            )
+
+        if not isinstance(result, dict):
+            raise ValueError("LLM chapter labeling returned non-dict payload")
         
         # Result is already a parsed dict from client.complete()
         return {
@@ -352,6 +611,7 @@ def compute_chapters_analysis(
     proj: Project,
     *,
     cfg: ChapterConfig = ChapterConfig(),
+    llm_complete: Optional[Callable[[str], str]] = None,
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Compute semantic chapter boundaries for a project.
@@ -368,6 +628,8 @@ def compute_chapters_analysis(
     Args:
         proj: Project instance
         cfg: Chapter configuration
+        llm_complete: Optional completion callable supplied by DAG runner
+            (uses active Studio AI backend, e.g. OpenAI API or local server)
         on_progress: Optional progress callback (0.0 to 1.0)
     
     Returns:
@@ -428,17 +690,126 @@ def compute_chapters_analysis(
         on_progress(0.5)
     
     # Step 3: Detect changepoints
+    video_end = units[-1][1] if units else 0.0
+    target_ch_min, target_ch_max, target_ch_ideal = _estimate_target_chapter_range(video_end, cfg)
+    target_cp_min = max(0, target_ch_min - 1)
+    target_cp_max = max(0, target_ch_max - 1)
+    target_cp_ideal = max(0, target_ch_ideal - 1)
+
+    changepoint_meta: Dict[str, Any] = {
+        "target_chapters_min": target_ch_min,
+        "target_chapters_max": target_ch_max,
+        "target_chapters_ideal": target_ch_ideal,
+        "target_raw_changepoints_min": target_cp_min,
+        "target_raw_changepoints_max": target_cp_max,
+        "target_raw_changepoints_ideal": target_cp_ideal,
+    }
+
+    method = str(cfg.changepoint_method or "auto").strip().lower()
+    changepoints: List[int] = []
     try:
-        changepoints = _detect_changepoints_ruptures(
-            embeddings,
-            method=cfg.changepoint_method,
-            penalty=cfg.changepoint_penalty,
-        )
+        if method in {"auto", "pelt"}:
+            if method == "auto" or cfg.changepoint_auto_tune:
+                changepoints, tune_meta = _detect_changepoints_pelt_adaptive(
+                    embeddings,
+                    initial_penalty=cfg.changepoint_penalty,
+                    target_min=target_cp_min,
+                    target_max=target_cp_max,
+                    target_ideal=target_cp_ideal,
+                )
+                changepoint_meta.update(tune_meta)
+            else:
+                changepoints = _detect_changepoints_ruptures(
+                    embeddings,
+                    method="pelt",
+                    penalty=cfg.changepoint_penalty,
+                )
+                changepoint_meta.update({
+                    "requested_method": "pelt",
+                    "selected_method": "pelt",
+                    "selected_penalty": cfg.changepoint_penalty,
+                })
+        elif method == "binseg":
+            if cfg.changepoint_auto_tune:
+                n_bkps = max(cfg.min_changepoints, target_cp_ideal, 1)
+                changepoints = _detect_changepoints_binseg_fixed(embeddings, n_bkps=n_bkps)
+                changepoint_meta.update({
+                    "requested_method": "binseg",
+                    "selected_method": "binseg",
+                    "selected_n_bkps": n_bkps,
+                })
+            else:
+                changepoints = _detect_changepoints_ruptures(
+                    embeddings,
+                    method="binseg",
+                    penalty=cfg.changepoint_penalty,
+                )
+                changepoint_meta.update({
+                    "requested_method": "binseg",
+                    "selected_method": "binseg",
+                    "selected_penalty": cfg.changepoint_penalty,
+                })
+        elif method == "window":
+            changepoints = _detect_changepoints_ruptures(
+                embeddings,
+                method="window",
+                penalty=cfg.changepoint_penalty,
+            )
+            changepoint_meta.update({
+                "requested_method": "window",
+                "selected_method": "window",
+                "selected_penalty": cfg.changepoint_penalty,
+            })
+        else:
+            raise ValueError(
+                f"Unknown changepoint method '{cfg.changepoint_method}'. "
+                "Expected one of: auto, pelt, binseg, window"
+            )
     except ImportError:
-        logger.warning("ruptures not available, using cosine similarity fallback")
-        changepoints = _detect_changepoints_cosine(embeddings, threshold=0.3)
-    
-    logger.info(f"Detected {len(changepoints)} raw changepoints")
+        logger.warning("ruptures not available, using adaptive cosine fallback")
+        changepoints, cosine_meta = _detect_changepoints_cosine_adaptive(
+            embeddings,
+            target_min=target_cp_min,
+            target_max=target_cp_max,
+            target_ideal=target_cp_ideal,
+        )
+        changepoint_meta.update(cosine_meta)
+
+    if len(changepoints) < max(0, int(cfg.min_changepoints)):
+        fallback_n = max(int(cfg.min_changepoints), target_cp_ideal, 1)
+        try:
+            binseg_cps = _detect_changepoints_binseg_fixed(embeddings, n_bkps=fallback_n)
+        except ImportError:
+            binseg_cps = []
+        if len(binseg_cps) > len(changepoints):
+            changepoints = binseg_cps
+            changepoint_meta["fallback_method"] = "binseg_fixed"
+            changepoint_meta["fallback_n_bkps"] = fallback_n
+            changepoint_meta["selected_method"] = "binseg"
+
+    # Prevent over-fragmented raw boundaries from destabilizing chapter lengths.
+    pre_prune_count = len(changepoints)
+    changepoints = _prune_changepoints_by_time_gap(
+        changepoints,
+        units,
+        min_gap_s=max(5.0, cfg.min_chapter_len_s * 0.35),
+    )
+    changepoint_meta["raw_count_before_gap_prune"] = pre_prune_count
+    changepoint_meta["raw_count_after_gap_prune"] = len(changepoints)
+
+    logger.info(
+        "[chapters] Detected %d raw changepoints (method=%s, requested=%s, target=%d-%d, ideal=%d)",
+        len(changepoints),
+        changepoint_meta.get("selected_method", "unknown"),
+        method,
+        target_cp_min,
+        target_cp_max,
+        target_cp_ideal,
+    )
+    if len(changepoints) == 0:
+        logger.warning(
+            "[chapters] No semantic changepoints detected; chapter boundaries will rely on max length fallback"
+        )
     
     if on_progress:
         on_progress(0.6)
@@ -458,7 +829,6 @@ def compute_chapters_analysis(
             boundary_times.append(snapped_time)
     
     # Add end time
-    video_end = units[-1][1] if units else 0.0
     boundary_times.append(video_end)
     
     # Sort and dedupe
@@ -553,7 +923,7 @@ def compute_chapters_analysis(
                 
                 # Only try LLM if we haven't hit the failure threshold
                 if not llm_disabled:
-                    labels = _label_chapter_with_llm(chapter_text, cfg)
+                    labels = _label_chapter_with_llm(chapter_text, cfg, llm_complete=llm_complete)
                     
                     if labels:
                         consecutive_failures = 0  # Reset on success
@@ -596,9 +966,16 @@ def compute_chapters_analysis(
             "embedding_model": cfg.embedding_model,
             "changepoint_method": cfg.changepoint_method,
             "changepoint_penalty": cfg.changepoint_penalty,
+            "changepoint_auto_tune": cfg.changepoint_auto_tune,
+            "min_changepoints": cfg.min_changepoints,
+            "target_chapter_len_s": cfg.target_chapter_len_s,
+            "target_chapters_min": cfg.target_chapters_min,
+            "target_chapters_max": cfg.target_chapters_max,
+            "target_chapters_ideal": cfg.target_chapters_ideal,
             "snap_to_silence_window_s": cfg.snap_to_silence_window_s,
             "llm_labeling": cfg.llm_labeling,
         },
+        "changepoint_diagnostics": changepoint_meta,
         "generated_at": generated_at,
         "elapsed_seconds": elapsed_seconds,
         "chapter_count": len(chapters),

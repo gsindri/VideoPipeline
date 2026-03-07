@@ -10,10 +10,13 @@ signal alongside audio RMS, motion, and chat spikes.
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 import sys
 import time as _time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -51,6 +54,8 @@ from .ffmpeg import ffprobe_duration_seconds, AudioStreamParams, stream_audio_bl
 from .peaks import moving_average, pick_top_peaks, robust_z
 from .project import Project, save_npz, update_project
 
+log = logging.getLogger(__name__)
+
 
 # YAMNet class indices for events of interest
 # These are based on AudioSet ontology class indices
@@ -75,7 +80,16 @@ class AudioEventsConfig:
     window_seconds: float = 1.0  # Classification window (YAMNet works best with ~1s)
     smooth_seconds: float = 2.0
     sample_rate: int = 16000  # YAMNet expects 16kHz
-    backend: str = "auto"  # auto | onnx_directml | onnx_cpu | tensorflow | heuristic
+    backend: str = "auto"  # auto | pytorch | onnx_directml | onnx_cpu | tensorflow | heuristic | assemblyai
+    strict: bool = False  # If true, fail instead of silently falling back to heuristic
+
+    # Optional AssemblyAI cloud backend settings (backend=assemblyai).
+    assemblyai_api_key: Optional[str] = None
+    assemblyai_speech_models: Optional[List[str]] = None
+    assemblyai_poll_interval_s: float = 3.0
+    assemblyai_timeout_s: float = 7200.0
+    assemblyai_auto_highlights: bool = True
+    assemblyai_sentiment_analysis: bool = True
     
     # Candidate extraction parameters (matching audio RMS)
     top: int = 20
@@ -97,6 +111,14 @@ class AudioEventsConfig:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "AudioEventsConfig":
+        aai_cfg = d.get("assemblyai", {})
+        if not isinstance(aai_cfg, dict):
+            aai_cfg = {}
+        raw_aai_models = d.get("assemblyai_speech_models", aai_cfg.get("speech_models"))
+        if isinstance(raw_aai_models, str):
+            raw_aai_models = [p.strip() for p in raw_aai_models.split(",") if p.strip()]
+        elif not isinstance(raw_aai_models, list):
+            raw_aai_models = None
         events = d.get("events", {})
         return cls(
             enabled=bool(d.get("enabled", True)),
@@ -105,6 +127,21 @@ class AudioEventsConfig:
             smooth_seconds=float(d.get("smooth_seconds", 2.0)),
             sample_rate=int(d.get("sample_rate", 16000)),
             backend=str(d.get("backend", "auto")),
+            strict=bool(d.get("strict", False)),
+            assemblyai_api_key=d.get("assemblyai_api_key", aai_cfg.get("api_key")),
+            assemblyai_speech_models=raw_aai_models,
+            assemblyai_poll_interval_s=float(
+                d.get("assemblyai_poll_interval_s", aai_cfg.get("poll_interval_s", 3.0))
+            ),
+            assemblyai_timeout_s=float(
+                d.get("assemblyai_timeout_s", aai_cfg.get("timeout_s", 7200.0))
+            ),
+            assemblyai_auto_highlights=bool(
+                d.get("assemblyai_auto_highlights", aai_cfg.get("auto_highlights", True))
+            ),
+            assemblyai_sentiment_analysis=bool(
+                d.get("assemblyai_sentiment_analysis", aai_cfg.get("sentiment_analysis", True))
+            ),
             top=int(d.get("top", 20)),
             min_gap_seconds=float(d.get("min_gap_seconds", 30.0)),
             pre_seconds=float(d.get("pre_seconds", 15.0)),
@@ -114,6 +151,327 @@ class AudioEventsConfig:
             min_clip_seconds=float(d.get("min_clip_seconds", 3.0)),
             events=events if events else cls().events,
         )
+
+
+class AudioEventsBackendError(RuntimeError):
+    """Raised when strict backend selection fails for audio events."""
+
+
+_AUDIO_EVENT_NAMES = ("laughter", "cheering", "applause", "screaming", "shouting", "crowd")
+_AUDIO_EVENT_RE = {
+    "laughter": re.compile(r"\b(?:ha(?:ha)+|he(?:he)+|lol+|lmao+|rofl|laugh(?:ing|ed|s)?)\b", re.I),
+    "cheering": re.compile(r"\b(?:let'?s\s+go+|lets\s+go+|woo+|hype|pog+|yess+|letsgg|gg+)\b", re.I),
+    "applause": re.compile(r"\b(?:applause|clap(?:ping|s|ped)?|ovation)\b", re.I),
+    "screaming": re.compile(r"\b(?:scream(?:ing|ed|s)?|shriek(?:ing|ed|s)?|aaa+h+)\b", re.I),
+    "shouting": re.compile(r"\b(?:shout(?:ing|ed|s)?|yell(?:ing|ed|s)?)\b", re.I),
+    "crowd": re.compile(r"\b(?:crowd|everyone|everybody|audience|stadium|chat)\b", re.I),
+}
+
+
+def _resolve_assemblyai_api_key(explicit_key: Optional[str]) -> Optional[str]:
+    key = (explicit_key or "").strip()
+    if key:
+        return key
+    for env_name in ("ASSEMBLYAI_API_KEY", "AAI_API_KEY"):
+        val = (os.getenv(env_name) or "").strip()
+        if val:
+            return val
+    return None
+
+
+def check_assemblyai_audio_events_available(explicit_key: Optional[str] = None) -> tuple[bool, Optional[str]]:
+    """Return availability and reason for AssemblyAI audio-events backend."""
+    try:
+        import assemblyai as _aai  # noqa: F401
+    except Exception as exc:
+        return False, f"assemblyai SDK not installed: {exc}"
+
+    if not _resolve_assemblyai_api_key(explicit_key):
+        return False, "ASSEMBLYAI_API_KEY not set"
+
+    return True, None
+
+
+def _emit_progress(
+    cb: Optional[Callable[[float], None]],
+    frac: float,
+    msg: str = "",
+) -> None:
+    if cb is None:
+        return
+    try:
+        cb(frac, msg)
+    except TypeError:
+        cb(frac)
+
+
+def _safe_ms_to_s(v: Any) -> float:
+    try:
+        return max(0.0, float(v) / 1000.0)
+    except Exception:
+        return 0.0
+
+
+def _clamp01(v: float) -> float:
+    return max(0.0, min(1.0, float(v)))
+
+
+def _make_timeline_arrays(duration_s: float, hop_seconds: float, window_seconds: float) -> tuple[np.ndarray, np.ndarray]:
+    n = max(1, int(np.floor(max(0.0, float(duration_s)) / float(hop_seconds))) + 1)
+    times_start = np.arange(n, dtype=np.float64) * float(hop_seconds)
+    times_start = np.minimum(times_start, float(duration_s))
+    times_center = np.minimum(times_start + float(window_seconds) * 0.5, float(duration_s))
+    return times_start, times_center
+
+
+def _audio_events_needs_short_guard(duration_s: float, sample_rate: int) -> bool:
+    """Skip backend dispatch when the real audio is too short to classify reliably."""
+    return max(0.0, float(duration_s)) * max(1, int(sample_rate)) < 256.0
+
+
+def _zero_audio_event_arrays(
+    duration_s: float,
+    *,
+    cfg: AudioEventsConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    times_start, times_center = _make_timeline_arrays(duration_s, cfg.hop_seconds, cfg.window_seconds)
+    base = np.zeros(times_start.shape, dtype=np.float64)
+    return (
+        times_start,
+        times_center,
+        base.copy(),
+        base.copy(),
+        base.copy(),
+        base.copy(),
+        base.copy(),
+        base.copy(),
+    )
+
+
+def _apply_interval_max(arr: np.ndarray, *, start_s: float, end_s: float, hop_seconds: float, value: float) -> None:
+    if arr.size == 0:
+        return
+    v = _clamp01(value)
+    if v <= 0.0:
+        return
+    hop = max(1e-6, float(hop_seconds))
+    start_i = max(0, int(np.floor(max(0.0, start_s) / hop)))
+    end_i = max(start_i, int(np.ceil(max(start_s, end_s) / hop)))
+    if start_i >= arr.size:
+        return
+    end_i = min(arr.size - 1, end_i)
+    arr[start_i : end_i + 1] = np.maximum(arr[start_i : end_i + 1], v)
+
+
+def _lexical_event_scores(text: str) -> Dict[str, float]:
+    raw = str(text or "").strip()
+    if not raw:
+        return {k: 0.0 for k in _AUDIO_EVENT_NAMES}
+
+    lower = raw.lower()
+    exclaim = min(1.0, raw.count("!") / 4.0)
+    letters = [c for c in raw if c.isalpha()]
+    caps_ratio = (sum(1 for c in letters if c.isupper()) / len(letters)) if letters else 0.0
+    repeated_chars = 1.0 if re.search(r"(.)\1{3,}", lower) else 0.0
+
+    hits = {k: len(p.findall(raw)) for k, p in _AUDIO_EVENT_RE.items()}
+
+    laughter = _clamp01(0.55 * hits["laughter"] + 0.20 * exclaim)
+    cheering = _clamp01(0.45 * hits["cheering"] + 0.20 * exclaim + 0.15 * repeated_chars)
+    applause = _clamp01(0.60 * hits["applause"] + 0.10 * hits["cheering"])
+    screaming = _clamp01(0.45 * hits["screaming"] + 0.30 * exclaim + 0.25 * caps_ratio)
+    shouting = _clamp01(0.40 * hits["shouting"] + 0.25 * exclaim + 0.20 * caps_ratio + 0.15 * repeated_chars)
+    crowd = _clamp01(0.35 * hits["crowd"] + 0.15 * hits["cheering"] + 0.10)
+
+    return {
+        "laughter": laughter,
+        "cheering": cheering,
+        "applause": applause,
+        "screaming": screaming,
+        "shouting": shouting,
+        "crowd": crowd,
+    }
+
+
+def _compute_assemblyai_event_series(
+    audio_path: Path,
+    *,
+    cfg: AudioEventsConfig,
+    duration_s: float,
+    on_progress: Optional[Callable[[float], None]] = None,
+) -> Dict[str, Any]:
+    """Compute event timelines from AssemblyAI transcript intelligence."""
+    ok, reason = check_assemblyai_audio_events_available(cfg.assemblyai_api_key)
+    if not ok:
+        raise AudioEventsBackendError(f"AssemblyAI audio_events backend unavailable: {reason}")
+
+    try:
+        import assemblyai as aai
+    except Exception as exc:
+        raise AudioEventsBackendError(f"AssemblyAI audio_events backend import failed: {exc}") from exc
+
+    key = _resolve_assemblyai_api_key(cfg.assemblyai_api_key)
+    if not key:
+        raise AudioEventsBackendError("AssemblyAI audio_events backend requested but no API key is configured")
+
+    aai.settings.api_key = key
+    transcriber = aai.Transcriber()
+    speech_models = cfg.assemblyai_speech_models or ["universal-3-pro", "universal-2"]
+    sdk_cfg = aai.TranscriptionConfig(
+        speech_models=speech_models,
+        speaker_labels=True,
+        language_detection=True,
+        auto_highlights=bool(cfg.assemblyai_auto_highlights),
+        sentiment_analysis=bool(cfg.assemblyai_sentiment_analysis),
+    )
+
+    _emit_progress(on_progress, 0.08, "Submitting audio to AssemblyAI")
+    transcript = transcriber.submit(str(audio_path), config=sdk_cfg)
+    _emit_progress(on_progress, 0.12, "AssemblyAI processing")
+
+    poll_interval = max(0.5, float(cfg.assemblyai_poll_interval_s))
+    timeout_s = max(poll_interval, float(cfg.assemblyai_timeout_s))
+    poll_started = _time.time()
+    progress = 0.12
+    while transcript.status in (aai.TranscriptStatus.queued, aai.TranscriptStatus.processing):
+        if _time.time() - poll_started > timeout_s:
+            raise AudioEventsBackendError(
+                f"AssemblyAI audio_events timed out after {timeout_s:.1f}s (id={getattr(transcript, 'id', '')})"
+            )
+        _time.sleep(poll_interval)
+        transcript = aai.Transcript.get_by_id(transcript.id)
+        progress = min(0.90, progress + 0.03)
+        _emit_progress(on_progress, progress, "AssemblyAI processing")
+
+    if transcript.status == aai.TranscriptStatus.error:
+        raise AudioEventsBackendError(
+            f"AssemblyAI audio_events failed: {getattr(transcript, 'error', 'unknown error')}"
+        )
+
+    transcript_duration = _safe_ms_to_s(getattr(transcript, "audio_duration", 0))
+    if transcript_duration > 0:
+        duration_s = max(duration_s, transcript_duration)
+
+    times_start, times_center = _make_timeline_arrays(duration_s, cfg.hop_seconds, cfg.window_seconds)
+    event_arrays = {
+        "laughter": np.zeros_like(times_start, dtype=np.float64),
+        "cheering": np.zeros_like(times_start, dtype=np.float64),
+        "applause": np.zeros_like(times_start, dtype=np.float64),
+        "screaming": np.zeros_like(times_start, dtype=np.float64),
+        "shouting": np.zeros_like(times_start, dtype=np.float64),
+        "crowd": np.zeros_like(times_start, dtype=np.float64),
+    }
+
+    utterances = list(getattr(transcript, "utterances", []) or [])
+    if utterances:
+        for utt in utterances:
+            start_s = _safe_ms_to_s(getattr(utt, "start", 0))
+            end_s = max(start_s, _safe_ms_to_s(getattr(utt, "end", 0)))
+            scores = _lexical_event_scores(str(getattr(utt, "text", "") or ""))
+            for name, score in scores.items():
+                _apply_interval_max(
+                    event_arrays[name],
+                    start_s=start_s,
+                    end_s=end_s,
+                    hop_seconds=cfg.hop_seconds,
+                    value=score,
+                )
+    else:
+        words = list(getattr(transcript, "words", []) or [])
+        for word in words:
+            start_s = _safe_ms_to_s(getattr(word, "start", 0))
+            end_s = max(start_s, _safe_ms_to_s(getattr(word, "end", 0)))
+            scores = _lexical_event_scores(str(getattr(word, "text", "") or ""))
+            for name, score in scores.items():
+                _apply_interval_max(
+                    event_arrays[name],
+                    start_s=start_s,
+                    end_s=end_s,
+                    hop_seconds=cfg.hop_seconds,
+                    value=score,
+                )
+
+    highlights = getattr(transcript, "auto_highlights", None)
+    highlight_results = list(getattr(highlights, "results", []) or [])
+    rank_max = max((float(getattr(r, "rank", 0.0) or 0.0) for r in highlight_results), default=0.0)
+    if rank_max <= 0:
+        rank_max = 1.0
+    for res in highlight_results:
+        text = str(getattr(res, "text", "") or "")
+        rank_norm = _clamp01(float(getattr(res, "rank", 0.0) or 0.0) / rank_max)
+        scores = _lexical_event_scores(text)
+        boost = 0.25 + 0.55 * rank_norm
+        scores["cheering"] = max(scores["cheering"], boost)
+        scores["shouting"] = max(scores["shouting"], 0.20 + 0.45 * rank_norm)
+        for ts in list(getattr(res, "timestamps", []) or []):
+            start_s = _safe_ms_to_s(getattr(ts, "start", 0))
+            end_s = max(start_s, _safe_ms_to_s(getattr(ts, "end", 0)))
+            for name, score in scores.items():
+                _apply_interval_max(
+                    event_arrays[name],
+                    start_s=start_s,
+                    end_s=end_s,
+                    hop_seconds=cfg.hop_seconds,
+                    value=score,
+                )
+
+    sentiments = list(getattr(transcript, "sentiment_analysis", []) or [])
+    for sent in sentiments:
+        start_s = _safe_ms_to_s(getattr(sent, "start", 0))
+        end_s = max(start_s, _safe_ms_to_s(getattr(sent, "end", 0)))
+        conf = _clamp01(float(getattr(sent, "confidence", 0.0) or 0.0))
+        label_obj = getattr(sent, "sentiment", None)
+        label = str(getattr(label_obj, "value", label_obj) or "").upper()
+        if label == "POSITIVE":
+            _apply_interval_max(
+                event_arrays["cheering"],
+                start_s=start_s,
+                end_s=end_s,
+                hop_seconds=cfg.hop_seconds,
+                value=0.15 + 0.45 * conf,
+            )
+            _apply_interval_max(
+                event_arrays["crowd"],
+                start_s=start_s,
+                end_s=end_s,
+                hop_seconds=cfg.hop_seconds,
+                value=0.08 + 0.25 * conf,
+            )
+        elif label == "NEGATIVE":
+            _apply_interval_max(
+                event_arrays["screaming"],
+                start_s=start_s,
+                end_s=end_s,
+                hop_seconds=cfg.hop_seconds,
+                value=0.10 + 0.35 * conf,
+            )
+            _apply_interval_max(
+                event_arrays["shouting"],
+                start_s=start_s,
+                end_s=end_s,
+                hop_seconds=cfg.hop_seconds,
+                value=0.10 + 0.30 * conf,
+            )
+
+    _emit_progress(on_progress, 0.93, "AssemblyAI features extracted")
+    return {
+        "times_start": times_start,
+        "times_center": times_center,
+        "laughter": event_arrays["laughter"],
+        "cheering": event_arrays["cheering"],
+        "applause": event_arrays["applause"],
+        "screaming": event_arrays["screaming"],
+        "shouting": event_arrays["shouting"],
+        "crowd": event_arrays["crowd"],
+        "duration_seconds": duration_s,
+        "backend_meta": {
+            "transcript_id": str(getattr(transcript, "id", "") or ""),
+            "speech_model_used": str(getattr(transcript, "speech_model_used", "") or ""),
+            "utterances": len(utterances),
+            "auto_highlights": len(highlight_results),
+            "sentiments": len(sentiments),
+        },
+    }
 
 
 def _suppress_protobuf_warnings():
@@ -249,14 +607,17 @@ class AudioEventClassifier:
     5. Heuristic (always works)
     """
     
-    def __init__(self, sample_rate: int = 16000, backend: str = "auto"):
+    def __init__(self, sample_rate: int = 16000, backend: str = "auto", strict: bool = False):
         """Initialize classifier.
         
         Args:
             sample_rate: Audio sample rate (16kHz recommended)
             backend: One of "auto", "pytorch", "onnx_directml", "onnx_cpu", "tensorflow", "heuristic"
+            strict: If True, fail instead of silently falling back to heuristic
         """
         self.sample_rate = sample_rate
+        self._requested_backend = str(backend)
+        self._strict = bool(strict)
         self._model = None
         self._onnx_session = None
         self._pytorch_model = None
@@ -279,6 +640,23 @@ class AudioEventClassifier:
             self._backend = "heuristic"
         else:
             raise ValueError(f"Unknown backend: {backend}")
+
+        if self._strict:
+            if self._requested_backend == "auto":
+                if self._backend == "heuristic":
+                    details = "; ".join(f"{k}={v}" for k, v in sorted(self._backend_errors.items()))
+                    if not details:
+                        details = "no ML backend available"
+                    raise AudioEventsBackendError(
+                        "audio_events strict mode: auto backend could not initialize any ML backend "
+                        f"(details: {details})"
+                    )
+            elif self._requested_backend != "heuristic" and self._backend != self._requested_backend:
+                details = self._backend_errors.get(self._requested_backend) or "initialization failed"
+                raise AudioEventsBackendError(
+                    "audio_events strict mode: requested backend "
+                    f"'{self._requested_backend}' unavailable ({details})"
+                )
     
     def _init_auto(self):
         """Auto-select best available backend."""
@@ -519,6 +897,18 @@ class AudioEventClassifier:
         Wav2Vec2 produces embeddings. We use embedding statistics combined
         with spectral features to estimate audio event probabilities.
         """
+        audio = audio_f32.astype(np.float64)
+        n = len(audio)
+        if n < 256:
+            return {
+                "laughter": 0.0,
+                "cheering": 0.0,
+                "applause": 0.0,
+                "screaming": 0.0,
+                "shouting": 0.0,
+                "crowd": 0.0,
+            }
+
         import torch
         import torchaudio.functional as F
         
@@ -554,15 +944,6 @@ class AudioEventClassifier:
         emb_complexity = min(1.0, emb_std / 2.0)  # Adjusted for Wav2Vec2 scale
         
         # Also compute spectral features from raw audio for better estimates
-        audio = audio_f32.astype(np.float64)
-        n = len(audio)
-        
-        if n < 256:
-            return {
-                "laughter": 0.0, "cheering": 0.0, "applause": 0.0,
-                "screaming": 0.0, "shouting": 0.0, "crowd": 0.0,
-            }
-        
         rms = float(np.sqrt(np.mean(audio ** 2)))
         fft = np.fft.rfft(audio * np.hanning(n))
         mag = np.abs(fft)
@@ -623,8 +1004,6 @@ def compute_audio_events_from_file(
         Dict with event timelines and metadata
         Can be saved to a project later using save_audio_events_to_project()
     """
-    from datetime import datetime, timezone
-    
     if not cfg.enabled:
         return {"enabled": False, "skipped": True}
     
@@ -643,46 +1022,137 @@ def compute_audio_events_from_file(
     if window_samples <= 0:
         raise ValueError("window_seconds too small")
     
-    # Initialize classifier
-    import logging
-    log = logging.getLogger(__name__)
-    log.info(f"[audio_events] Initializing classifier for {duration_s:.1f}s audio...")
-    classifier = AudioEventClassifier(sample_rate=cfg.sample_rate, backend=cfg.backend)
-    log.info(f"[audio_events] Using backend: {classifier._backend}")
-    
-    params = AudioStreamParams(sample_rate=cfg.sample_rate, channels=1)
-    total_hops = max(1, int(duration_s / cfg.hop_seconds))
-    
-    # Initialize arrays
-    times_start: List[float] = []
-    times_center: List[float] = []
-    laughter_probs: List[float] = []
-    cheering_probs: List[float] = []
-    applause_probs: List[float] = []
-    screaming_probs: List[float] = []
-    shouting_probs: List[float] = []
-    crowd_probs: List[float] = []
-    
-    processed = 0
-    current_time = 0.0
-    
-    if on_progress:
-        on_progress(0.01)
-    
-    audio_buffer = np.array([], dtype=np.float32)
-    
-    for block in stream_audio_blocks_f32le(
-        audio_path,
-        params=params,
-        block_samples=hop_samples,
-        yield_partial=True,
-    ):
-        audio_buffer = np.concatenate([audio_buffer, block])
-        
-        while len(audio_buffer) >= window_samples:
-            window = audio_buffer[:window_samples]
+    backend_used = str(cfg.backend)
+    ml_available = False
+    backend_errors: Dict[str, str] = {}
+    assembly_backend_meta: Dict[str, Any] = {}
+
+    times_arr: np.ndarray
+    times_center_arr: np.ndarray
+    laughter: np.ndarray
+    cheering: np.ndarray
+    applause: np.ndarray
+    screaming: np.ndarray
+    shouting: np.ndarray
+    crowd: np.ndarray
+
+    short_audio_guarded = _audio_events_needs_short_guard(duration_s, cfg.sample_rate)
+    assembly_data: Optional[Dict[str, Any]] = None
+    if short_audio_guarded:
+        log.info(
+            "[audio_events] Skipping backend dispatch for very short audio (%.4fs, sample_rate=%s)",
+            duration_s,
+            cfg.sample_rate,
+        )
+        backend_used = "short_audio"
+        (
+            times_arr,
+            times_center_arr,
+            laughter,
+            cheering,
+            applause,
+            screaming,
+            shouting,
+            crowd,
+        ) = _zero_audio_event_arrays(duration_s, cfg=cfg)
+    elif cfg.backend == "assemblyai":
+        log.info("[audio_events] Initializing AssemblyAI backend for %.1fs audio...", duration_s)
+        try:
+            assembly_data = _compute_assemblyai_event_series(
+                audio_path,
+                cfg=cfg,
+                duration_s=duration_s,
+                on_progress=on_progress,
+            )
+            duration_s = float(assembly_data.get("duration_seconds", duration_s))
+            backend_used = "assemblyai"
+            ml_available = True
+            assembly_backend_meta = dict(assembly_data.get("backend_meta") or {})
+        except AudioEventsBackendError as exc:
+            if cfg.strict:
+                raise
+            log.warning("[audio_events] AssemblyAI unavailable; falling back to local backend: %s", exc)
+            backend_errors["assemblyai"] = str(exc)
+
+    if short_audio_guarded:
+        pass
+    elif assembly_data is not None:
+        times_arr = np.asarray(assembly_data["times_start"], dtype=np.float64)
+        times_center_arr = np.asarray(assembly_data["times_center"], dtype=np.float64)
+        laughter = np.asarray(assembly_data["laughter"], dtype=np.float64)
+        cheering = np.asarray(assembly_data["cheering"], dtype=np.float64)
+        applause = np.asarray(assembly_data["applause"], dtype=np.float64)
+        screaming = np.asarray(assembly_data["screaming"], dtype=np.float64)
+        shouting = np.asarray(assembly_data["shouting"], dtype=np.float64)
+        crowd = np.asarray(assembly_data["crowd"], dtype=np.float64)
+    else:
+        requested_backend = cfg.backend if cfg.backend != "assemblyai" else "auto"
+        log.info("[audio_events] Initializing classifier for %.1fs audio...", duration_s)
+        classifier = AudioEventClassifier(sample_rate=cfg.sample_rate, backend=requested_backend, strict=cfg.strict)
+        log.info("[audio_events] Using backend: %s", classifier._backend)
+        if classifier._backend_errors:
+            backend_errors.update(classifier._backend_errors)
+
+        backend_used = classifier._backend
+        ml_available = classifier.is_ml_available
+
+        params = AudioStreamParams(sample_rate=cfg.sample_rate, channels=1)
+        total_hops = max(1, int(duration_s / cfg.hop_seconds))
+
+        times_start: List[float] = []
+        times_center: List[float] = []
+        laughter_probs: List[float] = []
+        cheering_probs: List[float] = []
+        applause_probs: List[float] = []
+        screaming_probs: List[float] = []
+        shouting_probs: List[float] = []
+        crowd_probs: List[float] = []
+
+        processed = 0
+        current_time = 0.0
+
+        if on_progress:
+            on_progress(0.01)
+
+        audio_buffer = np.array([], dtype=np.float32)
+
+        for block in stream_audio_blocks_f32le(
+            audio_path,
+            params=params,
+            block_samples=hop_samples,
+            yield_partial=True,
+        ):
+            audio_buffer = np.concatenate([audio_buffer, block])
+
+            while len(audio_buffer) >= window_samples:
+                window = audio_buffer[:window_samples]
+                probs = classifier.classify_chunk(window)
+
+                times_start.append(current_time)
+                times_center.append(current_time + cfg.window_seconds / 2.0)
+                laughter_probs.append(probs.get("laughter", 0.0))
+                cheering_probs.append(probs.get("cheering", 0.0))
+                applause_probs.append(probs.get("applause", 0.0))
+                screaming_probs.append(probs.get("screaming", 0.0))
+                shouting_probs.append(probs.get("shouting", 0.0))
+                crowd_probs.append(probs.get("crowd", 0.0))
+
+                audio_buffer = audio_buffer[hop_samples:]
+                current_time += cfg.hop_seconds
+                processed += 1
+
+                if on_progress and processed % 50 == 0:
+                    frac = min(0.9, processed / total_hops)
+                    on_progress(frac)
+
+        if len(audio_buffer) > 0:
+            if len(audio_buffer) < window_samples:
+                padding = np.zeros(window_samples - len(audio_buffer), dtype=np.float32)
+                window = np.concatenate([audio_buffer, padding])
+            else:
+                window = audio_buffer[:window_samples]
+
             probs = classifier.classify_chunk(window)
-            
             times_start.append(current_time)
             times_center.append(current_time + cfg.window_seconds / 2.0)
             laughter_probs.append(probs.get("laughter", 0.0))
@@ -691,42 +1161,15 @@ def compute_audio_events_from_file(
             screaming_probs.append(probs.get("screaming", 0.0))
             shouting_probs.append(probs.get("shouting", 0.0))
             crowd_probs.append(probs.get("crowd", 0.0))
-            
-            audio_buffer = audio_buffer[hop_samples:]
-            current_time += cfg.hop_seconds
-            processed += 1
-            
-            if on_progress and processed % 50 == 0:
-                frac = min(0.9, processed / total_hops)
-                on_progress(frac)
-    
-    # Handle remaining samples
-    if len(audio_buffer) > 0:
-        if len(audio_buffer) < window_samples:
-            padding = np.zeros(window_samples - len(audio_buffer), dtype=np.float32)
-            window = np.concatenate([audio_buffer, padding])
-        else:
-            window = audio_buffer[:window_samples]
-        
-        probs = classifier.classify_chunk(window)
-        times_start.append(current_time)
-        times_center.append(current_time + cfg.window_seconds / 2.0)
-        laughter_probs.append(probs.get("laughter", 0.0))
-        cheering_probs.append(probs.get("cheering", 0.0))
-        applause_probs.append(probs.get("applause", 0.0))
-        screaming_probs.append(probs.get("screaming", 0.0))
-        shouting_probs.append(probs.get("shouting", 0.0))
-        crowd_probs.append(probs.get("crowd", 0.0))
-    
-    # Convert to arrays and compute scores
-    times_arr = np.array(times_start, dtype=np.float64)
-    times_center_arr = np.array(times_center, dtype=np.float64)
-    laughter = np.array(laughter_probs, dtype=np.float64)
-    cheering = np.array(cheering_probs, dtype=np.float64)
-    applause = np.array(applause_probs, dtype=np.float64)
-    screaming = np.array(screaming_probs, dtype=np.float64)
-    shouting = np.array(shouting_probs, dtype=np.float64)
-    crowd = np.array(crowd_probs, dtype=np.float64)
+
+        times_arr = np.array(times_start, dtype=np.float64)
+        times_center_arr = np.array(times_center, dtype=np.float64)
+        laughter = np.array(laughter_probs, dtype=np.float64)
+        cheering = np.array(cheering_probs, dtype=np.float64)
+        applause = np.array(applause_probs, dtype=np.float64)
+        screaming = np.array(screaming_probs, dtype=np.float64)
+        shouting = np.array(shouting_probs, dtype=np.float64)
+        crowd = np.array(crowd_probs, dtype=np.float64)
     
     # Compute weighted combined score
     event_weights = cfg.events
@@ -788,13 +1231,19 @@ def compute_audio_events_from_file(
         "smooth_seconds": cfg.smooth_seconds,
         "sample_rate": cfg.sample_rate,
         "duration_seconds": duration_s,
-        "backend": classifier._backend,
-        "ml_available": classifier.is_ml_available,
+        "backend": backend_used,
+        "ml_available": ml_available,
+        "backend_errors": backend_errors,
+        "backend_meta": assembly_backend_meta,
         "config": {
             "hop_seconds": cfg.hop_seconds,
             "window_seconds": cfg.window_seconds,
             "smooth_seconds": cfg.smooth_seconds,
             "sample_rate": cfg.sample_rate,
+            "backend": cfg.backend,
+            "strict": cfg.strict,
+            "assemblyai_auto_highlights": cfg.assemblyai_auto_highlights,
+            "assemblyai_sentiment_analysis": cfg.assemblyai_sentiment_analysis,
             "events": cfg.events,
         },
         "elapsed_seconds": elapsed_seconds,
@@ -866,6 +1315,8 @@ def save_audio_events_to_project(
             "method": "audio_event_classifier",
             "backend": events_data["backend"],
             "ml_available": events_data["ml_available"],
+            "backend_errors": events_data.get("backend_errors", {}),
+            "backend_meta": events_data.get("backend_meta", {}),
             "config": events_data["config"],
             "features_npz": str(audio_events_path.relative_to(proj.project_dir)),
             "elapsed_seconds": events_data["elapsed_seconds"],
@@ -883,6 +1334,7 @@ def compute_audio_events_analysis(
     proj: Project,
     *,
     cfg: AudioEventsConfig,
+    source_audio_path: Optional[Path] = None,
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Compute audio event detection timeline.
@@ -903,7 +1355,7 @@ def compute_audio_events_analysis(
         return {"enabled": False}
 
     start_time = _time.time()
-    video_path = Path(proj.audio_source)  # Use audio_source for fallback during early analysis
+    video_path = Path(source_audio_path) if source_audio_path is not None else Path(proj.audio_source)
     duration_s = ffprobe_duration_seconds(video_path)
 
     def _clamp_window(peak_time: float) -> tuple[float, float]:
@@ -937,65 +1389,167 @@ def compute_audio_events_analysis(
         raise ValueError("hop_seconds too small")
     if window_samples <= 0:
         raise ValueError("window_seconds too small")
-    
-    # Initialize classifier with configured backend
-    import logging
-    log = logging.getLogger(__name__)
-    log.info(f"[audio_events] Initializing classifier for {duration_s:.1f}s video...")
-    classifier = AudioEventClassifier(sample_rate=cfg.sample_rate, backend=cfg.backend)
-    log.info(f"[audio_events] Using backend: {classifier._backend}")
-    if classifier._backend_errors:
-        log.info(f"[audio_events] Backend errors tried: {classifier._backend_errors}")
-    
-    params = AudioStreamParams(sample_rate=cfg.sample_rate, channels=1)
-    
-    total_hops = max(1, int(duration_s / cfg.hop_seconds))
-    
-    # Initialize arrays for each event type
-    # `times_start` refers to the window start. `times_center` is often a better
-    # timestamp to align the probability with other signals.
-    times_start: List[float] = []
-    times_center: List[float] = []
-    laughter_probs: List[float] = []
-    cheering_probs: List[float] = []
-    applause_probs: List[float] = []
-    screaming_probs: List[float] = []
-    shouting_probs: List[float] = []
-    crowd_probs: List[float] = []
-    
-    processed = 0
-    current_time = 0.0
-    
-    # Report early progress so UI shows something
+
+    backend_used = str(cfg.backend)
+    ml_available = False
+    backend_errors: Dict[str, str] = {}
+    assembly_backend_meta: Dict[str, Any] = {}
+
+    times_arr: np.ndarray
+    times_center_arr: np.ndarray
+    laughter: np.ndarray
+    cheering: np.ndarray
+    applause: np.ndarray
+    screaming: np.ndarray
+    shouting: np.ndarray
+    crowd: np.ndarray
+
     def _report(frac: float, msg: str = "") -> None:
-        if on_progress:
+        _emit_progress(on_progress, frac, msg)
+
+    short_audio_guarded = _audio_events_needs_short_guard(duration_s, cfg.sample_rate)
+    assembly_data: Optional[Dict[str, Any]] = None
+    if short_audio_guarded:
+        log.info(
+            "[audio_events] Skipping backend dispatch for very short video audio (%.4fs, sample_rate=%s)",
+            duration_s,
+            cfg.sample_rate,
+        )
+        backend_used = "short_audio"
+        (
+            times_arr,
+            times_center_arr,
+            laughter,
+            cheering,
+            applause,
+            screaming,
+            shouting,
+            crowd,
+        ) = _zero_audio_event_arrays(duration_s, cfg=cfg)
+    elif cfg.backend == "assemblyai":
+        log.info("[audio_events] Initializing AssemblyAI backend for %.1fs video...", duration_s)
+        try:
+            assembly_data = _compute_assemblyai_event_series(
+                video_path,
+                cfg=cfg,
+                duration_s=duration_s,
+                on_progress=on_progress,
+            )
+            duration_s = float(assembly_data.get("duration_seconds", duration_s))
+            backend_used = "assemblyai"
+            ml_available = True
+            assembly_backend_meta = dict(assembly_data.get("backend_meta") or {})
+            _report(0.94, "AssemblyAI features ready")
+        except AudioEventsBackendError as exc:
+            if cfg.strict:
+                raise
+            log.warning("[audio_events] AssemblyAI unavailable; falling back to local backend: %s", exc)
+            backend_errors["assemblyai"] = str(exc)
+
+    if short_audio_guarded:
+        pass
+    elif assembly_data is not None:
+        times_arr = np.asarray(assembly_data["times_start"], dtype=np.float64)
+        times_center_arr = np.asarray(assembly_data["times_center"], dtype=np.float64)
+        laughter = np.asarray(assembly_data["laughter"], dtype=np.float64)
+        cheering = np.asarray(assembly_data["cheering"], dtype=np.float64)
+        applause = np.asarray(assembly_data["applause"], dtype=np.float64)
+        screaming = np.asarray(assembly_data["screaming"], dtype=np.float64)
+        shouting = np.asarray(assembly_data["shouting"], dtype=np.float64)
+        crowd = np.asarray(assembly_data["crowd"], dtype=np.float64)
+    else:
+        requested_backend = cfg.backend if cfg.backend != "assemblyai" else "auto"
+        log.info("[audio_events] Initializing classifier for %.1fs video...", duration_s)
+        classifier = AudioEventClassifier(sample_rate=cfg.sample_rate, backend=requested_backend, strict=cfg.strict)
+        backend_used = classifier._backend
+        ml_available = classifier.is_ml_available
+        if classifier._backend_errors:
+            backend_errors.update(classifier._backend_errors)
+
+        log.info("[audio_events] Using backend: %s", classifier._backend)
+        if classifier._backend_errors:
+            log.info("[audio_events] Backend errors tried: %s", classifier._backend_errors)
+
+        params = AudioStreamParams(sample_rate=cfg.sample_rate, channels=1)
+        total_hops = max(1, int(duration_s / cfg.hop_seconds))
+        _report(0.01, f"Initializing ML classifier ({classifier._backend})")
+        log.info(
+            "[audio_events] Starting classification of %s hops (%.1fs at %ss hop)",
+            total_hops,
+            duration_s,
+            cfg.hop_seconds,
+        )
+
+        times_start: List[float] = []
+        times_center: List[float] = []
+        laughter_probs: List[float] = []
+        cheering_probs: List[float] = []
+        applause_probs: List[float] = []
+        screaming_probs: List[float] = []
+        shouting_probs: List[float] = []
+        crowd_probs: List[float] = []
+
+        processed = 0
+        current_time = 0.0
+        audio_buffer = np.array([], dtype=np.float32)
+
+        block_iter = None
+        if video_path.suffix.lower() == ".wav":
             try:
-                on_progress(frac, msg)
-            except TypeError:
-                on_progress(frac)
-    
-    _report(0.01, f"Initializing ML classifier ({classifier._backend})")
-    
-    log.info(f"[audio_events] Starting classification of {total_hops} hops ({duration_s:.1f}s at {cfg.hop_seconds}s hop)")
-    
-    # Rolling buffer approach: accumulate audio, classify when buffer >= window_samples
-    # This decouples window_seconds (classification) from hop_seconds (output timeline)
-    audio_buffer = np.array([], dtype=np.float32)
-    
-    for block in stream_audio_blocks_f32le(
-        video_path,
-        params=params,
-        block_samples=hop_samples,
-        yield_partial=True,
-    ):
-        audio_buffer = np.concatenate([audio_buffer, block])
-        
-        # While we have enough samples for a full window, classify and step forward
-        while len(audio_buffer) >= window_samples:
-            # Classify the current window
-            window = audio_buffer[:window_samples]
+                from .analysis_audio_decode import stream_decoded_audio_blocks_f32
+
+                block_iter = stream_decoded_audio_blocks_f32(
+                    video_path,
+                    block_samples=hop_samples,
+                    expected_sample_rate=cfg.sample_rate,
+                    yield_partial=True,
+                )
+                log.info("[audio_events] Using decoded WAV block stream")
+            except Exception as exc:
+                log.info("[audio_events] Decoded WAV stream unavailable (%s); falling back to ffmpeg", exc)
+
+        if block_iter is None:
+            block_iter = stream_audio_blocks_f32le(
+                video_path,
+                params=params,
+                block_samples=hop_samples,
+                yield_partial=True,
+            )
+
+        for block in block_iter:
+            audio_buffer = np.concatenate([audio_buffer, block])
+
+            while len(audio_buffer) >= window_samples:
+                window = audio_buffer[:window_samples]
+                probs = classifier.classify_chunk(window)
+
+                times_start.append(current_time)
+                times_center.append(current_time + cfg.window_seconds / 2.0)
+                laughter_probs.append(probs.get("laughter", 0.0))
+                cheering_probs.append(probs.get("cheering", 0.0))
+                applause_probs.append(probs.get("applause", 0.0))
+                screaming_probs.append(probs.get("screaming", 0.0))
+                shouting_probs.append(probs.get("shouting", 0.0))
+                crowd_probs.append(probs.get("crowd", 0.0))
+
+                audio_buffer = audio_buffer[hop_samples:]
+                current_time += cfg.hop_seconds
+                processed += 1
+
+                if processed % 100 == 0:
+                    pct = 100 * processed / total_hops
+                    _report(min(0.85, processed / total_hops), f"Classifying audio: {processed}/{total_hops} ({pct:.0f}%)")
+                    if processed % 500 == 0:
+                        log.info("[audio_events] Progress: %s/%s (%.1f%%)", processed, total_hops, pct)
+
+        if len(audio_buffer) > 0:
+            if len(audio_buffer) < window_samples:
+                padding = np.zeros(window_samples - len(audio_buffer), dtype=np.float32)
+                window = np.concatenate([audio_buffer, padding])
+            else:
+                window = audio_buffer[:window_samples]
+
             probs = classifier.classify_chunk(window)
-            
             times_start.append(current_time)
             times_center.append(current_time + cfg.window_seconds / 2.0)
             laughter_probs.append(probs.get("laughter", 0.0))
@@ -1004,46 +1558,15 @@ def compute_audio_events_analysis(
             screaming_probs.append(probs.get("screaming", 0.0))
             shouting_probs.append(probs.get("shouting", 0.0))
             crowd_probs.append(probs.get("crowd", 0.0))
-            
-            # Step forward by hop_samples
-            audio_buffer = audio_buffer[hop_samples:]
-            current_time += cfg.hop_seconds
-            processed += 1
-            
-            if processed % 100 == 0:
-                pct = 100 * processed / total_hops
-                _report(min(0.85, processed / total_hops), f"Classifying audio: {processed}/{total_hops} ({pct:.0f}%)")
-                if processed % 500 == 0:
-                    log.info(f"[audio_events] Progress: {processed}/{total_hops} ({pct:.1f}%)")
-    
-    # Handle remaining samples at the end (pad with zeros if needed)
-    if len(audio_buffer) > 0:
-        # Pad to window_samples
-        if len(audio_buffer) < window_samples:
-            padding = np.zeros(window_samples - len(audio_buffer), dtype=np.float32)
-            window = np.concatenate([audio_buffer, padding])
-        else:
-            window = audio_buffer[:window_samples]
-        
-        probs = classifier.classify_chunk(window)
-        times_start.append(current_time)
-        times_center.append(current_time + cfg.window_seconds / 2.0)
-        laughter_probs.append(probs.get("laughter", 0.0))
-        cheering_probs.append(probs.get("cheering", 0.0))
-        applause_probs.append(probs.get("applause", 0.0))
-        screaming_probs.append(probs.get("screaming", 0.0))
-        shouting_probs.append(probs.get("shouting", 0.0))
-        crowd_probs.append(probs.get("crowd", 0.0))
-    
-    # Convert to arrays
-    times_arr = np.array(times_start, dtype=np.float64)
-    times_center_arr = np.array(times_center, dtype=np.float64)
-    laughter = np.array(laughter_probs, dtype=np.float64)
-    cheering = np.array(cheering_probs, dtype=np.float64)
-    applause = np.array(applause_probs, dtype=np.float64)
-    screaming = np.array(screaming_probs, dtype=np.float64)
-    shouting = np.array(shouting_probs, dtype=np.float64)
-    crowd = np.array(crowd_probs, dtype=np.float64)
+
+        times_arr = np.array(times_start, dtype=np.float64)
+        times_center_arr = np.array(times_center, dtype=np.float64)
+        laughter = np.array(laughter_probs, dtype=np.float64)
+        cheering = np.array(cheering_probs, dtype=np.float64)
+        applause = np.array(applause_probs, dtype=np.float64)
+        screaming = np.array(screaming_probs, dtype=np.float64)
+        shouting = np.array(shouting_probs, dtype=np.float64)
+        crowd = np.array(crowd_probs, dtype=np.float64)
     
     # Compute weighted combined score
     event_weights = cfg.events
@@ -1157,14 +1680,16 @@ def compute_audio_events_analysis(
         "video": str(video_path),
         "duration_seconds": duration_s,
         "method": "audio_event_classifier",
-        "backend": classifier._backend,
-        "ml_available": classifier.is_ml_available,
-        "backend_errors": getattr(classifier, "_backend_errors", {}),
+        "backend": backend_used,
+        "ml_available": ml_available,
+        "backend_errors": backend_errors,
         "config": {
             "hop_seconds": cfg.hop_seconds,
             "window_seconds": cfg.window_seconds,
             "smooth_seconds": cfg.smooth_seconds,
             "sample_rate": cfg.sample_rate,
+            "backend": cfg.backend,
+            "strict": cfg.strict,
             "top": cfg.top,
             "min_gap_seconds": cfg.min_gap_seconds,
             "pre_seconds": cfg.pre_seconds,
@@ -1172,8 +1697,11 @@ def compute_audio_events_analysis(
             "skip_start_seconds": cfg.skip_start_seconds,
             "min_score_z": cfg.min_score_z,
             "min_clip_seconds": cfg.min_clip_seconds,
+            "assemblyai_auto_highlights": cfg.assemblyai_auto_highlights,
+            "assemblyai_sentiment_analysis": cfg.assemblyai_sentiment_analysis,
             "events": cfg.events,
         },
+        "backend_meta": assembly_backend_meta,
         "peaks": {
             "laughter_time_s": _safe_time(peak_laughter_idx),
             "laughter_z": float(laughter_z[peak_laughter_idx]) if len(laughter_z) > 0 else 0.0,
@@ -1185,7 +1713,7 @@ def compute_audio_events_analysis(
         },
         "candidates": candidates,
         "elapsed_seconds": _time.time() - start_time,
-        "generated_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     
     def _upd(d: Dict[str, Any]) -> None:

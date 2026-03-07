@@ -61,6 +61,7 @@ def test_audio_events_config_from_dict():
         "enabled": True,
         "hop_seconds": 0.25,
         "smooth_seconds": 1.5,
+        "strict": True,
         "events": {
             "laughter": 0.9,
             "cheering": 0.5,
@@ -70,6 +71,7 @@ def test_audio_events_config_from_dict():
     assert cfg.enabled is True
     assert cfg.hop_seconds == 0.25
     assert cfg.smooth_seconds == 1.5
+    assert cfg.strict is True
     assert cfg.events["laughter"] == 0.9
     assert cfg.events["cheering"] == 0.5
 
@@ -83,8 +85,50 @@ def test_audio_events_config_defaults():
     assert cfg.enabled is True
     assert cfg.hop_seconds == 0.5
     assert cfg.smooth_seconds == 2.0
+    assert cfg.strict is False
     assert "laughter" in cfg.events
     assert cfg.events["laughter"] == 1.0
+
+
+def test_audio_events_config_assemblyai_nested():
+    """AssemblyAI nested config should map to flat config fields."""
+    from videopipeline.analysis_audio_events import AudioEventsConfig
+
+    cfg = AudioEventsConfig.from_dict(
+        {
+            "backend": "assemblyai",
+            "strict": True,
+            "assemblyai": {
+                "speech_models": ["universal-3-pro", "universal-2"],
+                "auto_highlights": False,
+                "sentiment_analysis": False,
+                "poll_interval_s": 4.0,
+                "timeout_s": 1234.0,
+            },
+        }
+    )
+
+    assert cfg.backend == "assemblyai"
+    assert cfg.strict is True
+    assert cfg.assemblyai_speech_models == ["universal-3-pro", "universal-2"]
+    assert cfg.assemblyai_auto_highlights is False
+    assert cfg.assemblyai_sentiment_analysis is False
+    assert cfg.assemblyai_poll_interval_s == 4.0
+    assert cfg.assemblyai_timeout_s == 1234.0
+
+
+def test_assemblyai_audio_events_availability_requires_key(monkeypatch: pytest.MonkeyPatch):
+    """Availability helper should fail cleanly when API key is missing."""
+    import videopipeline.analysis_audio_events as mod
+
+    monkeypatch.delenv("ASSEMBLYAI_API_KEY", raising=False)
+    monkeypatch.delenv("AAI_API_KEY", raising=False)
+    ok, reason = mod.check_assemblyai_audio_events_available(explicit_key=None)
+    if ok:
+        # In CI or local env a key might exist via process-level injection.
+        assert reason is None
+    else:
+        assert "API_KEY" in str(reason)
 
 
 # ============================================================================
@@ -95,7 +139,7 @@ def test_classifier_heuristic_basic():
     """Test heuristic classifier with synthetic audio."""
     from videopipeline.analysis_audio_events import AudioEventClassifier
     
-    classifier = AudioEventClassifier(sample_rate=16000)
+    classifier = AudioEventClassifier(sample_rate=16000, backend="heuristic")
     
     # Create a simple sine wave (should be low on all events)
     t = np.linspace(0, 0.5, 8000)
@@ -113,7 +157,7 @@ def test_classifier_heuristic_noise():
     """Test heuristic classifier with white noise (should detect some crowd-like signal)."""
     from videopipeline.analysis_audio_events import AudioEventClassifier
     
-    classifier = AudioEventClassifier(sample_rate=16000)
+    classifier = AudioEventClassifier(sample_rate=16000, backend="heuristic")
     
     # White noise
     np.random.seed(42)
@@ -129,7 +173,7 @@ def test_classifier_heuristic_empty():
     """Test heuristic classifier with very short audio."""
     from videopipeline.analysis_audio_events import AudioEventClassifier
     
-    classifier = AudioEventClassifier(sample_rate=16000)
+    classifier = AudioEventClassifier(sample_rate=16000, backend="heuristic")
     
     # Very short audio
     audio = np.zeros(100, dtype=np.float32)
@@ -138,6 +182,67 @@ def test_classifier_heuristic_empty():
     
     # Should return zeros for all events
     assert all(v == 0.0 for v in probs.values())
+
+
+def test_compute_audio_events_from_file_short_audio_skips_backend_dispatch(tmp_path, monkeypatch):
+    """Very short inputs should not initialize heavyweight backends."""
+    import videopipeline.analysis_audio_events as mod
+
+    audio_path = tmp_path / "short.wav"
+    audio_path.write_bytes(b"not-a-real-waveform")
+
+    monkeypatch.setattr(mod, "ffprobe_duration_seconds", lambda _path: 100.0 / 16000.0)
+
+    class _ExplodingClassifier:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("classifier should not be initialized for very short audio")
+
+    monkeypatch.setattr(mod, "AudioEventClassifier", _ExplodingClassifier)
+
+    result = mod.compute_audio_events_from_file(
+        audio_path,
+        cfg=mod.AudioEventsConfig(backend="pytorch", sample_rate=16000),
+    )
+
+    assert result["backend"] == "short_audio"
+    assert result["ml_available"] is False
+    assert result["times"] == [0.0]
+    for key in ("laughter", "cheering", "applause", "screaming", "shouting", "crowd", "event_combo"):
+        assert result[key] == [0.0]
+
+
+def test_classifier_strict_requested_backend_failure(monkeypatch: pytest.MonkeyPatch):
+    """Strict mode should fail instead of silently falling back."""
+    import videopipeline.analysis_audio_events as mod
+
+    monkeypatch.setattr(mod, "_try_load_pytorch_classifier", lambda: (None, None, None, "missing torch"))
+
+    with pytest.raises(mod.AudioEventsBackendError):
+        mod.AudioEventClassifier(sample_rate=16000, backend="pytorch", strict=True)
+
+
+def test_classifier_auto_strict_requires_ml_backend(monkeypatch: pytest.MonkeyPatch):
+    """Strict auto mode requires at least one ML backend."""
+    import videopipeline.analysis_audio_events as mod
+
+    monkeypatch.setattr(mod, "_try_load_pytorch_classifier", lambda: (None, None, None, "missing torch"))
+    monkeypatch.setattr(mod, "_try_load_yamnet_onnx", lambda: (None, "missing onnx"))
+    monkeypatch.setattr(mod, "_try_load_yamnet", lambda: (None, "missing tensorflow_hub"))
+
+    with pytest.raises(mod.AudioEventsBackendError):
+        mod.AudioEventClassifier(sample_rate=16000, backend="auto", strict=True)
+
+
+def test_classifier_auto_non_strict_falls_back_to_heuristic(monkeypatch: pytest.MonkeyPatch):
+    """Non-strict auto mode should still keep the heuristic fallback."""
+    import videopipeline.analysis_audio_events as mod
+
+    monkeypatch.setattr(mod, "_try_load_pytorch_classifier", lambda: (None, None, None, "missing torch"))
+    monkeypatch.setattr(mod, "_try_load_yamnet_onnx", lambda: (None, "missing onnx"))
+    monkeypatch.setattr(mod, "_try_load_yamnet", lambda: (None, "missing tensorflow_hub"))
+
+    classifier = mod.AudioEventClassifier(sample_rate=16000, backend="auto", strict=False)
+    assert classifier._backend == "heuristic"
 
 
 # ============================================================================

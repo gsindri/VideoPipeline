@@ -49,12 +49,12 @@ import requests
 import uvicorn
 
 from videopipeline.logging_config import setup_logging
-from videopipeline.studio.app import create_app
 
 APP_NAME = "VideoPipeline"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765  # used only if --port specified; otherwise we auto-pick
 STUDIO_PORT_ENV = "VP_STUDIO_PORT"
+STUDIO_PROFILE_ENV = "VP_STUDIO_PROFILE"
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +123,36 @@ def _default_profile_path() -> Optional[Path]:
         if p.exists():
             return p
     return None
+
+
+def _profile_from_env() -> Optional[Path]:
+    """Return an explicit Studio profile from env, if configured."""
+    raw = (os.getenv(STUDIO_PROFILE_ENV) or "").strip()
+    if not raw:
+        return None
+    return Path(raw)
+
+
+def _resolve_profile_path(profile_path: Optional[Path]) -> Optional[Path]:
+    """Resolve profile path to an absolute path for stable comparisons/runtime metadata."""
+    if profile_path is None:
+        return None
+    p = Path(profile_path).expanduser()
+    try:
+        return p.resolve()
+    except Exception:
+        return p.absolute()
+
+
+def _normalize_profile_path(profile_path: Optional[Path]) -> Optional[str]:
+    """Normalize profile path for case-insensitive matching on Windows."""
+    resolved = _resolve_profile_path(profile_path)
+    if resolved is None:
+        return None
+    out = str(resolved)
+    if os.name == "nt":
+        out = os.path.normcase(out)
+    return out
 
 
 def _state_dir() -> Path:
@@ -202,13 +232,18 @@ def _http_ok(url: str, timeout: float = 0.25) -> bool:
         return False
 
 
-def _reuse_existing_if_running() -> Optional[str]:
-    """Check if a Studio instance is already running and return its URL if so."""
+def _reuse_existing_if_running(*, requested_profile: Optional[Path] = None) -> Optional[str]:
+    """Check if a matching Studio instance is already running and return its URL if so."""
     rf = _runtime_file()
     if not rf.exists():
         return None
     try:
         data = json.loads(rf.read_text(encoding="utf-8"))
+        requested_norm = _normalize_profile_path(requested_profile)
+        running_profile_raw = data.get("profile")
+        running_norm = _normalize_profile_path(Path(running_profile_raw)) if running_profile_raw else None
+        if requested_norm is not None and running_norm != requested_norm:
+            return None
         host = data.get("host", DEFAULT_HOST)
         port = int(data.get("port"))
         url = f"http://{host}:{port}"
@@ -219,7 +254,7 @@ def _reuse_existing_if_running() -> Optional[str]:
     return None
 
 
-def _write_runtime(host: str, port: int) -> None:
+def _write_runtime(host: str, port: int, *, profile_path: Optional[Path] = None) -> None:
     """Write the runtime state file with server info."""
     payload = {
         "host": host,
@@ -227,6 +262,9 @@ def _write_runtime(host: str, port: int) -> None:
         "pid": os.getpid(),
         "started_at": time.time(),
     }
+    normalized_profile = _normalize_profile_path(profile_path)
+    if normalized_profile is not None:
+        payload["profile"] = normalized_profile
     _runtime_file().write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -278,6 +316,7 @@ class LaunchArgs:
     """Parsed launcher arguments."""
     host: str = DEFAULT_HOST
     port: Optional[int] = None
+    profile: Optional[Path] = None
     no_browser: bool = False
     reuse: bool = True
 
@@ -301,15 +340,24 @@ def main(argv: Optional[List[str]] = None) -> None:
             args.host = next(it)
         elif token == "--port":
             args.port = int(next(it))
+        elif token == "--profile":
+            args.profile = Path(next(it))
         elif token == "--no-browser":
             args.no_browser = True
         elif token == "--no-reuse":
             args.reuse = False
         # Ignore unknown tokens to avoid breaking old shortcuts
 
+    # Resolve profile early so --profile / VP_STUDIO_PROFILE are respected even when reuse is enabled.
+    profile_path = _resolve_profile_path(
+        args.profile if args.profile is not None else (_profile_from_env() or _default_profile_path())
+    )
+    if profile_path is not None and not profile_path.exists():
+        raise FileNotFoundError(f"Profile not found: {profile_path}")
+
     # If already running, reuse (perfect UX)
     if args.reuse:
-        existing = _reuse_existing_if_running()
+        existing = _reuse_existing_if_running(requested_profile=profile_path)
         if existing:
             if not args.no_browser:
                 try:
@@ -327,11 +375,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     port = _resolve_port(args.port)
     url = f"http://{args.host}:{port}"
 
-    # Create app in HOME mode with default profile (gaming.yaml)
-    profile_path = _default_profile_path()
+    # Create app in HOME mode with either explicit --profile or default gaming.yaml.
+    from videopipeline.studio.app import create_app
+
     app = create_app(video_path=None, profile_path=profile_path)
 
-    _write_runtime(args.host, port)
+    _write_runtime(args.host, port, profile_path=profile_path)
 
     if not args.no_browser:
         threading.Thread(target=_open_browser_when_ready, args=(url,), daemon=True).start()
