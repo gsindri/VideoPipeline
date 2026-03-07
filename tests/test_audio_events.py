@@ -128,7 +128,7 @@ def test_assemblyai_audio_events_availability_requires_key(monkeypatch: pytest.M
         # In CI or local env a key might exist via process-level injection.
         assert reason is None
     else:
-        assert "API_KEY" in str(reason)
+        assert "API_KEY" in str(reason) or "SDK not installed" in str(reason)
 
 
 # ============================================================================

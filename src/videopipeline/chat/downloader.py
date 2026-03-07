@@ -940,7 +940,7 @@ def find_twitch_downloader_cli() -> Optional[Path]:
     return _find_twitch_downloader_cli()
 
 
-def get_twitch_downloader_info() -> Dict[str, Any]:
+def get_twitch_downloader_info(*, include_version: bool = True) -> Dict[str, Any]:
     """Get information about TwitchDownloaderCLI installation.
     
     Returns:
@@ -958,7 +958,10 @@ def get_twitch_downloader_info() -> Dict[str, Any]:
             "min_version": TWITCH_CLI_MIN_VERSION,
         }
     
-    version, needs_update = _get_twitch_downloader_version(cli_path)
+    version = None
+    needs_update = False
+    if include_version:
+        version, needs_update = _get_twitch_downloader_version(cli_path)
     
     return {
         "available": True,

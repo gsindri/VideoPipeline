@@ -273,7 +273,7 @@ def create_app(
     # -------------------------------------------------------------------------
     from .actions_api import create_actions_router
 
-    app.include_router(create_actions_router(profile=ctx.profile))
+    app.include_router(create_actions_router(profile=ctx.profile, profile_path=ctx.profile_path))
 
     static_dir = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")

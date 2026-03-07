@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import hashlib
 import json
 import os
@@ -272,7 +273,142 @@ class _IdempotencyCache:
             self._items[key] = (time.monotonic(), dict(payload))
 
 
-def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
+def _profile_env_present(*names: str) -> bool:
+    for name in names:
+        if (os.environ.get(name) or "").strip():
+            return True
+    return False
+
+
+def _diagnostics_transcription_backends() -> Dict[str, bool]:
+    torch_available = importlib.util.find_spec("torch") is not None
+    # Keep diagnostics cheap and side-effect free: importing torch on some
+    # Windows ROCm setups can hang inside platform/WMI detection.
+    gpu_stack_present = torch_available
+
+    whispercpp_available = importlib.util.find_spec("pywhispercpp") is not None
+    faster_whisper_available = importlib.util.find_spec("faster_whisper") is not None
+    openai_whisper_available = importlib.util.find_spec("whisper") is not None
+    nemo_available = importlib.util.find_spec("nemo") is not None and torch_available
+    assemblyai_available = importlib.util.find_spec("assemblyai") is not None and _profile_env_present(
+        "ASSEMBLYAI_API_KEY",
+        "AAI_API_KEY",
+    )
+
+    return {
+        "whispercpp": whispercpp_available,
+        "whispercpp_gpu": False,
+        "faster_whisper": faster_whisper_available,
+        "faster_whisper_gpu": faster_whisper_available and gpu_stack_present,
+        "openai_whisper": openai_whisper_available,
+        "openai_whisper_gpu": openai_whisper_available and gpu_stack_present,
+        "nemo_asr": nemo_available,
+        "nemo_asr_gpu": nemo_available and gpu_stack_present,
+        "assemblyai": assemblyai_available,
+        "assemblyai_gpu": False,
+    }
+
+
+def _profile_readiness(profile: Dict[str, Any], *, profile_path: Optional[Path], backends: Dict[str, bool]) -> Dict[str, Any]:
+    from ..analysis_audio_events import AudioEventsConfig, check_assemblyai_audio_events_available
+
+    analysis_cfg = (profile.get("analysis", {}) or {}) if isinstance(profile, dict) else {}
+    speech_cfg = (analysis_cfg.get("speech", {}) or {}) if isinstance(analysis_cfg, dict) else {}
+    audio_events_cfg = (analysis_cfg.get("audio_events", {}) or {}) if isinstance(analysis_cfg, dict) else {}
+    diarization_cfg = (analysis_cfg.get("diarization", {}) or {}) if isinstance(analysis_cfg, dict) else {}
+    chat_cfg = (analysis_cfg.get("chat", {}) or {}) if isinstance(analysis_cfg, dict) else {}
+    highlights_cfg = (analysis_cfg.get("highlights", {}) or {}) if isinstance(analysis_cfg, dict) else {}
+
+    issues: list[str] = []
+
+    speech_backend = str(speech_cfg.get("backend", "auto") or "auto")
+    speech_use_gpu = bool(speech_cfg.get("use_gpu", False))
+    speech_ready = True
+    speech_reason: Optional[str] = None
+
+    if speech_backend == "assemblyai":
+        speech_ready = bool(backends.get("assemblyai", False))
+        if not speech_ready:
+            speech_reason = "AssemblyAI transcription backend unavailable (install SDK and set ASSEMBLYAI_API_KEY)"
+    elif speech_backend == "nemo_asr":
+        speech_ready = bool(backends.get("nemo_asr", False))
+        if speech_ready and speech_use_gpu and not bool(backends.get("nemo_asr_gpu", False)):
+            speech_ready = False
+            speech_reason = "NeMo ASR requested with GPU but CUDA backend is unavailable"
+        elif not speech_ready:
+            speech_reason = "NeMo ASR backend unavailable"
+    elif speech_backend == "auto":
+        speech_ready = any(
+            bool(backends.get(name, False))
+            for name in ("nemo_asr", "openai_whisper", "faster_whisper", "whispercpp")
+        )
+        if not speech_ready:
+            speech_reason = "No local transcription backend available for auto mode"
+    elif speech_backend in backends:
+        speech_ready = bool(backends.get(speech_backend, False))
+        if not speech_ready:
+            speech_reason = f"{speech_backend} backend unavailable"
+
+    if not speech_ready and speech_reason:
+        issues.append(f"speech: {speech_reason}")
+
+    events_diag: Dict[str, Any] = {
+        "backend": str(audio_events_cfg.get("backend", "auto") or "auto"),
+        "strict": bool(audio_events_cfg.get("strict", False)),
+        "ready": True,
+        "reason": None,
+    }
+    if events_diag["backend"] == "assemblyai":
+        events_cfg = AudioEventsConfig.from_dict(audio_events_cfg)
+        ok, reason = check_assemblyai_audio_events_available(events_cfg.assemblyai_api_key)
+        events_diag["ready"] = bool(ok)
+        events_diag["reason"] = reason
+        if not ok:
+            issues.append(f"audio_events: {reason or 'AssemblyAI audio events unavailable'}")
+    elif events_diag["backend"] == "heuristic":
+        events_diag["ready"] = True
+
+    standalone_diarization = bool((diarization_cfg.get("enabled", False)))
+    speech_diarization = bool(speech_cfg.get("diarize", False))
+    needs_hf_token = bool(standalone_diarization or (speech_diarization and speech_backend != "assemblyai"))
+    hf_token_present = _profile_env_present("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+    diarization_ready = True
+    diarization_reason: Optional[str] = None
+    if needs_hf_token and not hf_token_present:
+        diarization_ready = False
+        diarization_reason = "HF_TOKEN not set for pyannote diarization"
+        issues.append(f"diarization: {diarization_reason}")
+
+    return {
+        "path": str(profile_path) if profile_path is not None else None,
+        "env_selected": bool((os.environ.get("VP_STUDIO_PROFILE") or "").strip()),
+        "fail_fast": bool(analysis_cfg.get("fail_fast", False)),
+        "chat_llm_strict": bool(chat_cfg.get("llm_strict", False)),
+        "highlights_llm_semantic_enabled": bool(highlights_cfg.get("llm_semantic_enabled", False)),
+        "speech": {
+            "backend": speech_backend,
+            "strict": bool(speech_cfg.get("strict", False)),
+            "use_gpu": speech_use_gpu,
+            "ready": speech_ready,
+            "reason": speech_reason,
+        },
+        "audio_events": events_diag,
+        "diarization": {
+            "standalone_enabled": standalone_diarization,
+            "speech_enabled": speech_diarization,
+            "requires_hf_token": needs_hf_token,
+            "hf_token_present": hf_token_present,
+            "ready": diarization_ready,
+            "reason": diarization_reason,
+        },
+        "readiness": {
+            "ok": not issues,
+            "issues": issues,
+        },
+    }
+
+
+def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Path] = None) -> APIRouter:
     router = APIRouter(prefix="/api/actions", tags=["actions"])
 
     _default_domains = {
@@ -4416,21 +4552,28 @@ def create_actions_router(*, profile: Dict[str, Any]) -> APIRouter:
     @router.get("/diagnostics", openapi_extra={"x-openai-isConsequential": False})
     def diagnostics(request: Request):
         _rate_limit(request)
-        from ..transcription import get_available_backends
         from ..chat.downloader import get_supported_platforms, get_twitch_downloader_info, is_chat_download_available
 
-        backends = get_available_backends()
+        backends = _diagnostics_transcription_backends()
         return JSONResponse(
             {
                 "token_required": bool(os.environ.get("VP_API_TOKEN", "").strip()),
+                "env": {
+                    "vp_api_token": bool(os.environ.get("VP_API_TOKEN", "").strip()),
+                    "vp_studio_profile": bool(os.environ.get("VP_STUDIO_PROFILE", "").strip()),
+                    "assemblyai_api_key": _profile_env_present("ASSEMBLYAI_API_KEY", "AAI_API_KEY"),
+                    "hf_token": _profile_env_present("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"),
+                },
                 "transcription": {"backends": backends},
                 "chat": {
                     "available": bool(is_chat_download_available()),
                     "platforms": get_supported_platforms(),
-                    "twitch_downloader": get_twitch_downloader_info(),
+                    "twitch_downloader": get_twitch_downloader_info(include_version=False),
                 },
+                "profile": _profile_readiness(profile, profile_path=profile_path, backends=backends),
                 "paths": {
                     "projects_root": str(default_projects_root()),
+                    "profile_path": str(profile_path) if profile_path is not None else None,
                 },
                 "allowed_domains": sorted(allow_domains),
             }

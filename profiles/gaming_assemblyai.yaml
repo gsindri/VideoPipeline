@@ -1,0 +1,201 @@
+analysis:
+  # Cloud-offload profile for machines where we want strict fail-fast behavior
+  # without relying on local GPU acceleration.
+  fail_fast: true
+  audio:
+    sample_rate: 16000
+    hop_seconds: 0.5
+    smooth_seconds: 3.0
+    top: 12
+    min_gap_seconds: 20.0
+    pre_seconds: 8.0
+    post_seconds: 22.0
+    skip_start_seconds: 10.0
+  vad:
+    enabled: true
+    sample_rate: 16000
+    hop_seconds: 0.5
+    threshold: 0.5
+    min_silence_duration_ms: 250
+    speech_pad_ms: 60
+    min_speech_duration_ms: 250
+    use_onnx: false
+    opset_version: 16
+    torch_threads: 1
+    device: cpu
+  motion:
+    sample_fps: 3.0
+    scale_width: 160
+    smooth_seconds: 2.5
+  scenes:
+    enabled: true
+    threshold_z: 3.5
+    min_scene_len_seconds: 1.2
+    snap_window_seconds: 1.0
+  highlights:
+    top: 45
+    min_gap_seconds: 15.0
+    skip_start_seconds: 10.0
+    smooth_seconds: 1.5
+    require_speech: true
+    min_peak_speech_fraction: 0.15
+    speech_gate_min_fraction: 0.05
+    speech_gate_floor: 0.08
+    speech_gate_power: 1.0
+    weights:
+      audio: 0.25
+      motion: 0.25
+      chat: 0.18
+      audio_events: 0.10
+      reaction: 0.18
+      turn_rate: 0.03
+      overlap: 0.01
+    clip:
+      min_seconds: 12
+      max_seconds: 60
+      min_pre_seconds: 2
+      max_pre_seconds: 12
+      min_post_seconds: 4
+      max_post_seconds: 28
+    llm_filter_enabled: false
+    llm_filter_min_quality: 5
+    llm_filter_max_keep: 10
+    content_type: gaming
+    llm_semantic_enabled: true
+    llm_semantic_weight: 0.3
+    llm_max_candidates: 15
+    llm_strict: true
+  speech:
+    enabled: true
+    backend: assemblyai
+    strict: true
+    model_size: small.en
+    language: en
+    device: cpu
+    compute_type: int8
+    use_gpu: false
+    threads: 0
+    n_processors: 1
+    vad_filter: true
+    word_timestamps: true
+    diarize: true
+    assemblyai_speech_models:
+      - universal-3-pro
+      - universal-2
+    assemblyai_poll_interval_s: 3.0
+    assemblyai_timeout_s: 7200.0
+    hop_seconds: 0.5
+  diarization:
+    enabled: false
+    fail_fast: false
+  chat:
+    llm_strict: true
+  reaction_audio:
+    enabled: true
+    sample_rate: 16000
+    hop_seconds: 0.5
+    smooth_seconds: 1.5
+  audio_events:
+    enabled: true
+    hop_seconds: 0.5
+    smooth_seconds: 2.0
+    sample_rate: 16000
+    backend: assemblyai
+    strict: true
+    assemblyai:
+      speech_models:
+        - universal-3-pro
+        - universal-2
+      auto_highlights: true
+      sentiment_analysis: true
+      poll_interval_s: 3.0
+      timeout_s: 7200.0
+    events:
+      laughter: 1.0
+      cheering: 0.7
+      applause: 0.5
+      screaming: 0.8
+      shouting: 0.6
+  boundaries:
+    prefer_vad: true
+    vad_boundary_score: 1.0
+    prefer_silence: true
+    prefer_sentences: true
+    prefer_scene_cuts: true
+    prefer_chapters: true
+    prefer_chat_valleys: true
+    snap_tolerance_s: 1.0
+    chapter_boundary_score: 2.0
+  enrich:
+    enabled: true
+    hook:
+      max_chars: 60
+      window_seconds: 4.0
+      phrases:
+        - "no way"
+        - "oh my god"
+        - "let's go"
+        - "lets go"
+        - "bro"
+        - "what"
+        - "holy"
+        - "wtf"
+        - "omg"
+        - "insane"
+        - "clutch"
+        - "no shot"
+        - "bruh"
+        - "dude"
+        - "sheesh"
+        - "yo"
+        - "oh no"
+        - "wait"
+        - "huh"
+        - "wow"
+        - "nice"
+        - "crazy"
+        - "dead"
+        - "gg"
+        - "pog"
+        - "hype"
+    quote:
+      max_chars: 120
+
+export:
+  template: vertical_streamer_pip
+  width: 1080
+  height: 1920
+  fps: 30
+  crf: 20
+  preset: medium
+  normalize_audio: false
+
+overlay:
+  hook_text:
+    enabled: true
+    duration_seconds: 2.0
+    text: null
+    font: auto
+    fontsize: 64
+    y: 120
+
+layout:
+  pip:
+    position: top_left
+    margin: 40
+    width_fraction: 0.28
+    border_px: 6
+
+captions:
+  enabled: false
+  model_size: medium.en
+  language: en
+  device: cpu
+  compute_type: int8
+
+context:
+  enabled: true
+  top_n: 25
+  silence_noise_db: -30.0
+  silence_min_duration: 0.3
+  max_sentence_words: 30

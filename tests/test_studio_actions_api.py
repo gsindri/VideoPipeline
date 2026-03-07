@@ -26,7 +26,7 @@ def _reset_job_manager():
         JOB_MANAGER._jobs.clear()  # type: ignore[attr-defined]
 
 
-def _make_client(tmp_path: Path, monkeypatch, *, token: str | None = None) -> TestClient:
+def _make_client(tmp_path: Path, monkeypatch, *, token: str | None = None, profile_path: Path | None = None) -> TestClient:
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("VP_API_TOKEN", raising=False)
 
@@ -42,7 +42,7 @@ def _make_client(tmp_path: Path, monkeypatch, *, token: str | None = None) -> Te
     monkeypatch.setattr(project_mod, "default_projects_root", lambda: projects_root)
     monkeypatch.setattr(actions_api, "default_projects_root", lambda: projects_root)
 
-    app = create_app(video_path=None, profile_path=None)
+    app = create_app(video_path=None, profile_path=profile_path)
     return TestClient(app)
 
 
@@ -128,6 +128,74 @@ def test_actions_allow_domains_env(tmp_path, monkeypatch):
     assert "custom.io" in domains
     # defaults are still present
     assert "twitch.tv" in domains
+
+
+def test_actions_diagnostics_reports_profile_readiness(tmp_path, monkeypatch):
+    profile_path = tmp_path / "gaming_nvidia.yaml"
+    profile_path.write_text(
+        """
+analysis:
+  fail_fast: true
+  speech:
+    backend: assemblyai
+    strict: true
+    diarize: true
+    use_gpu: true
+  diarization:
+    enabled: false
+  audio_events:
+    backend: assemblyai
+    strict: true
+""".strip(),
+        encoding="utf-8",
+    )
+
+    import videopipeline.analysis_audio_events as audio_events_mod
+    import videopipeline.studio.actions_api as actions_api_mod
+
+    monkeypatch.delenv("ASSEMBLYAI_API_KEY", raising=False)
+    monkeypatch.delenv("AAI_API_KEY", raising=False)
+    monkeypatch.setattr(
+        actions_api_mod,
+        "_diagnostics_transcription_backends",
+        lambda: {
+            "whispercpp": False,
+            "whispercpp_gpu": False,
+            "faster_whisper": False,
+            "faster_whisper_gpu": False,
+            "openai_whisper": True,
+            "openai_whisper_gpu": True,
+            "nemo_asr": False,
+            "nemo_asr_gpu": False,
+            "assemblyai": False,
+            "assemblyai_gpu": False,
+        },
+    )
+    monkeypatch.setattr(
+        audio_events_mod,
+        "check_assemblyai_audio_events_available",
+        lambda explicit_key=None: (False, "ASSEMBLYAI_API_KEY not set"),
+    )
+
+    client = _make_client(tmp_path, monkeypatch, token="secret", profile_path=profile_path)
+    hdr = {"Authorization": "Bearer secret"}
+
+    r = client.get("/api/actions/diagnostics", headers=hdr)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["paths"]["profile_path"] == str(profile_path)
+    assert data["profile"]["path"] == str(profile_path)
+    assert data["profile"]["fail_fast"] is True
+    assert data["profile"]["speech"]["backend"] == "assemblyai"
+    assert data["profile"]["speech"]["ready"] is False
+    assert "AssemblyAI" in data["profile"]["speech"]["reason"]
+    assert data["profile"]["audio_events"]["backend"] == "assemblyai"
+    assert data["profile"]["audio_events"]["ready"] is False
+    assert data["profile"]["diarization"]["speech_enabled"] is True
+    assert data["profile"]["diarization"]["requires_hf_token"] is False
+    assert data["profile"]["readiness"]["ok"] is False
+    assert any("speech:" in issue for issue in data["profile"]["readiness"]["issues"])
+    assert any("audio_events:" in issue for issue in data["profile"]["readiness"]["issues"])
 
 
 def test_actions_rate_limiting(tmp_path, monkeypatch):
