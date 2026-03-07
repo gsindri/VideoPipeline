@@ -11,10 +11,10 @@ let isStudioMode = false;
 let currentTab = 'edit';
 
 // =========================================================================
-// LLM MODE (Local vs External "ChatGPT Actions")
+// LLM MODE (In-app AI vs Actions-only)
 // =========================================================================
 
-const VP_LLM_MODE_KEY = 'vp_llm_mode';
+const VP_LLM_MODE_KEY_PREFIX = 'vp_llm_mode';
 const VP_CANDIDATE_SOURCE_FILTER_KEY = 'vp_candidate_source_filter';
 
 function normalizeCandidateSourceFilter(mode) {
@@ -42,19 +42,36 @@ function normalizeLlmMode(mode) {
   return (m === 'local' || m === 'external') ? m : 'external';
 }
 
+function getLlmModeStorageKey() {
+  const ai = profile?.ai?.director || {};
+  const engine = String(ai.engine || 'unknown').trim().toLowerCase();
+  const endpoint = String(ai.endpoint || '').trim().toLowerCase();
+  const model = String(ai.model_name || '').trim().toLowerCase();
+  return `${VP_LLM_MODE_KEY_PREFIX}:${engine}:${endpoint}:${model}`;
+}
+
+function getDefaultLlmMode() {
+  const engine = String(profile?.ai?.director?.engine || '').trim().toLowerCase();
+  // OpenAI API profile should default to in-app mode (uses hosted API, not local llama).
+  if (engine === 'openai_api') return 'local';
+  // Local-LLM profiles keep the existing conservative default.
+  return 'external';
+}
+
 function getLlmMode() {
+  const key = getLlmModeStorageKey();
   try {
-    const raw = localStorage.getItem(VP_LLM_MODE_KEY);
+    const raw = localStorage.getItem(key);
     if (raw && raw.trim()) return normalizeLlmMode(raw);
   } catch {}
-  // Default to external unless user explicitly chose local.
-  return 'external';
+  return getDefaultLlmMode();
 }
 
 function setLlmMode(mode) {
   const m = normalizeLlmMode(mode);
+  const key = getLlmModeStorageKey();
   try {
-    localStorage.setItem(VP_LLM_MODE_KEY, m);
+    localStorage.setItem(key, m);
   } catch {}
   applyLlmModeUiState();
 }
@@ -2018,6 +2035,15 @@ function renderPipelineStatus() {
 	          return { state: 'done', detail: `${speakers} speakers • ${segments} segments${extras}${timeStr}` };
 	        }
 
+	        // Cloud transcript backends (e.g. AssemblyAI) may provide speaker labels
+	        // without producing standalone analysis/diarization.json.
+	        const t = analysis.transcript || {};
+	        if (t?.diarization_used) {
+	          const speakerCount = Array.isArray(t.speakers) ? t.speakers.length : 0;
+	          const backend = t.backend_used || 'transcript backend';
+	          return { state: 'done', detail: `${speakerCount} speakers • via transcript (${backend})` };
+	        }
+
 		        // If diarization isn't enabled, treat as skipped (it is optional).
 		        const diarizeEnabled = $('#diarizeEnabled')?.checked ?? (profile?.analysis?.speech?.diarize === true);
 		        if (!diarizeEnabled) {
@@ -2228,13 +2254,16 @@ function renderPipelineStatus() {
       name: 'AI Director',
       icon: '🤖',
       check: () => {
-	        const d = analysis.ai_director;
-	        if (hasRun(d)) {
-	          const count = d.candidate_count || 0;
-	          const llm = d.llm_available ? 'LLM' : 'heuristic';
-	          const timeStr = d.elapsed_seconds != null ? ` • ${fmtDuration(d.elapsed_seconds)}` : '';
-	          return { state: 'done', detail: `${count} clips analyzed • ${llm}${timeStr}` };
-	        }
+        const d = analysis.ai_director || analysis.director;
+        if (hasRun(d)) {
+          const count = d.candidate_count || 0;
+          const llm = d.llm_available ? 'LLM' : 'heuristic';
+          const timeStr = d.elapsed_seconds != null ? ` • ${fmtDuration(d.elapsed_seconds)}` : '';
+          return { state: 'done', detail: `${count} clips analyzed • ${llm}${timeStr}` };
+        }
+        if (getLlmMode() === 'external') {
+          return { state: 'skipped', detail: 'Actions-only mode (in-app AI disabled)' };
+        }
         // Check if AI is disabled
         const aiEnabled = profile?.ai?.director?.enabled !== false;
         if (!aiEnabled) {
@@ -2778,7 +2807,7 @@ function renderCandidates() {
 
   const highlights = project?.analysis?.highlights;
   const audio = project?.analysis?.audio;
-  const aiDirector = project?.analysis?.ai_director;
+  const aiDirector = project?.analysis?.ai_director || project?.analysis?.director;
   const allCandidates = highlights?.candidates || audio?.candidates || [];
   if (allCandidates.length === 0) {
     if (summaryEl) summaryEl.textContent = '';
@@ -3012,7 +3041,7 @@ function showResetAnalysisModal() {
     const items = [
       // Inputs
       { key: 'transcript', label: 'Transcript', detail: 'Whisper output', status: hasTranscript ? `${fmtCount(transcriptSegCount)} segments` : 'not detected' },
-      { key: 'diarization', label: 'Diarization', detail: 'Speaker turns', status: analysis?.diarization ? 'detected' : 'not detected' },
+      { key: 'diarization', label: 'Diarization', detail: 'Speaker turns', status: (analysis?.diarization || analysis?.transcript?.diarization_used) ? 'detected' : 'not detected' },
       { key: 'chat', label: 'Chat', detail: 'Chat DB + features', status: hasChat ? `${fmtCount(chatCount)} messages` : 'not detected' },
 
       // Core signals + highlights
@@ -3033,7 +3062,7 @@ function showResetAnalysisModal() {
       { key: 'chapters', label: 'Chapters', detail: 'Semantic chapters', status: analysis?.chapters ? 'detected' : 'not detected' },
       { key: 'boundaries', label: 'Boundaries', detail: 'Merged boundary graph', status: analysis?.boundaries ? 'detected' : 'not detected' },
       { key: 'variants', label: 'Clip variants', detail: 'Variant windows + strategies', status: (analysis?.variants || analysis?.clip_variants) ? 'detected' : 'not detected' },
-      { key: 'ai_director', label: 'AI director', detail: 'LLM picks/titles/hooks', status: analysis?.ai_director ? 'detected' : 'not detected' },
+      { key: 'ai_director', label: 'AI director', detail: 'LLM picks/titles/hooks', status: (analysis?.ai_director || analysis?.director) ? 'detected' : 'not detected' },
       { key: 'director', label: 'Director (rules)', detail: 'Heuristic picks', status: analysis?.director ? 'detected' : 'not detected' },
 
       // Chat extras
@@ -4371,7 +4400,7 @@ function setupFacecamCanvas() {
 
 async function startAnalyzeJob() {
   const llmMode = getLlmMode();
-  $('#analysisStatus').textContent = llmMode === 'external' ? 'Starting analysis (external brain)...' : 'Starting analysis...';
+  $('#analysisStatus').textContent = llmMode === 'external' ? 'Starting analysis (actions-only mode)...' : 'Starting analysis (in-app AI mode)...';
   const contentType = $('#contentType')?.value || 'gaming';
   const body = {
     highlights: {
@@ -4379,7 +4408,7 @@ async function startAnalyzeJob() {
     }
   };
   if (llmMode === 'external') {
-    // Ensure we don't attempt any local LLM calls in this run.
+    // Ensure we don't attempt any in-app AI calls in this run.
     body.highlights.llm_semantic_enabled = false;
     body.highlights.llm_filter_enabled = false;
     body.ai = { enabled: false };
@@ -4408,7 +4437,7 @@ async function startAnalyzeAudioEventsJob() {
 
 async function startAnalyzeFullJob() {
   const llmMode = getLlmMode();
-  $('#analysisStatus').textContent = llmMode === 'external' ? 'Starting full analysis (external brain)...' : 'Starting full parallel analysis (DAG)...';
+  $('#analysisStatus').textContent = llmMode === 'external' ? 'Starting full analysis (actions-only mode)...' : 'Starting full parallel analysis (in-app AI)...';
   const motionMode = $('#motionWeightMode')?.value || 'low';
   const contentType = $('#contentType')?.value || 'gaming';
   const whisperBackend = $('#whisperBackend')?.value || 'auto';
@@ -4439,7 +4468,7 @@ async function startAnalyzeFullJob() {
     }
   };
   if (llmMode === 'external') {
-    // External mode means: local compute runs, but we intentionally avoid local-LLM steps.
+    // Actions-only mode means: local compute runs, but we intentionally avoid in-app AI steps.
     // ChatGPT (via Actions) can later fetch bounded inputs and write decisions back.
     body.highlights.llm_semantic_enabled = false;
     body.highlights.llm_filter_enabled = false;
@@ -4482,8 +4511,8 @@ async function startAnalyzeSpeechJob() {
 async function startAnalyzeContextJob() {
   const llmMode = getLlmMode();
   if (llmMode === 'external') {
-    $('#analysisStatus').textContent = 'External mode: use ChatGPT Actions for packaging/picks.';
-    alert('External mode is enabled.\n\nUse ChatGPT (via Actions) to do packaging/picks:\n- GET /api/actions/ai/candidates (default mix: top 30 + 15 chat-spike)\n- GET /api/actions/ai/variants\n- POST /api/actions/ai/apply_director_picks\n- POST /api/actions/export_director_picks\n\nTip: open the Actions Helper to copy the OpenAPI import URL.');
+    $('#analysisStatus').textContent = 'Actions-only mode: use ChatGPT Actions for packaging/picks.';
+    alert('Actions-only mode is enabled.\n\nIn-app AI steps are disabled for this run.\n\nUse ChatGPT (via Actions) to do packaging/picks:\n- GET /api/actions/ai/candidates (default mix: top 30 + 15 chat-spike)\n- GET /api/actions/ai/variants\n- POST /api/actions/ai/apply_director_picks\n- POST /api/actions/export_director_picks\n\nTip: open the Actions Helper to copy the OpenAPI import URL.');
     openActionsHelperModal();
     return;
   }
@@ -4528,7 +4557,15 @@ function wireUI() {
   const canvasApi = setupFacecamCanvas();
 
   const diarizeCb = $('#diarizeEnabled');
-  if (diarizeCb) diarizeCb.onchange = updateDiarizationControls;
+  const dlDiarizeCb = $('#dlDiarizeEnabled');
+  const syncDiarizeToggles = (sourceCb) => {
+    const enabled = !!(sourceCb && sourceCb.checked);
+    if (diarizeCb && sourceCb !== diarizeCb) diarizeCb.checked = enabled;
+    if (dlDiarizeCb && sourceCb !== dlDiarizeCb) dlDiarizeCb.checked = enabled;
+    updateDiarizationControls();
+  };
+  if (diarizeCb) diarizeCb.onchange = () => syncDiarizeToggles(diarizeCb);
+  if (dlDiarizeCb) dlDiarizeCb.onchange = () => syncDiarizeToggles(dlDiarizeCb);
   updateDiarizationControls();
 
   const candidateSourceFilter = $('#candidateSourceFilter');
@@ -6076,7 +6113,8 @@ function showAISuggestionsPanel(candidateRank) {
   
   // Add hashtags
   const hashtags = ai.hashtags || ai.tags || [];
-  const modelName = project?.analysis?.ai_director?.config?.model_name || project?.analysis?.ai_director?.config?.model || '';
+  const directorMeta = project?.analysis?.ai_director || project?.analysis?.director || {};
+  const modelName = directorMeta?.config?.model_name || directorMeta?.config?.model || '';
   
   aiSuggestionsState = {
     candidateRank,
@@ -6248,7 +6286,7 @@ function wireRelearnButton() {
   
   btn.onclick = async () => {
     if (getLlmMode() === 'external') {
-      alert('External mode is enabled.\n\nLocal chat emote learning is disabled in this mode. Switch Brain to "Local LLM" to use Re-learn.');
+      alert('Actions-only mode is enabled.\n\nIn-app chat emote learning is disabled in this mode. Switch Brain to "In-app AI" to use Re-learn.');
       return;
     }
     if (!confirm('This will clear the cached emote data and require re-analysis with Analyze (Full) to learn channel-specific emotes using AI.\n\nContinue?')) {
@@ -6348,10 +6386,10 @@ function wireChatUI() {
 
 async function main() {
   initApiTokenUi();
-  initLlmModeUi();
   try {
     profile = await apiGet('/api/profile');
   } catch (_) {}
+  initLlmModeUi();
   applyAnalysisDefaultsFromProfile();
 
   // Initialize collapsible panels
@@ -6561,6 +6599,16 @@ async function updateWhisperBackendOptions() {
           opt.textContent = gpu ? 'openai-whisper (GPU)' : 'openai-whisper';
           opt.disabled = false;
         }
+      } else if (opt.value === 'nemo_asr') {
+        const available = backends.nemo_asr;
+        const gpu = backends.nemo_asr_gpu;
+        if (!available) {
+          opt.textContent = 'NeMo ASR ✗';
+          opt.disabled = true;
+        } else {
+          opt.textContent = gpu ? 'NeMo ASR (CUDA)' : 'NeMo ASR';
+          opt.disabled = false;
+        }
       } else if (opt.value === 'whispercpp') {
         const available = backends.whispercpp;
         const gpu = backends.whispercpp_gpu;
@@ -6579,6 +6627,15 @@ async function updateWhisperBackendOptions() {
           opt.disabled = true;
         } else {
           opt.textContent = gpu ? 'faster-whisper (CUDA)' : 'faster-whisper';
+          opt.disabled = false;
+        }
+      } else if (opt.value === 'assemblyai') {
+        const available = backends.assemblyai;
+        if (!available) {
+          opt.textContent = 'AssemblyAI (cloud) ✗';
+          opt.disabled = true;
+        } else {
+          opt.textContent = 'AssemblyAI (cloud)';
           opt.disabled = false;
         }
       }

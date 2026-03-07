@@ -1,7 +1,8 @@
 """Project-level transcription with pluggable backends.
 
-Supports whisper.cpp (pywhispercpp) and faster-whisper backends.
-Runs Whisper once per video and caches the full transcript for reuse.
+Supports openai-whisper, faster-whisper, whisper.cpp, NeMo ASR, and AssemblyAI
+backends. Runs transcription once per video and caches the full transcript for
+reuse.
 """
 from __future__ import annotations
 
@@ -25,7 +26,7 @@ class WhisperNotInstalledError(RuntimeError):
     pass
 
 
-BackendType = Literal["whispercpp", "faster_whisper", "auto"]
+BackendType = Literal["whispercpp", "faster_whisper", "openai_whisper", "nemo_asr", "assemblyai", "auto"]
 
 
 @dataclass(frozen=True)
@@ -33,7 +34,7 @@ class TranscriptConfig:
     """Configuration for full-video transcription.
     
     Attributes:
-        backend: Transcription backend ("whispercpp", "faster_whisper", "auto")
+        backend: Transcription backend ("openai_whisper", "faster_whisper", "whispercpp", "nemo_asr", "assemblyai", "auto")
         model_size: Model size (tiny, base, small, medium, large)
                     Also supports quantized: small.en-q8_0, tiny-q5_1
         language: Language code or None for auto-detect
@@ -68,6 +69,10 @@ class TranscriptConfig:
     diarize_min_speakers: Optional[int] = None
     diarize_max_speakers: Optional[int] = None
     hf_token: Optional[str] = None
+    assemblyai_api_key: Optional[str] = None
+    assemblyai_speech_models: Optional[List[str]] = None
+    assemblyai_poll_interval_s: float = 3.0
+    assemblyai_timeout_s: float = 7200.0
 
 
 @dataclass
@@ -231,6 +236,10 @@ def _use_new_transcription_engine(
         diarize_min_speakers=cfg.diarize_min_speakers,
         diarize_max_speakers=cfg.diarize_max_speakers,
         hf_token=cfg.hf_token,
+        assemblyai_api_key=cfg.assemblyai_api_key,
+        assemblyai_speech_models=cfg.assemblyai_speech_models,
+        assemblyai_poll_interval_s=cfg.assemblyai_poll_interval_s,
+        assemblyai_timeout_s=cfg.assemblyai_timeout_s,
     )
     
     # Get transcriber with fallback
@@ -263,11 +272,11 @@ def _use_new_transcription_engine(
     # Unload transcription model to free GPU memory before diarization
     transcriber.unload_model()
     
-    # Run diarization if enabled
-    speakers: Optional[List[str]] = None
-    diarization_used = False
+    # Backends may already include speaker labels (e.g., AssemblyAI cloud diarization).
+    speakers: Optional[List[str]] = result.speakers
+    diarization_used = bool(result.diarization_used)
     
-    if diarization_enabled:
+    if diarization_enabled and not diarization_used:
         try:
             from .transcription.diarization import (
                 is_diarization_available,
@@ -371,14 +380,19 @@ def compute_transcript_analysis(
     cfg: TranscriptConfig,
     on_progress: Optional[Callable[[float], None]] = None,
     force: bool = False,
+    source_audio_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Transcribe the full video using the configured backend.
 
-    Supports whisper.cpp (pywhispercpp) and faster-whisper backends.
+    Supports openai-whisper, faster-whisper, whisper.cpp, NeMo ASR, and
+    AssemblyAI backends.
     Backend selection:
-      - "auto": tries whispercpp first, falls back to faster-whisper
+      - "auto": selects best available local backend for current hardware
+      - "openai_whisper": uses openai-whisper (PyTorch)
+      - "faster_whisper": uses faster-whisper (CTranslate2, CUDA acceleration)
       - "whispercpp": uses pywhispercpp (fast CPU, GPU with Vulkan build)
-      - "faster_whisper": uses faster-whisper (CUDA GPU support)
+      - "nemo_asr": uses NVIDIA NeMo ASR (CUDA-optimized)
+      - "assemblyai": uses AssemblyAI cloud transcription + optional speaker labels
 
     Args:
         proj: Project to transcribe
@@ -395,7 +409,7 @@ def compute_transcript_analysis(
       - Config (backend, model, language, word_timestamps) matches
       - force=False
     """
-    video_path = Path(proj.audio_source)  # Use audio_source for fallback during early analysis
+    video_path = Path(source_audio_path) if source_audio_path is not None else Path(proj.audio_source)
     transcript_path = proj.analysis_dir / "transcript_full.json"
     
     # Check for cached transcript (major speedup on re-runs)
@@ -483,6 +497,7 @@ def compute_transcript_analysis(
             "n_processors": cfg.n_processors,
             "strict": cfg.strict,
             "diarize": cfg.diarize,
+            "assemblyai_speech_models": cfg.assemblyai_speech_models,
         },
         "backend_used": backend_used,
         "gpu_used": gpu_used,
@@ -636,6 +651,7 @@ def compute_transcript_analysis_from_audio(
             "n_processors": cfg.n_processors,
             "strict": cfg.strict,
             "diarize": cfg.diarize,
+            "assemblyai_speech_models": cfg.assemblyai_speech_models,
         },
         "backend_used": backend_used,
         "gpu_used": gpu_used,
@@ -683,6 +699,10 @@ def _transcribe_audio_file(
         diarize_min_speakers=cfg.diarize_min_speakers,
         diarize_max_speakers=cfg.diarize_max_speakers,
         hf_token=cfg.hf_token,
+        assemblyai_api_key=cfg.assemblyai_api_key,
+        assemblyai_speech_models=cfg.assemblyai_speech_models,
+        assemblyai_poll_interval_s=cfg.assemblyai_poll_interval_s,
+        assemblyai_timeout_s=cfg.assemblyai_timeout_s,
     )
     
     # Get transcriber with fallback
@@ -702,11 +722,11 @@ def _transcribe_audio_file(
     # Unload model to free GPU memory
     transcriber.unload_model()
     
-    # Run diarization if requested and available
-    speakers: Optional[List[str]] = None
-    diarization_used = False
+    # Backends may already include speaker labels (e.g., AssemblyAI cloud diarization).
+    speakers: Optional[List[str]] = result.speakers
+    diarization_used = bool(result.diarization_used)
     
-    if cfg.diarize:
+    if cfg.diarize and not diarization_used:
         from .transcription import is_diarization_available, diarize_audio, merge_diarization_with_transcript
         
         if is_diarization_available():

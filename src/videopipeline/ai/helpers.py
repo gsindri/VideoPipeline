@@ -1,6 +1,6 @@
 """Helper functions for LLM client setup.
 
-Provides a unified way to get an LLM completion function with auto-start support.
+Provides a unified way to get an LLM completion function for local or hosted APIs.
 This reduces code duplication across the codebase.
 """
 
@@ -27,7 +27,7 @@ def get_llm_complete_fn(
     This is the unified way to set up LLM access across the codebase.
     It handles:
     - Checking if AI is enabled
-    - Auto-starting the LLM server if configured
+    - Auto-starting local llama.cpp server if configured
     - Creating the client and checking availability
     - Returning a simple completion function or None
     
@@ -51,22 +51,27 @@ def get_llm_complete_fn(
         return None
     
     try:
-        from .llm_server import ensure_llm_server
         from .llm_client import create_llm_client
         
+        engine = str(ai_cfg.get("engine", "llama_cpp_server")).strip().lower()
         endpoint = str(ai_cfg.get("endpoint", "http://127.0.0.1:11435"))
+        api_key = ai_cfg.get("api_key")
+        if isinstance(api_key, str):
+            api_key = api_key.strip() or None
         
-        # Auto-start server if configured
-        if ai_cfg.get("auto_start", False):
+        # Auto-start only applies to local llama.cpp server.
+        if engine == "llama_cpp_server" and ai_cfg.get("auto_start", False):
+            from .llm_server import ensure_llm_server
+
             server_path = Path(ai_cfg.get("server_path", "C:/llama.cpp/llama-server.exe"))
             model_path = Path(ai_cfg.get("model_path", "C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf"))
             auto_stop_s = ai_cfg.get("auto_stop_idle_s", 600.0)
             startup_timeout_s = float(ai_cfg.get("startup_timeout_s", 120.0))
-            
+
             log.info(f"[llm] Auto-starting server (timeout={startup_timeout_s}s)...")
             if on_status:
                 on_status("Starting LLM server...")
-            
+
             started_endpoint = ensure_llm_server(
                 server_path=server_path,
                 model_path=model_path,
@@ -86,13 +91,15 @@ def get_llm_complete_fn(
         llm_client = create_llm_client(
             endpoint=endpoint,
             cache_dir=cache_dir,
+            model_name=str(ai_cfg.get("model_name", "local-gguf-vulkan")),
+            api_key=api_key,
             timeout_s=float(ai_cfg.get("timeout_s", 60)),
             max_tokens=int(ai_cfg.get("max_tokens", 2048)),
             temperature=float(ai_cfg.get("temperature", 0.2)),
         )
         
         if llm_client.is_available():
-            log.info(f"[llm] Client available at {endpoint}")
+            log.info(f"[llm] Client available at {endpoint} (engine={engine})")
             
             def complete_fn(prompt: str) -> str:
                 resp = llm_client.complete(prompt, json_mode=True)

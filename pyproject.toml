@@ -26,6 +26,8 @@ vp = "videopipeline.cli:main"
 
 [project.optional-dependencies]
 whisper = ["faster-whisper>=1.0.0"]
+assemblyai = ["assemblyai>=0.52.0"]
+nemo_asr = ["nemo-toolkit[asr]>=2.4.0"]
 diarization = [
     "pyannote-audio>=4.0.0",
     "torch>=2.0.0",

@@ -155,6 +155,7 @@ def compute_silence_analysis(
     proj: Project,
     *,
     cfg: SilenceConfig,
+    source_audio_path: Optional[Path] = None,
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Detect silence intervals and save to project.
@@ -165,7 +166,7 @@ def compute_silence_analysis(
     """
     from .ffmpeg import ffprobe_duration_seconds
     
-    video_path = Path(proj.audio_source)  # Use audio_source for fallback during early analysis
+    video_path = Path(source_audio_path) if source_audio_path is not None else Path(proj.audio_source)
     
     # Get duration for EOF handling
     try:

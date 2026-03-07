@@ -50,6 +50,7 @@ from .jobs import JOB_MANAGER, with_prevent_sleep
 from .range import ranged_file_response
 from .home import list_recent_projects, windows_open_video_dialog, check_video_exists
 from .publisher_api import create_publisher_router
+from .dag_config import apply_llm_mode_to_dag_config, build_dag_config, dag_config_needs_llm
 from ..ingest import (
     IngestRequest,
     IngestResult,
@@ -337,13 +338,18 @@ def create_app(
         
         backends = get_available_backends()
         
-        # Recommended: openai_whisper with GPU (supports AMD ROCm + NVIDIA CUDA)
-        if backends.get("openai_whisper_gpu"):
+        # Recommended backend order (favor CUDA-optimized paths on NVIDIA):
+        if backends.get("nemo_asr_gpu"):
+            recommended = "nemo_asr"
+        elif backends.get("openai_whisper_gpu"):
             recommended = "openai_whisper"
         elif backends.get("openai_whisper"):
             recommended = "openai_whisper"
         elif backends.get("faster_whisper"):
             recommended = "faster_whisper"
+        elif backends.get("assemblyai"):
+            # Optional cloud fallback when local stacks are unavailable.
+            recommended = "assemblyai"
         else:
             recommended = "whispercpp"
         
@@ -351,7 +357,7 @@ def create_app(
             "transcription": {
                 "backends": backends,
                 "recommended": recommended,
-                "gpu_available": backends.get("openai_whisper_gpu") or backends.get("faster_whisper_gpu") or backends.get("whispercpp_gpu"),
+                "gpu_available": backends.get("nemo_asr_gpu") or backends.get("openai_whisper_gpu") or backends.get("faster_whisper_gpu") or backends.get("whispercpp_gpu"),
             },
         })
 
@@ -477,42 +483,44 @@ def create_app(
 
     @app.get("/api/system/llm")
     def api_system_llm() -> JSONResponse:
-        """Get LLM server status."""
+        """Get configured LLM status (local llama.cpp or hosted OpenAI-compatible API)."""
         import subprocess
-        import urllib.request
+        from ..ai.llm_client import LLMClient, LLMClientConfig
         
         result: Dict[str, Any] = {
             "running": False,
             "endpoint": None,
             "model": None,
+            "engine": None,
         }
         
         # Get configured endpoint from profile
         ai_cfg = ctx.profile.get("ai", {}).get("director", {})
         endpoint = ai_cfg.get("endpoint", "http://127.0.0.1:11435")
+        engine = str(ai_cfg.get("engine", "llama_cpp_server"))
         result["endpoint"] = endpoint
+        result["engine"] = engine
+        result["model"] = str(ai_cfg.get("model_name", "")) or None
         
-        # Check if server is running
+        # Check endpoint availability (auth-aware for hosted APIs).
         try:
-            req = urllib.request.Request(f"{endpoint}/health", method="GET")
-            with urllib.request.urlopen(req, timeout=2.0) as resp:
-                if resp.status == 200:
-                    result["running"] = True
-                    
-                    # Try to get model info
-                    try:
-                        import json
-                        req2 = urllib.request.Request(f"{endpoint}/v1/models")
-                        with urllib.request.urlopen(req2, timeout=2.0) as resp2:
-                            data = json.loads(resp2.read().decode('utf-8'))
-                            if data.get("data"):
-                                result["model"] = data["data"][0].get("id", "unknown")
-                    except:
-                        pass
-        except:
+            client = LLMClient(
+                LLMClientConfig(
+                    endpoint=str(endpoint),
+                    model_name=str(ai_cfg.get("model_name", "local-gguf-vulkan")),
+                    api_key=(str(ai_cfg.get("api_key", "")).strip() or None),
+                    timeout_s=float(ai_cfg.get("timeout_s", 30.0)),
+                    cache_enabled=False,
+                )
+            )
+            result["running"] = bool(client.is_available())
+        except Exception:
             pass
         
-        # Check process info
+        # Local process info only applies to llama.cpp server.
+        if engine != "llama_cpp_server":
+            return JSONResponse(result)
+
         try:
             proc = subprocess.run(
                 ["tasklist", "/FI", "IMAGENAME eq llama-server.exe", "/FO", "CSV", "/NH"],
@@ -538,21 +546,34 @@ def create_app(
     def api_system_llm_stop() -> JSONResponse:
         """Stop the LLM server to free GPU memory."""
         import subprocess
+        from ..ai.llm_client import LLMClient, LLMClientConfig
         
         result: Dict[str, Any] = {
             "success": False,
             "was_running": False,
         }
+
+        ai_cfg = ctx.profile.get("ai", {}).get("director", {})
+        engine = str(ai_cfg.get("engine", "llama_cpp_server"))
+        if engine != "llama_cpp_server":
+            result["success"] = True
+            result["message"] = f"Stop not applicable for engine '{engine}'"
+            return JSONResponse(result)
         
         # Check if it was running first
         try:
-            import urllib.request
-            ai_cfg = ctx.profile.get("ai", {}).get("director", {})
             endpoint = ai_cfg.get("endpoint", "http://127.0.0.1:11435")
-            req = urllib.request.Request(f"{endpoint}/health", method="GET")
-            with urllib.request.urlopen(req, timeout=2.0) as resp:
-                result["was_running"] = resp.status == 200
-        except:
+            client = LLMClient(
+                LLMClientConfig(
+                    endpoint=str(endpoint),
+                    model_name=str(ai_cfg.get("model_name", "local-gguf-vulkan")),
+                    api_key=(str(ai_cfg.get("api_key", "")).strip() or None),
+                    timeout_s=2.0,
+                    cache_enabled=False,
+                )
+            )
+            result["was_running"] = bool(client.is_available())
+        except Exception:
             pass
         
         # Kill the process
@@ -1692,6 +1713,18 @@ def create_app(
             import logging
             import threading
             log = logging.getLogger("videopipeline.studio")
+            try:
+                _speech = ctx.profile.get("analysis", {}).get("speech", {}) or {}
+                _diar = ctx.profile.get("analysis", {}).get("diarization", {}) or {}
+                log.info(
+                    "[DOWNLOAD] diarize option: provided=%s enabled=%s (speech.diarize=%s, diarization.enabled=%s)",
+                    diarize_opt_provided,
+                    diarize_enabled,
+                    bool(_speech.get("diarize", False)),
+                    _diar.get("enabled", None),
+                )
+            except Exception:
+                pass
             
             # Shared state for progress tracking
             current_chat_status = {"status": "pending", "message": "Waiting..."}
@@ -2090,6 +2123,17 @@ def create_app(
                         diarize_min_speakers=speech_cfg.get("diarize_min_speakers"),
                         diarize_max_speakers=speech_cfg.get("diarize_max_speakers"),
                         hf_token=speech_cfg.get("hf_token"),
+                        assemblyai_api_key=speech_cfg.get("assemblyai_api_key"),
+                        assemblyai_speech_models=(
+                            speech_cfg.get("assemblyai_speech_models")
+                            or (speech_cfg.get("assemblyai", {}) or {}).get("speech_models")
+                        ),
+                        assemblyai_poll_interval_s=float(
+                            speech_cfg.get("assemblyai_poll_interval_s", (speech_cfg.get("assemblyai", {}) or {}).get("poll_interval_s", 3.0))
+                        ),
+                        assemblyai_timeout_s=float(
+                            speech_cfg.get("assemblyai_timeout_s", (speech_cfg.get("assemblyai", {}) or {}).get("timeout_s", 7200.0))
+                        ),
                     )
                     
                     log.info(f"[TRANSCRIPT] Starting early transcription from audio... (diarize={should_diarize})")
@@ -2231,21 +2275,23 @@ def create_app(
                         speech_cfg["verbose"] = True
                     if diarize_opt_provided:
                         speech_cfg["diarize"] = diarize_enabled
-                    dag_config = {
-                        "audio": analysis_cfg.get("audio", {}),
-                        "vad": analysis_cfg.get("vad", {}),
-                        "silence": analysis_cfg.get("silence", {}),
-                        "reaction_audio": analysis_cfg.get("reaction_audio", {}),
-                        "speech": speech_cfg,
-                        "diarization": analysis_cfg.get("diarization", {}),
-                        "sentences": analysis_cfg.get("sentences", {}),
-                        "speech_features": analysis_cfg.get("speech_features", {}),
-                        "boundaries": analysis_cfg.get("boundaries", {}),
-                        "highlights": analysis_cfg.get("highlights", {}),
-                        "audio_events": analysis_cfg.get("audio_events", {}),
-                        "include_chat": True,
-                        "include_audio_events": bool(analysis_cfg.get("audio_events", {}).get("enabled", True)),
-                    }
+                    dag_config = build_dag_config(
+                        analysis_cfg,
+                        section_overrides={"speech": speech_cfg},
+                        include_chat=True,
+                    )
+                    dag_config = apply_llm_mode_to_dag_config(dag_config, llm_mode=llm_mode)
+
+                    # Optional LLM support (semantic filtering/reranking + chat emote learning).
+                    llm_complete_fn_pre = None
+                    if llm_mode != "external":
+                        try:
+                            llm_needed_pre = dag_config_needs_llm(dag_config)
+                            ai_cfg_pre = ctx.profile.get("ai", {}).get("director", {}) or {}
+                            if ai_cfg_pre.get("enabled", True) and llm_needed_pre:
+                                llm_complete_fn_pre = get_llm_complete_fn(ai_cfg_pre, early_proj.analysis_dir)
+                        except Exception:
+                            llm_complete_fn_pre = None
                     
                     log.info(f"[DAG] Starting pre_download bundle analysis...")
                     early_dag_status["status"] = "analyzing"
@@ -2301,7 +2347,13 @@ def create_app(
                     bundle_name = "pre_download" if chat_available else "pre_download_no_chat"
                     if not chat_available:
                         log.info("[DAG] Chat not available yet; deferring chat-derived tasks")
-                    result = run_analysis(early_proj, bundle=bundle_name, config=dag_config, on_progress=on_dag_progress)
+                    result = run_analysis(
+                        early_proj,
+                        bundle=bundle_name,
+                        config=dag_config,
+                        on_progress=on_dag_progress,
+                        llm_complete=llm_complete_fn_pre,
+                    )
 
                     early_dag_result = result
                     early_dag_status["progress"] = 1.0
@@ -2347,6 +2399,20 @@ def create_app(
                             audio_events_status["status"] = "complete"
                             audio_events_status["progress"] = 1.0
 
+                    transcript_diarization_used = False
+                    transcript_speakers: List[str] = []
+                    try:
+                        transcript_path = early_proj.analysis_dir / "transcript_full.json"
+                        if transcript_path.exists():
+                            t_payload = json.loads(transcript_path.read_text(encoding="utf-8"))
+                            transcript_diarization_used = bool(t_payload.get("diarization_used", False))
+                            raw_speakers = t_payload.get("speakers")
+                            if isinstance(raw_speakers, list):
+                                transcript_speakers = [str(s).strip() for s in raw_speakers if str(s).strip()]
+                    except Exception:
+                        transcript_diarization_used = False
+                        transcript_speakers = []
+
                     diar_tr = next((tr for tr in result.tasks_run if tr.task_name == "diarization"), None)
                     if diar_tr is not None:
                         diar_out = early_proj.analysis_dir / "diarization.json"
@@ -2363,12 +2429,42 @@ def create_app(
                             except Exception:
                                 pass
                         elif diar_tr.status == "failed":
-                            diarization_status["status"] = "failed"
-                            diarization_status["progress"] = 0
+                            # Cloud transcript backends (e.g. AssemblyAI) can provide speaker
+                            # labels even when standalone diarization is disabled/unavailable.
+                            if transcript_diarization_used:
+                                diarization_status["status"] = "complete"
+                                diarization_status["progress"] = 1.0
+                                diarization_status["speakers"] = transcript_speakers
+                            else:
+                                diarization_status["status"] = "failed"
+                                diarization_status["progress"] = 0
                         else:
-                            # Task ran but produced no output (optional/unavailable) or was disabled.
-                            diarization_status["status"] = "failed"
-                            diarization_status["progress"] = 0
+                            # Task did not produce standalone diarization output
+                            # (disabled/unavailable/optional). If transcript already carries
+                            # speaker labels, treat diarization as complete for UI status.
+                            if transcript_diarization_used:
+                                diarization_status["status"] = "complete"
+                                diarization_status["progress"] = 1.0
+                                diarization_status["speakers"] = transcript_speakers
+                            else:
+                                diarization_status["status"] = "skipped"
+                                diarization_status["progress"] = 1.0
+                    else:
+                        # Not present in tasks_run -> either not selected or disabled by config.
+                        if transcript_diarization_used:
+                            diarization_status["status"] = "complete"
+                            diarization_status["progress"] = 1.0
+                            diarization_status["speakers"] = transcript_speakers
+                        else:
+                            diar_enabled_cfg = bool(
+                                (analysis_cfg.get("diarization", {}) or {}).get(
+                                    "enabled",
+                                    analysis_cfg.get("speech", {}).get("diarize", False),
+                                )
+                            )
+                            if not diar_enabled_cfg:
+                                diarization_status["status"] = "skipped"
+                                diarization_status["progress"] = 1.0
                     
                     # Summary log that reflects partial failures.
                     _counts: Dict[str, int] = {}
@@ -2499,21 +2595,21 @@ def create_app(
                                                 speech_cfg["verbose"] = True
                                             if diarize_opt_provided:
                                                 speech_cfg["diarize"] = diarize_enabled
-                                            dag_config = {
-                                                "audio": analysis_cfg.get("audio", {}),
-                                                "vad": analysis_cfg.get("vad", {}),
-                                                "silence": analysis_cfg.get("silence", {}),
-                                                "reaction_audio": analysis_cfg.get("reaction_audio", {}),
-                                                "speech": speech_cfg,
-                                                "diarization": analysis_cfg.get("diarization", {}),
-                                                "sentences": analysis_cfg.get("sentences", {}),
-                                                "speech_features": analysis_cfg.get("speech_features", {}),
-                                                "boundaries": analysis_cfg.get("boundaries", {}),
-                                                "highlights": analysis_cfg.get("highlights", {}),
-                                                "audio_events": analysis_cfg.get("audio_events", {}),
-                                                "include_chat": True,
-                                                "include_audio_events": bool(analysis_cfg.get("audio_events", {}).get("enabled", True)),
-                                            }
+                                            dag_config = build_dag_config(
+                                                analysis_cfg,
+                                                section_overrides={"speech": speech_cfg},
+                                                include_chat=True,
+                                            )
+                                            dag_config = apply_llm_mode_to_dag_config(dag_config, llm_mode=llm_mode)
+
+                                            llm_complete_fn_chat = None
+                                            if llm_mode != "external":
+                                                try:
+                                                    ai_cfg = ctx.profile.get("ai", {}).get("director", {}) or {}
+                                                    if ai_cfg.get("enabled", True) and dag_config_needs_llm(dag_config):
+                                                        llm_complete_fn_chat = get_llm_complete_fn(ai_cfg, early_proj.analysis_dir)
+                                                except Exception:
+                                                    llm_complete_fn_chat = None
 
                                             def on_chat_progress(frac: float, msg: str) -> None:
                                                 # Keep the main DAG progress intact; just update message for visibility.
@@ -2527,6 +2623,7 @@ def create_app(
                                                 targets={"chat_boundaries"},
                                                 config=dag_config,
                                                 on_progress=on_chat_progress,
+                                                llm_complete=llm_complete_fn_chat,
                                             )
                                         except Exception as e:
                                             log.warning(f"[DAG] Chat-only analysis failed: {e}")
@@ -2572,17 +2669,27 @@ def create_app(
                                             early_dag_status["message"] = "Adding chat features..."
                                                 
                                             analysis_cfg = ctx.profile.get("analysis", {})
-                                            dag_config = {
-                                                "audio": analysis_cfg.get("audio", {}),
-                                                "silence": analysis_cfg.get("silence", {}),
-                                                "speech": analysis_cfg.get("speech", {}),
-                                                "sentences": analysis_cfg.get("sentences", {}),
-                                                "speech_features": analysis_cfg.get("speech_features", {}),
-                                                "highlights": analysis_cfg.get("highlights", {}),
-                                                "audio_events": analysis_cfg.get("audio_events", {}),
-                                                "include_chat": True,
-                                                "include_audio_events": bool(analysis_cfg.get("audio_events", {}).get("enabled", True)),
-                                            }
+                                            speech_cfg = dict(analysis_cfg.get("speech", {}) or {})
+                                            if whisper_verbose:
+                                                speech_cfg["verbose"] = True
+                                            if diarize_opt_provided:
+                                                speech_cfg["diarize"] = diarize_enabled
+
+                                            dag_config = build_dag_config(
+                                                analysis_cfg,
+                                                section_overrides={"speech": speech_cfg},
+                                                include_chat=True,
+                                            )
+                                            dag_config = apply_llm_mode_to_dag_config(dag_config, llm_mode=llm_mode)
+
+                                            llm_complete_fn_chat = None
+                                            if llm_mode != "external":
+                                                try:
+                                                    ai_cfg = ctx.profile.get("ai", {}).get("director", {}) or {}
+                                                    if ai_cfg.get("enabled", True) and dag_config_needs_llm(dag_config):
+                                                        llm_complete_fn_chat = get_llm_complete_fn(ai_cfg, early_proj.analysis_dir)
+                                                except Exception:
+                                                    llm_complete_fn_chat = None
                                                 
                                             def on_rerun_progress(frac: float, msg: str) -> None:
                                                 check_cancel()
@@ -2594,6 +2701,7 @@ def create_app(
                                                 bundle="pre_download",
                                                 config=dag_config,
                                                 on_progress=on_rerun_progress,
+                                                llm_complete=llm_complete_fn_chat,
                                             )
 
                                             early_dag_status["progress"] = 1.0
@@ -2958,6 +3066,8 @@ def create_app(
 
                                     hop_s = float(ctx.profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
                                     smooth_s = float(ctx.profile.get("analysis", {}).get("highlights", {}).get("chat_smooth_seconds", 3.0))
+                                    chat_llm_strict = bool((ctx.profile.get("analysis", {}).get("chat", {}) or {}).get("llm_strict", False))
+                                    chat_llm_strict = bool(chat_llm_strict and mode_uses_local_llm)
 
                                     llm_complete_fn = None
                                     if mode_uses_local_llm:
@@ -2985,13 +3095,16 @@ def create_app(
                                         smooth_s=smooth_s,
                                         on_status=on_feature_status,
                                         llm_complete=llm_complete_fn,
+                                        strict_llm=chat_llm_strict,
                                         channel_id=channel_id,
                                         platform=platform,
                                     )
                                     log.info("[CHAT] Chat features computed")
                                 except Exception as e:
                                     log.warning("[CHAT] Chat feature computation failed: %s", e)
-                                    # Non-fatal - features can be computed later during analysis
+                                    if bool((ctx.profile.get("analysis", {}) or {}).get("fail_fast", False)):
+                                        raise
+                                    # Non-fatal in non-strict mode - features can be computed later during analysis
 
                         if chat_result.get("imported"):
                             JOB_MANAGER._set(
@@ -3061,44 +3174,32 @@ def create_app(
                             )
 
                             analysis_cfg = ctx.profile.get("analysis", {})
+                            fail_fast = bool((analysis_cfg or {}).get("fail_fast", False))
+                            ai_cfg = ctx.profile.get("ai", {}).get("director", {}) or {}
+                            director_cfg_for_dag = {
+                                "enabled": bool(ai_cfg.get("enabled", True)),
+                                "use_llm": True,
+                                "fallback_to_rules": bool(ai_cfg.get("fallback_to_rules", True)),
+                                "platform": str(ai_cfg.get("platform", "shorts")),
+                            }
                             speech_cfg = dict(analysis_cfg.get("speech", {}) or {})
                             if whisper_verbose:
                                 speech_cfg["verbose"] = True
                             if diarize_opt_provided:
                                 speech_cfg["diarize"] = diarize_enabled
 
-                            dag_config: Dict[str, Any] = {
-                                **(analysis_cfg or {}),
-                                "speech": speech_cfg,
-                                "include_chat": True,
-                                "include_audio_events": bool(analysis_cfg.get("audio_events", {}).get("enabled", True)),
-                            }
-
-                            if llm_mode == "external":
-                                # Ensure no local LLM calls happen during upgrade analysis. ChatGPT-in-the-loop
-                                # workflows use Actions IO/apply endpoints instead.
-                                highlights_cfg = dict(dag_config.get("highlights", {}) or {})
-                                highlights_cfg["llm_semantic_enabled"] = False
-                                highlights_cfg["llm_filter_enabled"] = False
-                                dag_config["highlights"] = highlights_cfg
-
-                                chapters_cfg = dict(dag_config.get("chapters", {}) or {})
-                                chapters_cfg["llm_labeling"] = False
-                                dag_config["chapters"] = chapters_cfg
-
-                                director_cfg = dict(dag_config.get("director", {}) or {})
-                                director_cfg["enabled"] = False
-                                dag_config["director"] = director_cfg
+                            dag_config = build_dag_config(
+                                analysis_cfg,
+                                section_overrides={"speech": speech_cfg, "director": director_cfg_for_dag},
+                                include_chat=True,
+                            )
+                            dag_config = apply_llm_mode_to_dag_config(dag_config, llm_mode=llm_mode)
 
                             # Optional LLM support (semantic filtering/reranking + chat emotes).
                             llm_complete_fn = None
                             if llm_mode != "external":
                                 try:
-                                    ai_cfg = ctx.profile.get("ai", {}).get("director", {}) or {}
-                                    highlights_cfg2 = dag_config.get("highlights", {}) or {}
-                                    llm_needed = bool(highlights_cfg2.get("llm_semantic_enabled", True)) or bool(
-                                        highlights_cfg2.get("llm_filter_enabled", False)
-                                    )
+                                    llm_needed = dag_config_needs_llm(dag_config)
                                     if ai_cfg.get("enabled", True) and llm_needed:
                                         llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
                                 except Exception:
@@ -3118,15 +3219,18 @@ def create_app(
                                     llm_complete=llm_complete_fn,
                                     upgrade_mode=True,
                                 )
-                                # Treat partial failures as "done" (they'll be visible in logs/project),
-                                # since missing optional deps (torch/ruptures/etc) shouldn't feel fatal.
+                                status = "succeeded"
                                 msg = "Upgrade complete."
                                 if not getattr(dag_result, "success", True):
                                     err = getattr(dag_result, "error", "") or "see logs"
-                                    msg = f"Upgrade complete (with warnings): {err}"
+                                    if fail_fast:
+                                        status = "failed"
+                                        msg = f"Upgrade failed: {err}"
+                                    else:
+                                        msg = f"Upgrade complete (with warnings): {err}"
                                 JOB_MANAGER._set(
                                     upgrade_job,
-                                    status="succeeded",
+                                    status=status,
                                     progress=1.0,
                                     message=msg,
                                     result={
@@ -3216,10 +3320,32 @@ def create_app(
                         "dag_message": str(early_dag_status.get("message") or ""),
                     }
                 )
-                
+
+                fail_fast = bool((ctx.profile.get("analysis", {}) or {}).get("fail_fast", False))
+                fail_reasons: list[str] = []
+                if chat_result.get("import_error") or chat_result.get("status") == "failed":
+                    fail_reasons.append("chat")
+                if str(transcript_status.get("status", "")) in {"failed", "audio_failed"}:
+                    fail_reasons.append("transcript")
+                if str(audio_rms_status.get("status", "")) == "failed":
+                    fail_reasons.append("audio_rms")
+                if str(audio_events_status.get("status", "")) == "failed":
+                    fail_reasons.append("audio_events")
+                if str(diarization_status.get("status", "")) == "failed":
+                    fail_reasons.append("diarization")
+                if early_dag_result is not None and not bool(getattr(early_dag_result, "success", True)):
+                    fail_reasons.append("dag")
+                elif str(early_dag_status.get("status", "")) == "failed":
+                    fail_reasons.append("dag")
+
+                final_status = "succeeded"
+                if fail_fast and fail_reasons:
+                    final_status = "failed"
+                    final_msg = f"{final_msg} [fail_fast: {', '.join(sorted(set(fail_reasons)))}]"
+
                 JOB_MANAGER._set(
                     job,
-                    status="succeeded",
+                    status=final_status,
                     progress=1.0,
                     message=final_msg,
                     result=result_dict,
@@ -3478,16 +3604,19 @@ def create_app(
                     llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
                 
                 # Use DAG runner for full analysis with proper dependency ordering
-                dag_config = {
-                    "audio": audio_cfg,
-                    "motion": motion_cfg,
-                    "scenes": scenes_cfg,
-                    "highlights": highlights_cfg,
-                    "audio_events": audio_events_cfg,
-                    "include_chat": True,
-                    "include_audio_events": bool(audio_events_cfg.get("enabled", True)),
-                    "_llm_complete": llm_complete_fn,
-                }
+                dag_config = build_dag_config(
+                    analysis_cfg,
+                    section_overrides={
+                        "audio": audio_cfg,
+                        "motion": motion_cfg,
+                        "scenes": scenes_cfg,
+                        "highlights": highlights_cfg,
+                        "audio_events": audio_events_cfg,
+                    },
+                    include_chat=True,
+                    include_audio_events=bool(audio_events_cfg.get("enabled", True)),
+                    extra={"_llm_complete": llm_complete_fn},
+                )
                 
                 def on_dag_progress(frac: float, msg: str) -> None:
                     on_prog(frac)
@@ -3855,6 +3984,17 @@ def create_app(
                         diarize_min_speakers=speech_cfg.get("diarize_min_speakers"),
                         diarize_max_speakers=speech_cfg.get("diarize_max_speakers"),
                         hf_token=speech_cfg.get("hf_token"),
+                        assemblyai_api_key=speech_cfg.get("assemblyai_api_key"),
+                        assemblyai_speech_models=(
+                            speech_cfg.get("assemblyai_speech_models")
+                            or (speech_cfg.get("assemblyai", {}) or {}).get("speech_models")
+                        ),
+                        assemblyai_poll_interval_s=float(
+                            speech_cfg.get("assemblyai_poll_interval_s", (speech_cfg.get("assemblyai", {}) or {}).get("poll_interval_s", 3.0))
+                        ),
+                        assemblyai_timeout_s=float(
+                            speech_cfg.get("assemblyai_timeout_s", (speech_cfg.get("assemblyai", {}) or {}).get("timeout_s", 7200.0))
+                        ),
                     )
                     
                     def on_transcript_progress(frac: float) -> None:
@@ -4021,12 +4161,31 @@ def create_app(
                             min_chapter_len_s=float(chapters_cfg_dict.get("min_chapter_len_s", 60.0)),
                             max_chapter_len_s=float(chapters_cfg_dict.get("max_chapter_len_s", 900.0)),
                             embedding_model=str(chapters_cfg_dict.get("embedding_model", "all-mpnet-base-v2")),
-                            changepoint_method=str(chapters_cfg_dict.get("changepoint_method", "pelt")),
+                            changepoint_method=str(chapters_cfg_dict.get("changepoint_method", "auto")),
                             changepoint_penalty=float(chapters_cfg_dict.get("changepoint_penalty", 10.0)),
+                            changepoint_auto_tune=bool(chapters_cfg_dict.get("changepoint_auto_tune", True)),
+                            min_changepoints=int(chapters_cfg_dict.get("min_changepoints", 1)),
+                            target_chapter_len_s=float(chapters_cfg_dict.get("target_chapter_len_s", 600.0)),
+                            target_chapters_min=(
+                                int(chapters_cfg_dict.get("target_chapters_min"))
+                                if chapters_cfg_dict.get("target_chapters_min") is not None
+                                else None
+                            ),
+                            target_chapters_max=(
+                                int(chapters_cfg_dict.get("target_chapters_max"))
+                                if chapters_cfg_dict.get("target_chapters_max") is not None
+                                else None
+                            ),
+                            target_chapters_ideal=(
+                                int(chapters_cfg_dict.get("target_chapters_ideal"))
+                                if chapters_cfg_dict.get("target_chapters_ideal") is not None
+                                else None
+                            ),
                             snap_to_silence_window_s=float(chapters_cfg_dict.get("snap_to_silence_window_s", 10.0)),
                             llm_labeling=bool(chapters_cfg_dict.get("llm_labeling", True)),
                             llm_endpoint=str(ai_cfg.get("endpoint", "http://127.0.0.1:11435")),
                             llm_model_name=str(ai_cfg.get("model_name", "local-gguf-vulkan")),
+                            llm_api_key=(str(ai_cfg.get("api_key", "")).strip() or None),
                             llm_timeout_s=float(ai_cfg.get("timeout_s", 30.0)),
                             max_chars_per_chapter=int(chapters_cfg_dict.get("max_chars_per_chapter", 6000)),
                         )
@@ -4090,6 +4249,7 @@ def create_app(
                     engine=str(ai_cfg.get("engine", "llama_cpp_server")),
                     endpoint=str(ai_cfg.get("endpoint", "http://127.0.0.1:11435")),
                     model_name=str(ai_cfg.get("model_name", "local-gguf-vulkan")),
+                    api_key=(str(ai_cfg.get("api_key", "")).strip() or None),
                     timeout_s=float(ai_cfg.get("timeout_s", 30)),
                     max_tokens=int(ai_cfg.get("max_tokens", 256)),
                     temperature=float(ai_cfg.get("temperature", 0.2)),
@@ -4381,6 +4541,17 @@ def create_app(
                     diarize_min_speakers=speech_cfg.get("diarize_min_speakers"),
                     diarize_max_speakers=speech_cfg.get("diarize_max_speakers"),
                     hf_token=speech_cfg.get("hf_token"),
+                    assemblyai_api_key=speech_cfg.get("assemblyai_api_key"),
+                    assemblyai_speech_models=(
+                        speech_cfg.get("assemblyai_speech_models")
+                        or (speech_cfg.get("assemblyai", {}) or {}).get("speech_models")
+                    ),
+                    assemblyai_poll_interval_s=float(
+                        speech_cfg.get("assemblyai_poll_interval_s", (speech_cfg.get("assemblyai", {}) or {}).get("poll_interval_s", 3.0))
+                    ),
+                    assemblyai_timeout_s=float(
+                        speech_cfg.get("assemblyai_timeout_s", (speech_cfg.get("assemblyai", {}) or {}).get("timeout_s", 7200.0))
+                    ),
                 )
                 compute_transcript_analysis(proj, cfg=transcript_config, on_progress=transcript_progress)
                 return ("transcript", False)  # computed
@@ -4514,6 +4685,7 @@ def create_app(
                 from ..chat.features import compute_and_save_chat_features
                 hop_s = float(audio_cfg.get("hop_seconds", 0.5))
                 smooth_s = float(highlights_cfg.get("chat_smooth_seconds", 3.0))
+                chat_llm_strict = bool((analysis_cfg.get("chat", {}) or {}).get("llm_strict", False))
                 
                 # Get LLM for laugh emote learning (with auto-start)
                 llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
@@ -4531,6 +4703,7 @@ def create_app(
                     hop_s=hop_s,
                     smooth_s=smooth_s,
                     llm_complete=llm_complete_fn,
+                    strict_llm=chat_llm_strict,
                     force_relearn_laugh=force_relearn,
                     channel_id=channel_id,
                     platform=platform,
@@ -4772,18 +4945,21 @@ def create_app(
                     speech_cfg_for_dag["diarize"] = False
 
                 # Use DAG runner for highlights with proper boundary graph ordering
-                dag_config = {
-                    "audio": audio_cfg,
-                    "motion": motion_cfg,
-                    "scenes": scenes_cfg,
-                    "highlights": highlights_cfg,
-                    "audio_events": audio_events_cfg,
-                    "speech": speech_cfg_for_dag,
-                    "diarization": diarization_cfg,
-                    "include_chat": True,
-                    "include_audio_events": bool(audio_events_cfg.get("enabled", True)),
-                    "_llm_complete": llm_complete_fn_highlights,
-                }
+                dag_config = build_dag_config(
+                    analysis_cfg,
+                    section_overrides={
+                        "audio": audio_cfg,
+                        "motion": motion_cfg,
+                        "scenes": scenes_cfg,
+                        "highlights": highlights_cfg,
+                        "audio_events": audio_events_cfg,
+                        "speech": speech_cfg_for_dag,
+                        "diarization": diarization_cfg,
+                    },
+                    include_chat=True,
+                    include_audio_events=bool(audio_events_cfg.get("enabled", True)),
+                    extra={"_llm_complete": llm_complete_fn_highlights},
+                )
                 
                 def on_dag_progress(frac: float, msg: str) -> None:
                     on_highlights_progress(frac, msg)
@@ -4898,12 +5074,31 @@ def create_app(
                                 min_chapter_len_s=float(chapters_cfg_dict.get("min_chapter_len_s", 60.0)),
                                 max_chapter_len_s=float(chapters_cfg_dict.get("max_chapter_len_s", 900.0)),
                                 embedding_model=str(chapters_cfg_dict.get("embedding_model", "all-mpnet-base-v2")),
-                                changepoint_method=str(chapters_cfg_dict.get("changepoint_method", "pelt")),
+                                changepoint_method=str(chapters_cfg_dict.get("changepoint_method", "auto")),
                                 changepoint_penalty=float(chapters_cfg_dict.get("changepoint_penalty", 10.0)),
+                                changepoint_auto_tune=bool(chapters_cfg_dict.get("changepoint_auto_tune", True)),
+                                min_changepoints=int(chapters_cfg_dict.get("min_changepoints", 1)),
+                                target_chapter_len_s=float(chapters_cfg_dict.get("target_chapter_len_s", 600.0)),
+                                target_chapters_min=(
+                                    int(chapters_cfg_dict.get("target_chapters_min"))
+                                    if chapters_cfg_dict.get("target_chapters_min") is not None
+                                    else None
+                                ),
+                                target_chapters_max=(
+                                    int(chapters_cfg_dict.get("target_chapters_max"))
+                                    if chapters_cfg_dict.get("target_chapters_max") is not None
+                                    else None
+                                ),
+                                target_chapters_ideal=(
+                                    int(chapters_cfg_dict.get("target_chapters_ideal"))
+                                    if chapters_cfg_dict.get("target_chapters_ideal") is not None
+                                    else None
+                                ),
                                 snap_to_silence_window_s=float(chapters_cfg_dict.get("snap_to_silence_window_s", 10.0)),
                                 llm_labeling=bool(chapters_cfg_dict.get("llm_labeling", True)),
                                 llm_endpoint=str(ai_cfg.get("endpoint", "http://127.0.0.1:11435")),
                                 llm_model_name=str(ai_cfg.get("model_name", "local-gguf-vulkan")),
+                                llm_api_key=(str(ai_cfg.get("api_key", "")).strip() or None),
                                 llm_timeout_s=float(ai_cfg.get("timeout_s", 30.0)),
                                 max_chars_per_chapter=int(chapters_cfg_dict.get("max_chars_per_chapter", 6000)),
                             )
@@ -4981,6 +5176,7 @@ def create_app(
                         engine=str(ai_cfg.get("engine", "llama_cpp_server")),
                         endpoint=str(ai_cfg.get("endpoint", "http://127.0.0.1:11435")),
                         model_name=str(ai_cfg.get("model_name", "local-gguf-vulkan")),
+                        api_key=(str(ai_cfg.get("api_key", "")).strip() or None),
                         timeout_s=float(ai_cfg.get("timeout_s", 30)),
                         max_tokens=int(ai_cfg.get("max_tokens", 256)),
                         temperature=float(ai_cfg.get("temperature", 0.2)),
@@ -5602,7 +5798,7 @@ def create_app(
         """Get audio events analysis status including backend availability.
         
         Returns comprehensive status:
-        - backend_selected: Which backend was used (tensorflow/onnx/heuristic)
+        - backend_selected: Which backend was used (assemblyai/tensorflow/onnx/heuristic)
         - available_backends: List of backends that could be used
         - unavailable_backends: Dict of unavailable backends with reasons
         - model_loaded: Whether an ML model is active
@@ -5615,7 +5811,12 @@ def create_app(
         features_available = proj.audio_events_features_path.exists()
         
         # Check available backends
-        from ..analysis_audio_events import _try_load_yamnet, _try_load_yamnet_onnx, _try_load_onnx_directml
+        from ..analysis_audio_events import (
+            _try_load_onnx_directml,
+            _try_load_yamnet,
+            _try_load_yamnet_onnx,
+            check_assemblyai_audio_events_available,
+        )
         
         available_backends = []
         unavailable_backends = {}
@@ -5640,6 +5841,13 @@ def create_app(
             available_backends.append("onnx_cpu")
         else:
             unavailable_backends["onnx_cpu"] = onnx_err
+
+        # Check AssemblyAI cloud backend
+        aai_ok, aai_err = check_assemblyai_audio_events_available()
+        if aai_ok:
+            available_backends.append("assemblyai")
+        else:
+            unavailable_backends["assemblyai"] = aai_err or "unavailable"
         
         # Heuristic is always available
         available_backends.append("heuristic")
@@ -5648,7 +5856,9 @@ def create_app(
         backend_used = audio_events_analysis.get("backend", "unknown") if features_available else None
         ml_available = audio_events_analysis.get("ml_available", False) if features_available else False
         
-        if backend_used == "onnx_directml":
+        if backend_used == "assemblyai":
+            notes = "Using AssemblyAI cloud audio intelligence"
+        elif backend_used == "onnx_directml":
             notes = "Using GPU via DirectML (optimal)"
         elif backend_used == "tensorflow":
             notes = "Using TensorFlow Hub YAMNet"
@@ -5935,6 +6145,8 @@ def create_app(
                 JOB_MANAGER._set(job, progress=0.7, message="Computing chat features...")
                 hop_s = float(ctx.profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
                 smooth_s = float(ctx.profile.get("analysis", {}).get("highlights", {}).get("chat_smooth_seconds", 3.0))
+                chat_llm_strict = bool((ctx.profile.get("analysis", {}).get("chat", {}) or {}).get("llm_strict", False))
+                chat_llm_strict = bool(chat_llm_strict and llm_mode != "external")
                 
                 # Get LLM config for laugh emote learning (with auto-start)
                 llm_complete_fn = None
@@ -5968,6 +6180,7 @@ def create_app(
                     on_progress=on_feature_progress,
                     on_status=on_feature_status,
                     llm_complete=llm_complete_fn,
+                    strict_llm=chat_llm_strict,
                     channel_id=channel_id,
                     platform=platform,
                 )
@@ -5997,31 +6210,25 @@ def create_app(
                         )
 
                         analysis_cfg = ctx.profile.get("analysis", {}) or {}
-                        dag_config: Dict[str, Any] = {
-                            **analysis_cfg,
-                            "include_chat": True,
-                            "include_audio_events": bool(analysis_cfg.get("audio_events", {}).get("enabled", True)),
+                        ai_cfg = ctx.profile.get("ai", {}).get("director", {}) or {}
+                        fail_fast = bool(analysis_cfg.get("fail_fast", False))
+                        director_cfg_for_dag = {
+                            "enabled": bool(ai_cfg.get("enabled", True)),
+                            "use_llm": True,
+                            "fallback_to_rules": bool(ai_cfg.get("fallback_to_rules", True)),
+                            "platform": str(ai_cfg.get("platform", "shorts")),
                         }
-
-                        if llm_mode == "external":
-                            highlights_cfg = dict(dag_config.get("highlights", {}) or {})
-                            highlights_cfg["llm_semantic_enabled"] = False
-                            highlights_cfg["llm_filter_enabled"] = False
-                            dag_config["highlights"] = highlights_cfg
-
-                            chapters_cfg = dict(dag_config.get("chapters", {}) or {})
-                            chapters_cfg["llm_labeling"] = False
-                            dag_config["chapters"] = chapters_cfg
-
-                            director_cfg = dict(dag_config.get("director", {}) or {})
-                            director_cfg["enabled"] = False
-                            dag_config["director"] = director_cfg
+                        dag_config = build_dag_config(
+                            analysis_cfg,
+                            section_overrides={"director": director_cfg_for_dag},
+                            include_chat=True,
+                        )
+                        dag_config = apply_llm_mode_to_dag_config(dag_config, llm_mode=llm_mode)
 
                         llm_complete_fn = None
                         if llm_mode != "external":
                             try:
-                                ai_cfg = ctx.profile.get("ai", {}).get("director", {}) or {}
-                                if ai_cfg.get("enabled", True):
+                                if ai_cfg.get("enabled", True) and dag_config_needs_llm(dag_config):
                                     llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
                             except Exception:
                                 llm_complete_fn = None
@@ -6036,7 +6243,7 @@ def create_app(
                             # Only run packaging tasks if transcript exists (avoids surprising long Whisper runs).
                             if proj.transcript_path.exists():
                                 targets.update({"variants"})
-                                if llm_mode != "external":
+                                if llm_mode != "external" and bool(director_cfg_for_dag.get("enabled", False)):
                                     targets.update({"director"})
 
                             dag_result = run_analysis(
@@ -6048,14 +6255,19 @@ def create_app(
                                 upgrade_mode=True,
                             )
 
+                            status = "succeeded"
                             msg = "Upgrade complete."
                             if not getattr(dag_result, "success", True):
                                 err = getattr(dag_result, "error", "") or "see logs"
-                                msg = f"Upgrade complete (with warnings): {err}"
+                                if fail_fast:
+                                    status = "failed"
+                                    msg = f"Upgrade failed: {err}"
+                                else:
+                                    msg = f"Upgrade complete (with warnings): {err}"
 
                             JOB_MANAGER._set(
                                 upgrade_job,
-                                status="succeeded",
+                                status=status,
                                 progress=1.0,
                                 message=msg,
                                 result={

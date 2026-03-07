@@ -6,6 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from .ffmpeg import _require_cmd
 from .utils import subprocess_flags as _subprocess_flags
 
 
@@ -30,18 +31,25 @@ def _version(cmd: str) -> str:
 def run_doctor() -> DoctorReport:
     checks: Dict[str, Dict[str, object]] = {}
 
-    ffmpeg_path = _which("ffmpeg")
-    ffprobe_path = _which("ffprobe")
+    try:
+        ffmpeg_path = _require_cmd("ffmpeg")
+    except Exception:
+        ffmpeg_path = _which("ffmpeg")
+
+    try:
+        ffprobe_path = _require_cmd("ffprobe")
+    except Exception:
+        ffprobe_path = _which("ffprobe")
 
     checks["ffmpeg"] = {
         "found": ffmpeg_path is not None,
         "path": ffmpeg_path,
-        "version": _version("ffmpeg") if ffmpeg_path else None,
+        "version": _version(ffmpeg_path) if ffmpeg_path else None,
     }
     checks["ffprobe"] = {
         "found": ffprobe_path is not None,
         "path": ffprobe_path,
-        "version": _version("ffprobe") if ffprobe_path else None,
+        "version": _version(ffprobe_path) if ffprobe_path else None,
     }
 
     whisper_spec = importlib.util.find_spec("faster_whisper")

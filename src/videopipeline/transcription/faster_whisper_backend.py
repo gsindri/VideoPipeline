@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Callable, List, Optional
 
@@ -29,9 +30,54 @@ from ..utils import subprocess_flags
 
 logger = logging.getLogger(__name__)
 
+_cuda_dll_dir_handles: list[Any] = []
+_cuda_dll_dirs_added: set[str] = set()
+
+
+def _maybe_add_windows_cuda_dll_dirs() -> None:
+    """Make pip-installed NVIDIA CUDA runtime DLLs discoverable on Windows.
+
+    faster-whisper -> ctranslate2 expects DLLs like cublas64_12.dll.
+    When installed via pip (`nvidia-cublas-cu12`, `nvidia-cudnn-cu12`), those
+    DLLs live in site-packages/nvidia/*/bin and are not always on PATH.
+    """
+    if os.name != "nt":
+        return
+
+    add_dll_directory = getattr(os, "add_dll_directory", None)
+    if add_dll_directory is None:
+        return
+
+    site_root = Path(sys.prefix) / "Lib" / "site-packages"
+    candidates = [
+        site_root / "nvidia" / "cublas" / "bin",
+        site_root / "nvidia" / "cudnn" / "bin",
+    ]
+
+    # Keep PATH in sync for subprocesses launched later in this process.
+    current_path = os.environ.get("PATH", "")
+    path_parts = [p for p in current_path.split(os.pathsep) if p]
+
+    for d in candidates:
+        if not d.exists():
+            continue
+        ds = str(d)
+        if ds not in path_parts:
+            os.environ["PATH"] = ds + (os.pathsep + os.environ.get("PATH", "") if os.environ.get("PATH") else "")
+            path_parts.insert(0, ds)
+        if ds in _cuda_dll_dirs_added:
+            continue
+        try:
+            _cuda_dll_dir_handles.append(add_dll_directory(ds))
+            _cuda_dll_dirs_added.add(ds)
+        except Exception:
+            # Best effort: PATH update above may still be sufficient.
+            pass
+
 
 def is_available() -> bool:
     """Check if faster-whisper is installed."""
+    _maybe_add_windows_cuda_dll_dirs()
     try:
         from faster_whisper import WhisperModel
         return True
@@ -41,6 +87,7 @@ def is_available() -> bool:
 
 def check_gpu_available() -> bool:
     """Check if CUDA GPU is available for faster-whisper."""
+    _maybe_add_windows_cuda_dll_dirs()
     if not is_available():
         return False
     

@@ -23,6 +23,7 @@ class TestDirectorConfig:
         assert cfg.engine == "llama_cpp_server"
         assert cfg.endpoint == "http://127.0.0.1:11435"
         assert cfg.model_name == "local-gguf-vulkan"
+        assert cfg.api_key is None
         assert cfg.timeout_s == 30.0
         assert cfg.max_tokens == 256
         assert cfg.temperature == 0.2
@@ -34,12 +35,14 @@ class TestDirectorConfig:
         cfg = DirectorConfig(
             endpoint="http://custom:8080",
             model_name="llama3:8b",
+            api_key="test-key",
             max_tokens=1024,
             temperature=0.5,
             enabled=False,
         )
         assert cfg.endpoint == "http://custom:8080"
         assert cfg.model_name == "llama3:8b"
+        assert cfg.api_key == "test-key"
         assert cfg.max_tokens == 1024
         assert cfg.temperature == 0.5
         assert cfg.enabled is False

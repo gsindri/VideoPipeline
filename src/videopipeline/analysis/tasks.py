@@ -104,15 +104,47 @@ def _torch_missing_reason() -> str:
     return "torch not installed (pip install torch)"
 
 
+def _decoded_audio_source(proj: Project, *, sample_rate: Optional[int] = None):
+    """Return shared decoded audio path when available."""
+    try:
+        from ..analysis_audio_decode import get_decoded_audio_path, load_audio_decode_index
+
+        p = get_decoded_audio_path(proj)
+        if p is None:
+            return None
+
+        if sample_rate is not None:
+            idx = load_audio_decode_index(proj) or {}
+            try:
+                decoded_sr = int(idx.get("sample_rate", 0))
+            except Exception:
+                decoded_sr = 0
+            if decoded_sr != int(sample_rate):
+                return None
+        return p
+    except Exception:
+        return None
+
+
 # =============================================================================
 # Task Implementations
 # =============================================================================
 
+def _run_audio_decode(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
+    """Decode source media to shared mono 16k audio artifact + index."""
+    decode_cfg = cfg.get("audio_decode", {}) or {}
+
+    from ..analysis_audio_decode import AudioDecodeConfig, compute_audio_decode_analysis
+
+    compute_audio_decode_analysis(
+        proj,
+        cfg=AudioDecodeConfig.from_dict(decode_cfg),
+        on_progress=on_progress,
+    )
+
+
 def _run_audio_features(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Compute audio RMS/energy features."""
-    if proj.audio_features_path.exists():
-        return
-    
     from ..analysis_audio import compute_audio_analysis
     
     audio_cfg = cfg.get("audio", {})
@@ -126,34 +158,31 @@ def _run_audio_features(proj: Project, cfg: Dict[str, Any], on_progress: Optiona
         pre_s=float(audio_cfg.get("pre_seconds", 8.0)),
         post_s=float(audio_cfg.get("post_seconds", 22.0)),
         skip_start_s=float(audio_cfg.get("skip_start_seconds", 10.0)),
+        source_audio_path=_decoded_audio_source(proj, sample_rate=int(audio_cfg.get("sample_rate", 16000))),
         on_progress=on_progress,
     )
 
 
 def _run_audio_events(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Compute ML-based audio event detection (laughter, applause, etc.)."""
-    if proj.audio_events_features_path.exists():
-        return
-    
     audio_events_cfg = cfg.get("audio_events", {})
     if not audio_events_cfg.get("enabled", True):
         return
     
     from ..analysis_audio_events import compute_audio_events_analysis, AudioEventsConfig
     
+    events_cfg = AudioEventsConfig.from_dict(audio_events_cfg)
+
     compute_audio_events_analysis(
         proj,
-        cfg=AudioEventsConfig.from_dict(audio_events_cfg),
+        cfg=events_cfg,
+        source_audio_path=_decoded_audio_source(proj, sample_rate=events_cfg.sample_rate),
         on_progress=on_progress,
     )
 
 
 def _run_silence(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Detect silence intervals in audio."""
-    silence_path = proj.analysis_dir / "silence.json"
-    if silence_path.exists():
-        return
-    
     from ..analysis_silence import compute_silence_analysis, SilenceConfig
     
     silence_cfg = cfg.get("silence", {})
@@ -163,6 +192,7 @@ def _run_silence(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Calla
             noise_db=float(silence_cfg.get("noise_db", -35.0)),
             min_duration=float(silence_cfg.get("min_duration", 0.3)),
         ),
+        source_audio_path=_decoded_audio_source(proj),
         on_progress=on_progress,
     )
 
@@ -176,10 +206,6 @@ def _run_audio_vad(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Cal
     # Check torch availability first - skip gracefully if not installed
     if not _is_torch_available():
         logger.info("[audio_vad] torch not installed; skipping VAD (install with: pip install torch)")
-        return
-
-    vad_path = proj.analysis_dir / "audio_vad.npz"
-    if vad_path.exists():
         return
 
     from ..analysis_vad import compute_audio_vad_analysis, VadConfig
@@ -200,6 +226,7 @@ def _run_audio_vad(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Cal
             torch_threads=int(vad_cfg.get("torch_threads", 1)),
             device=str(vad_cfg.get("device", "cpu")),
         ),
+        source_audio_path=_decoded_audio_source(proj, sample_rate=int(vad_cfg.get("sample_rate", 16000))),
         on_progress=on_progress,
     )
 
@@ -209,11 +236,6 @@ def _run_reaction_audio(proj: Project, cfg: Dict[str, Any], on_progress: Optiona
 
     Output: analysis/reaction_audio_features.npz
     """
-    # Project has a helper, but fall back to analysis_dir to keep this task portable.
-    out_path = getattr(proj, "reaction_audio_features_path", proj.analysis_dir / "reaction_audio_features.npz")
-    if out_path.exists():
-        return
-
     reaction_cfg = cfg.get("reaction_audio", {})
     if not reaction_cfg.get("enabled", True):
         return
@@ -224,30 +246,20 @@ def _run_reaction_audio(proj: Project, cfg: Dict[str, Any], on_progress: Optiona
     audio_cfg = cfg.get("audio", {})
     merged = dict(reaction_cfg)
     merged.setdefault("hop_seconds", audio_cfg.get("hop_seconds", 0.5))
+    reaction_cfg_obj = ReactionAudioConfig.from_dict(merged)
 
     compute_reaction_audio_features(
         proj,
-        cfg=ReactionAudioConfig.from_dict(merged),
+        cfg=reaction_cfg_obj,
+        source_audio_path=_decoded_audio_source(proj, sample_rate=reaction_cfg_obj.sample_rate),
         on_progress=on_progress,
     )
 
 
 def _run_diarization(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Compute speaker diarization as a standalone analysis artifact."""
-    diar_path = proj.analysis_dir / "diarization.json"
     speech_cfg = cfg.get("speech", {})
     if not speech_cfg.get("diarize", False):
-        return
-
-    # If diarization already exists, still try to merge speaker labels into the transcript
-    # (older projects may have transcript_full.json without speakers).
-    if diar_path.exists():
-        try:
-            from ..analysis_transcript import merge_diarization_json_into_transcript
-
-            merge_diarization_json_into_transcript(proj)
-        except Exception:
-            pass
         return
 
     from ..analysis_diarization import compute_diarization_analysis, DiarizationConfig
@@ -262,6 +274,7 @@ def _run_diarization(proj: Project, cfg: Dict[str, Any], on_progress: Optional[C
     compute_diarization_analysis(
         proj,
         cfg=DiarizationConfig.from_dict(merged_cfg),
+        source_audio_path=_decoded_audio_source(proj),
         on_progress=on_progress,
     )
 
@@ -276,22 +289,9 @@ def _run_diarization(proj: Project, cfg: Dict[str, Any], on_progress: Optional[C
 
 def _run_transcript(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Compute full video transcript."""
-    transcript_path = proj.analysis_dir / "transcript_full.json"
-    
     from ..analysis_transcript import compute_transcript_analysis, TranscriptConfig
     
     speech_cfg = cfg.get("speech", {})
-
-    # If transcript already exists, still try to merge diarization speaker labels (if enabled).
-    if transcript_path.exists():
-        if speech_cfg.get("diarize", False):
-            try:
-                from ..analysis_transcript import merge_diarization_json_into_transcript
-
-                merge_diarization_json_into_transcript(proj)
-            except Exception:
-                pass
-        return
 
     compute_transcript_analysis(
         proj,
@@ -299,14 +299,40 @@ def _run_transcript(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Ca
             backend=str(speech_cfg.get("backend", "auto")),
             model_size=str(speech_cfg.get("model_size", "small")),
             language=speech_cfg.get("language"),
+            sample_rate=int(speech_cfg.get("sample_rate", 16000)),
             device=str(speech_cfg.get("device", "cuda")),
             compute_type=str(speech_cfg.get("compute_type", "float16")),
             vad_filter=bool(speech_cfg.get("vad_filter", True)),
             word_timestamps=bool(speech_cfg.get("word_timestamps", True)),
             use_gpu=bool(speech_cfg.get("use_gpu", True)),
+            threads=int(speech_cfg.get("threads", 0)),
+            n_processors=int(speech_cfg.get("n_processors", 1)),
+            strict=bool(speech_cfg.get("strict", False)),
             verbose=bool(speech_cfg.get("verbose", False)),
+            diarize=bool(speech_cfg.get("diarize", False)),
+            diarize_min_speakers=speech_cfg.get("diarize_min_speakers"),
+            diarize_max_speakers=speech_cfg.get("diarize_max_speakers"),
+            assemblyai_api_key=speech_cfg.get("assemblyai_api_key"),
+            assemblyai_speech_models=(
+                speech_cfg.get("assemblyai_speech_models")
+                or (speech_cfg.get("assemblyai", {}) or {}).get("speech_models")
+            ),
+            assemblyai_poll_interval_s=float(
+                speech_cfg.get(
+                    "assemblyai_poll_interval_s",
+                    (speech_cfg.get("assemblyai", {}) or {}).get("poll_interval_s", 3.0),
+                )
+            ),
+            assemblyai_timeout_s=float(
+                speech_cfg.get(
+                    "assemblyai_timeout_s",
+                    (speech_cfg.get("assemblyai", {}) or {}).get("timeout_s", 7200.0),
+                )
+            ),
         ),
+        source_audio_path=_decoded_audio_source(proj, sample_rate=int(speech_cfg.get("sample_rate", 16000))),
         on_progress=on_progress,
+        force=True,
     )
 
     # Best-effort: merge speaker labels once both transcript and diarization exist.
@@ -321,10 +347,6 @@ def _run_transcript(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Ca
 
 def _run_sentences(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Extract sentence boundaries from transcript."""
-    sentences_path = proj.analysis_dir / "sentences.json"
-    if sentences_path.exists():
-        return
-    
     from ..analysis_sentences import compute_sentences_analysis, SentenceConfig
     
     sentences_cfg = cfg.get("sentences", {})
@@ -340,9 +362,6 @@ def _run_sentences(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Cal
 
 def _run_speech_features(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Compute speech features (word density, speech rate, etc.)."""
-    if proj.speech_features_path.exists():
-        return
-    
     from ..analysis_speech_features import compute_speech_features, SpeechFeatureConfig
     
     speech_cfg = cfg.get("speech_features", cfg.get("speech", {}))
@@ -357,10 +376,6 @@ def _run_speech_features(proj: Project, cfg: Dict[str, Any], on_progress: Option
 
 def _run_chapters(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Compute semantic chapters using embeddings + LLM labeling."""
-    chapters_path = proj.analysis_dir / "chapters.json"
-    if chapters_path.exists():
-        return
-    
     chapters_cfg = cfg.get("chapters", {})
     if not chapters_cfg.get("enabled", True):
         return
@@ -369,6 +384,12 @@ def _run_chapters(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Call
     
     # Get LLM function if available
     llm_complete = cfg.get("_llm_complete")  # Injected by runner
+    ai_cfg = cfg.get("ai", {})
+    director_cfg = ai_cfg.get("director", {}) if isinstance(ai_cfg, dict) else {}
+    endpoint = str(director_cfg.get("endpoint", "http://127.0.0.1:11435"))
+    model_name = str(director_cfg.get("model_name", "local-gguf-vulkan"))
+    api_key = str(director_cfg.get("api_key", "")).strip() or None
+    timeout_s = float(director_cfg.get("timeout_s", 30.0))
     
     compute_chapters_analysis(
         proj,
@@ -376,9 +397,35 @@ def _run_chapters(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Call
             min_chapter_len_s=float(chapters_cfg.get("min_chapter_len_s", 60.0)),
             max_chapter_len_s=float(chapters_cfg.get("max_chapter_len_s", 900.0)),
             embedding_model=str(chapters_cfg.get("embedding_model", "all-mpnet-base-v2")),
+            changepoint_method=str(chapters_cfg.get("changepoint_method", "auto")),
             changepoint_penalty=float(chapters_cfg.get("changepoint_penalty", 10.0)),
-            llm_labeling=bool(chapters_cfg.get("llm_labeling", True)) and llm_complete is not None,
+            changepoint_auto_tune=bool(chapters_cfg.get("changepoint_auto_tune", True)),
+            min_changepoints=int(chapters_cfg.get("min_changepoints", 1)),
+            target_chapter_len_s=float(chapters_cfg.get("target_chapter_len_s", 600.0)),
+            target_chapters_min=(
+                int(chapters_cfg.get("target_chapters_min"))
+                if chapters_cfg.get("target_chapters_min") is not None
+                else None
+            ),
+            target_chapters_max=(
+                int(chapters_cfg.get("target_chapters_max"))
+                if chapters_cfg.get("target_chapters_max") is not None
+                else None
+            ),
+            target_chapters_ideal=(
+                int(chapters_cfg.get("target_chapters_ideal"))
+                if chapters_cfg.get("target_chapters_ideal") is not None
+                else None
+            ),
+            snap_to_silence_window_s=float(chapters_cfg.get("snap_to_silence_window_s", 10.0)),
+            llm_labeling=bool(chapters_cfg.get("llm_labeling", True)),
+            llm_endpoint=endpoint,
+            llm_model_name=model_name,
+            llm_api_key=api_key,
+            llm_timeout_s=timeout_s,
+            max_chars_per_chapter=int(chapters_cfg.get("max_chars_per_chapter", 6000)),
         ),
+        llm_complete=llm_complete,
         on_progress=on_progress,
     )
 
@@ -448,6 +495,7 @@ def _run_chat_features(proj: Project, cfg: Dict[str, Any], on_progress: Optional
             smooth_s=float(highlights_cfg.get("chat_smooth_seconds", 3.0)),
             on_progress=on_progress,
             llm_complete=cfg.get("_llm_complete"),
+            strict_llm=bool((cfg.get("chat", {}) or {}).get("llm_strict", False)),
             channel_id=channel_id,
             platform=platform,
         )
@@ -464,10 +512,6 @@ def _run_chat_features(proj: Project, cfg: Dict[str, Any], on_progress: Optional
 
 def _run_chat_boundaries(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Compute chat activity valleys (good boundary points)."""
-    boundaries_path = proj.analysis_dir / "chat_boundaries.json"
-    if boundaries_path.exists():
-        return
-    
     if not proj.chat_features_path.exists():
         return  # Need chat features first
     
@@ -505,9 +549,6 @@ def _run_chat_sync(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Cal
 
 def _run_motion_features(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Compute motion features from video frames."""
-    if proj.motion_features_path.exists():
-        return
-    
     from ..analysis_motion import compute_motion_analysis
     
     motion_cfg = cfg.get("motion", {})
@@ -522,9 +563,6 @@ def _run_motion_features(proj: Project, cfg: Dict[str, Any], on_progress: Option
 
 def _run_scenes(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Detect visual scene cuts."""
-    if proj.scenes_path.exists():
-        return
-    
     scenes_cfg = cfg.get("scenes", {})
     if not scenes_cfg.get("enabled", True):
         return
@@ -660,10 +698,6 @@ def _run_director(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Call
     if not director_cfg.get("enabled", False):
         return
 
-    director_path = proj.analysis_dir / "director.json"
-    if director_path.exists():
-        return
-
     from ..analysis_director import compute_director
 
     compute_director(
@@ -680,8 +714,16 @@ def _run_director(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Call
 
 # --- Audio-derived tasks ---
 task_registry.register(Task(
+    name="audio_decode",
+    requires=set(),  # Needs source media/audio (implicit)
+    produces={"audio_decode"},
+    run=_run_audio_decode,
+    version="1.0",
+))
+
+task_registry.register(Task(
     name="audio_features",
-    requires=set(),  # Needs video/audio file (implicit)
+    requires={"audio_decode"},
     produces={"audio_features"},
     run=_run_audio_features,
     version="1.0",
@@ -689,7 +731,7 @@ task_registry.register(Task(
 
 task_registry.register(Task(
     name="audio_events",
-    requires=set(),  # Needs audio (implicit)
+    requires={"audio_decode"},
     produces={"audio_events"},
     run=_run_audio_events,
     version="1.0",
@@ -698,7 +740,7 @@ task_registry.register(Task(
 
 task_registry.register(Task(
     name="silence",
-    requires=set(),  # Needs audio (implicit)
+    requires={"audio_decode"},
     produces={"silence"},
     run=_run_silence,
     version="1.0",
@@ -707,7 +749,7 @@ task_registry.register(Task(
 # --- Transcript-derived tasks ---
 task_registry.register(Task(
     name="transcript",
-    requires=set(),  # Needs audio (implicit)
+    requires={"audio_decode"},
     produces={"transcript"},
     run=_run_transcript,
     version="1.0",
@@ -740,7 +782,7 @@ task_registry.register(Task(
 
 task_registry.register(Task(
     name="audio_vad",
-    requires=set(),  # Needs audio (implicit)
+    requires={"audio_decode"},
     produces={"audio_vad"},
     run=_run_audio_vad,
     version="1.0",
@@ -749,12 +791,19 @@ task_registry.register(Task(
 
 task_registry.register(Task(
     name="diarization",
-    requires=set(),  # Needs audio (implicit)
+    requires={"audio_decode"},
     produces={"diarization"},
     run=_run_diarization,
     version="1.0",
-    # Disabled by default unless speech.diarize = true, also requires torch
-    enabled_check=lambda cfg: bool(cfg.get("speech", {}).get("diarize", False)),
+    # Backward-compatible default: follow speech.diarize unless explicitly overridden.
+    # This lets cloud transcript diarization stay enabled while standalone pyannote
+    # diarization can be disabled via analysis.diarization.enabled=false.
+    enabled_check=lambda cfg: bool(
+        (cfg.get("diarization", {}) or {}).get(
+            "enabled",
+            cfg.get("speech", {}).get("diarize", False),
+        )
+    ),
 ))
 
 task_registry.register(Task(
@@ -762,7 +811,7 @@ task_registry.register(Task(
     # We *prefer* VAD (speech_fraction gating), but can fall back if missing.
     # This pattern makes the runner wait for audio_vad when both are scheduled,
     # while still allowing a partial run if audio_vad is disabled.
-    requires={"audio_vad"},
+    requires={"audio_decode", "audio_vad"},
     optional_inputs={"audio_vad", "diarization"},
     produces={"reaction_audio"},
     run=_run_reaction_audio,

@@ -188,18 +188,20 @@
                 <option value="high">High</option>
               </select>
             </label>
-            <label title="Which speech-to-text engine to use. openai-whisper with GPU (AMD ROCm / NVIDIA CUDA) is recommended.">Whisper:
+            <label title="Which speech-to-text engine to use. Local GPU/CPU backends are available, and AssemblyAI can be used as an optional cloud backend.">Whisper:
               <select id="whisperBackend">
                 <option value="openai_whisper" selected>openai-whisper</option>
+                <option value="nemo_asr">NeMo ASR</option>
                 <option value="faster_whisper">faster-whisper</option>
                 <option value="whispercpp">whisper.cpp</option>
+                <option value="assemblyai">AssemblyAI (cloud)</option>
                 <option value="auto">auto</option>
               </select>
             </label>
-            <label title="Where AI decisions come from. External means you intend to use ChatGPT (via Actions) to do semantic filtering/reranking and packaging (director picks).">Brain:
+            <label title="Where AI decisions run. In-app AI executes inside Studio using your profile engine (OpenAI API or local server). Actions-only disables in-app AI steps for external workflows.">Brain:
               <select id="llmMode">
-                <option value="external" selected>ChatGPT Actions (external)</option>
-                <option value="local">Local LLM</option>
+                <option value="local">In-app AI (profile engine: OpenAI/local)</option>
+                <option value="external" selected>Actions-only (disable in-app AI)</option>
               </select>
             </label>
             <div class="dropdown" style="position:relative">

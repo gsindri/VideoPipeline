@@ -33,6 +33,7 @@ class DirectorConfig:
     engine: str = "llama_cpp_server"
     endpoint: str = "http://127.0.0.1:11435"
     model_name: str = "local-gguf-vulkan"
+    api_key: Optional[str] = None
     timeout_s: float = 30.0
     max_tokens: int = 256
     temperature: float = 0.2
@@ -460,7 +461,7 @@ class AIDirector:
         self.cfg = cfg
         self._client: Optional[LLMClient] = None
 
-        if cfg.enabled and cfg.engine == "llama_cpp_server":
+        if cfg.enabled and cfg.engine in {"llama_cpp_server", "openai_api"}:
             self._client = create_llm_client(
                 endpoint=cfg.endpoint,
                 cache_dir=cache_dir,
@@ -468,6 +469,7 @@ class AIDirector:
                 max_tokens=cfg.max_tokens,
                 temperature=cfg.temperature,
                 model_name=cfg.model_name,
+                api_key=cfg.api_key,
             )
 
     def is_available(self) -> bool:
@@ -594,6 +596,7 @@ def compute_director_analysis(
         engine=cfg.engine,
         endpoint=actual_endpoint,
         model_name=cfg.model_name,
+        api_key=cfg.api_key,
         timeout_s=cfg.timeout_s,
         max_tokens=cfg.max_tokens,
         temperature=cfg.temperature,

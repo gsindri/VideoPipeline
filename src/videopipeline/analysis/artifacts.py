@@ -117,6 +117,7 @@ register_artifact("audio_file", "audio", "Source audio file (extracted or downlo
 register_artifact("chat_file", "chat_raw.json", "Raw chat messages")
 
 # --- Audio-derived ---
+register_artifact("audio_decode", "audio_decode/index.json", "Decoded mono 16k audio + index/timebase")
 register_artifact("audio_features", "audio_features.npz", "Audio RMS/energy timeline")
 register_artifact("audio_events", "audio_events_features.npz", "ML-detected audio events (laughter, etc.)")
 register_artifact(
@@ -190,6 +191,7 @@ def get_artifact_state(
     *,
     config: Optional[Dict[str, Any]] = None,
     task_version: Optional[str] = None,
+    input_signature: Optional[str] = None,
 ) -> ArtifactState:
     """Get the current state of an artifact.
     
@@ -256,13 +258,31 @@ def get_artifact_state(
     if config is not None:
         current_hash = _hash_config(config)
         stored_hash = state.metadata.get("config_hash")
-        if stored_hash and stored_hash != current_hash:
+        # Missing hash means we cannot prove freshness (legacy/missing state).
+        if not stored_hash:
+            state.fresh = False
+            return state
+        if stored_hash != current_hash:
             state.fresh = False
             return state
     
     if task_version is not None:
         stored_version = state.metadata.get("task_version")
-        if stored_version and stored_version != task_version:
+        # Missing version means we cannot prove freshness (legacy/missing state).
+        if not stored_version:
+            state.fresh = False
+            return state
+        if stored_version != task_version:
+            state.fresh = False
+            return state
+
+    if input_signature is not None:
+        stored_signature = state.metadata.get("input_signature")
+        # Missing signature means we cannot prove freshness (legacy/missing state).
+        if not stored_signature:
+            state.fresh = False
+            return state
+        if stored_signature != input_signature:
             state.fresh = False
             return state
     

@@ -83,6 +83,7 @@ class DiarizationConfig:
     """
 
     enabled: bool = True
+    fail_fast: bool = False
 
     # pyannote execution
     use_gpu: bool = True
@@ -126,6 +127,7 @@ class DiarizationConfig:
 
         return cls(
             enabled=enabled,
+            fail_fast=bool(d.get("fail_fast", False)),
             use_gpu=use_gpu,
             min_speakers=_opt_int(d.get("min_speakers", d.get("diarize_min_speakers"))),
             max_speakers=_opt_int(d.get("max_speakers", d.get("diarize_max_speakers"))),
@@ -341,6 +343,7 @@ def compute_diarization_analysis(
     proj: Project,
     *,
     cfg: DiarizationConfig,
+    source_audio_path: Optional[Path] = None,
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Run diarization and persist `analysis/diarization.json`.
@@ -380,12 +383,18 @@ def compute_diarization_analysis(
             diarize_audio = None
 
     if diarize_audio is None or is_available is None:
+        msg = "diarization module missing"
         logger.warning("[diarization] Diarization module not available; skipping.")
-        return {"unavailable": True, "reason": "diarization module missing"}
+        if cfg.fail_fast:
+            raise RuntimeError(msg)
+        return {"unavailable": True, "reason": msg}
 
     if not is_available():
+        msg = "pyannote-audio not installed"
         logger.warning("[diarization] pyannote-audio not installed; skipping.")
-        return {"unavailable": True, "reason": "pyannote-audio not installed"}
+        if cfg.fail_fast:
+            raise RuntimeError(msg)
+        return {"unavailable": True, "reason": msg}
 
     # Prefer explicit token; otherwise read from env via helper.
     token = cfg.hf_token
@@ -393,12 +402,15 @@ def compute_diarization_analysis(
         token = get_hf_token(token)
 
     if not token:
+        msg = "missing HF token"
         logger.warning("[diarization] No HF token available; skipping.")
-        return {"unavailable": True, "reason": "missing HF token"}
+        if cfg.fail_fast:
+            raise RuntimeError(msg)
+        return {"unavailable": True, "reason": msg}
 
     start_time = _time.time()
 
-    audio_path = Path(proj.audio_source)
+    audio_path = Path(source_audio_path) if source_audio_path is not None else Path(proj.audio_source)
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio source not found: {audio_path}")
 

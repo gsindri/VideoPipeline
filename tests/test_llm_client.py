@@ -1,13 +1,10 @@
 """Tests for LLM client module."""
 
 import json
-import hashlib
-import pytest
-import tempfile
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+import urllib.error
 
 from videopipeline.ai.llm_client import (
+    LLMClient,
     LLMClientConfig,
     LLMResponseCache,
     _compute_cache_key,
@@ -142,3 +139,73 @@ class TestComputeCacheKey:
         key2 = _compute_cache_key("prompt2", "model", 0.7, 100)
         
         assert key1 != key2
+
+
+class _DummyResponse:
+    def __init__(self, *, status: int = 200, payload=None):
+        self.status = status
+        self._payload = payload or {}
+
+    def read(self):
+        return json.dumps(self._payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class TestLLMClientHTTP:
+    def test_complete_sends_model_and_auth_header(self, monkeypatch):
+        seen = {"url": None, "auth": None, "model": None}
+
+        def fake_urlopen(req, timeout=0):
+            seen["url"] = req.full_url
+            seen["auth"] = req.headers.get("Authorization")
+            seen["model"] = json.loads(req.data.decode("utf-8")).get("model")
+            return _DummyResponse(payload={"choices": [{"message": {"content": '{"ok": true}'}}]})
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+        client = LLMClient(
+            LLMClientConfig(
+                endpoint="https://api.openai.com",
+                model_name="gpt-4o-mini",
+                api_key="sk-test",
+                cache_enabled=False,
+            )
+        )
+        out = client.complete("hello", json_mode=True)
+
+        assert out == {"ok": True}
+        assert seen["url"] == "https://api.openai.com/v1/chat/completions"
+        assert seen["auth"] == "Bearer sk-test"
+        assert seen["model"] == "gpt-4o-mini"
+
+    def test_is_available_falls_back_to_models_with_auth(self, monkeypatch):
+        calls = []
+
+        def fake_urlopen(req, timeout=0):
+            calls.append((req.full_url, req.headers.get("Authorization")))
+            if req.full_url.endswith("/health"):
+                raise urllib.error.HTTPError(req.full_url, 404, "Not Found", hdrs=None, fp=None)
+            if req.full_url.endswith("/v1/models"):
+                return _DummyResponse(payload={"data": [{"id": "gpt-4o-mini"}]})
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+        client = LLMClient(
+            LLMClientConfig(
+                endpoint="https://api.openai.com",
+                api_key="sk-test",
+                cache_enabled=False,
+            )
+        )
+
+        assert client.is_available() is True
+        assert calls == [
+            ("https://api.openai.com/health", "Bearer sk-test"),
+            ("https://api.openai.com/v1/models", "Bearer sk-test"),
+        ]

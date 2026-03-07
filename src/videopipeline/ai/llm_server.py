@@ -37,6 +37,134 @@ def _as_path(p: Optional[PathLike]) -> Optional[Path]:
     return Path(p)
 
 
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    seen: set[str] = set()
+    for p in paths:
+        key = str(p).strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+def _gguf_files_in_dir(directory: Path) -> list[Path]:
+    try:
+        if not directory.exists() or not directory.is_dir():
+            return []
+        files = [p for p in directory.glob("*.gguf") if p.is_file()]
+    except Exception:
+        return []
+
+    def _prio(p: Path) -> tuple[int, str]:
+        name = p.name.lower()
+        if "qwen" in name and "instruct" in name:
+            return (0, name)
+        if "instruct" in name:
+            return (1, name)
+        return (2, name)
+
+    files.sort(key=_prio)
+    return files
+
+
+def _resolve_server_path(preferred: Optional[Path]) -> tuple[Path, list[Path]]:
+    default = Path("C:/llama.cpp/llama-server.exe")
+    candidates: list[Path] = []
+
+    def _append_path(p: Optional[Path]) -> None:
+        if p is None:
+            return
+        candidates.append(p)
+        s = str(p).replace("\\", "/")
+        if s.endswith("/") or s.endswith("\\"):
+            candidates.append(p / "llama-server.exe")
+        # If a directory is passed, also try the binary name under it.
+        try:
+            if p.exists() and p.is_dir():
+                candidates.append(p / "llama-server.exe")
+        except Exception:
+            pass
+
+    _append_path(preferred)
+    for env_name in ("VP_LLAMACPP_SERVER_PATH", "VP_LLAMA_SERVER_PATH", "LLAMA_SERVER_PATH"):
+        raw = (os.environ.get(env_name) or "").strip()
+        if raw:
+            _append_path(Path(raw))
+
+    home = Path.home()
+    for p in (
+        default,
+        Path("C:/llama.cpp/build/bin/llama-server.exe"),
+        Path("C:/llama.cpp/build/bin/Release/llama-server.exe"),
+        home / "llama.cpp" / "llama-server.exe",
+        home / "llama.cpp" / "build" / "bin" / "llama-server.exe",
+    ):
+        _append_path(p)
+
+    deduped = _dedupe_paths(candidates)
+    for cand in deduped:
+        try:
+            if cand.exists() and cand.is_file():
+                return cand, deduped
+        except Exception:
+            continue
+
+    if deduped:
+        return deduped[0], deduped
+    return default, [default]
+
+
+def _resolve_model_path(preferred: Optional[Path], *, server_path: Optional[Path] = None) -> tuple[Path, list[Path]]:
+    default = Path("C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf")
+    candidates: list[Path] = []
+
+    def _append_model_path(p: Optional[Path]) -> None:
+        if p is None:
+            return
+        candidates.append(p)
+        suffix = p.suffix.lower()
+        if suffix != ".gguf":
+            for gguf in _gguf_files_in_dir(p):
+                candidates.append(gguf)
+
+    _append_model_path(preferred)
+    for env_name in (
+        "VP_LLAMACPP_MODEL_PATH",
+        "VP_LLAMA_MODEL_PATH",
+        "LLAMA_MODEL_PATH",
+        "VP_LLAMACPP_MODEL_DIR",
+        "LLAMA_MODEL_DIR",
+    ):
+        raw = (os.environ.get(env_name) or "").strip()
+        if raw:
+            _append_model_path(Path(raw))
+
+    home = Path.home()
+    if server_path is not None:
+        _append_model_path(server_path.parent / "models")
+    for p in (
+        default,
+        Path("C:/llama.cpp/models"),
+        home / "llama.cpp" / "models",
+        Path.cwd() / "models",
+    ):
+        _append_model_path(p)
+
+    deduped = _dedupe_paths(candidates)
+    for cand in deduped:
+        try:
+            if cand.exists() and cand.is_file():
+                return cand, deduped
+        except Exception:
+            continue
+
+    if deduped:
+        return deduped[0], deduped
+    return default, [default]
+
+
 # Heartbeat file location (in temp dir)
 def _get_heartbeat_path() -> Path:
     """Get path to heartbeat file."""
@@ -269,13 +397,31 @@ class LlamaServerManager:
     
     def _start_server(self) -> bool:
         """Start the llama.cpp server process."""
+        resolved_server, server_candidates = _resolve_server_path(self.cfg.server_path)
+        if resolved_server != self.cfg.server_path and resolved_server.exists():
+            self._status(f"Resolved llama-server path: {resolved_server}")
+        self.cfg.server_path = resolved_server
+
+        resolved_model, model_candidates = _resolve_model_path(self.cfg.model_path, server_path=self.cfg.server_path)
+        if resolved_model != self.cfg.model_path and resolved_model.exists():
+            self._status(f"Resolved model path: {resolved_model}")
+        self.cfg.model_path = resolved_model
+
         # Validate paths
         if not self.cfg.server_path.exists():
-            self._status(f"llama-server not found: {self.cfg.server_path}")
+            tried = ", ".join(str(p) for p in server_candidates[:4])
+            self._status(
+                f"llama-server not found: {self.cfg.server_path} "
+                f"(set VP_LLAMACPP_SERVER_PATH). Tried: {tried}"
+            )
             return False
         
         if not self.cfg.model_path.exists():
-            self._status(f"Model not found: {self.cfg.model_path}")
+            tried = ", ".join(str(p) for p in model_candidates[:4])
+            self._status(
+                f"Model not found: {self.cfg.model_path} "
+                f"(set VP_LLAMACPP_MODEL_PATH or VP_LLAMACPP_MODEL_DIR). Tried: {tried}"
+            )
             return False
         
         self._status(f"Starting LLM server ({self.cfg.model_path.name})...")
@@ -476,10 +622,15 @@ def get_server_manager(
     # Coerce string paths to Path objects (YAML config values are strings)
     server_path_p = _as_path(server_path)
     model_path_p = _as_path(model_path)
+    resolved_server_path, _ = _resolve_server_path(server_path_p or Path("C:/llama.cpp/llama-server.exe"))
+    resolved_model_path, _ = _resolve_model_path(
+        model_path_p or Path("C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf"),
+        server_path=resolved_server_path,
+    )
     
     cfg = LlamaServerConfig(
-        server_path=server_path_p or Path("C:/llama.cpp/llama-server.exe"),
-        model_path=model_path_p or Path("C:/llama.cpp/models/qwen2.5-7b-instruct-q4_k_m.gguf"),
+        server_path=resolved_server_path,
+        model_path=resolved_model_path,
         port=port,
         auto_stop_after_idle_s=auto_stop_after_idle_s,
         startup_timeout_s=startup_timeout_s,

@@ -3,7 +3,9 @@
 Provides a pluggable backend for speech-to-text transcription:
 - openai-whisper (PyTorch - supports AMD GPUs via ROCm, NVIDIA via CUDA)
 - faster-whisper (CTranslate2 - NVIDIA CUDA only, fastest on CUDA)
+- NVIDIA NeMo ASR (PyTorch - optimized for NVIDIA CUDA)
 - whisper.cpp via pywhispercpp (fast CPU, Vulkan GPU with custom build)
+- AssemblyAI (cloud API transcription + optional speaker labels)
 
 Optional speaker diarization via pyannote-audio:
 - Identifies who is speaking when

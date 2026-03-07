@@ -250,6 +250,7 @@ def learn_laugh_tokens_with_llm(
     store: ChatStore,
     *,
     llm_complete: Callable[[str], str],
+    strict: bool = False,
     top_k: int = 200,
     min_freq: int = 10,
     batch_size: int = 60,
@@ -315,7 +316,9 @@ def learn_laugh_tokens_with_llm(
 
         try:
             resp = llm_complete(prompt)
-        except Exception:
+        except Exception as e:
+            if strict:
+                raise RuntimeError(f"LLM laugh-token classification failed: {type(e).__name__}: {e}") from e
             # If LLM fails mid-way, return what we have (seeds + pattern expansions)
             return laugh
 
@@ -503,6 +506,7 @@ def compute_and_save_chat_features(
     # Laughter lexicon options:
     auto_learn_laugh_tokens: bool = True,
     llm_complete: Optional[Callable[[str], str]] = None,
+    strict_llm: bool = False,
     laugh_top_k: int = 200,
     laugh_min_freq: int = 10,
     laugh_batch_size: int = 60,
@@ -609,6 +613,7 @@ def compute_and_save_chat_features(
             learned = learn_laugh_tokens_with_llm(
                 store,
                 llm_complete=llm_complete,
+                strict=bool(strict_llm),
                 top_k=laugh_top_k,
                 min_freq=laugh_min_freq,
                 batch_size=laugh_batch_size,
@@ -654,6 +659,8 @@ def compute_and_save_chat_features(
                     on_status(f"Learned {len(laugh_tokens)} laugh tokens ({llm_count} from AI, {seed_count} seeds)")
                     
         elif (not laugh_tokens) and auto_learn_laugh_tokens and llm_complete is None:
+            if strict_llm:
+                raise RuntimeError("chat.llm_strict is enabled but no LLM client is available for laugh-token learning")
             # No LLM available - use seed tokens and save them
             laugh_tokens = set(_SEED_LAUGH_TOKENS)
             save_laugh_tokens_to_store(store, laugh_tokens, source="seed", llm_learned=None)

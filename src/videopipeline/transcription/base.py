@@ -143,7 +143,14 @@ class TranscriptResult:
         return words
 
 
-BackendType = Literal["whispercpp", "faster_whisper", "openai_whisper", "auto"]
+BackendType = Literal[
+    "whispercpp",
+    "faster_whisper",
+    "openai_whisper",
+    "nemo_asr",
+    "assemblyai",
+    "auto",
+]
 
 
 @dataclass
@@ -151,9 +158,12 @@ class TranscriberConfig:
     """Configuration for transcription engine.
     
     Attributes:
-        backend: Which engine to use ("openai_whisper", "faster_whisper", "whispercpp", "auto")
+        backend: Which engine to use
+                 ("openai_whisper", "faster_whisper", "whispercpp", "nemo_asr", "assemblyai", "auto")
         model: Model size ("tiny", "base", "small", "medium", "large")
                Also supports quantized models: "small.en-q8_0", "tiny-q5_1"
+               For AssemblyAI, this can be a comma-separated model list
+               (e.g. "universal-3-pro,universal-2").
         language: Language code (None for auto-detect)
         use_gpu: Whether to attempt GPU acceleration (AMD ROCm or NVIDIA CUDA)
         threads: Number of CPU threads (0 = use all cores)
@@ -191,9 +201,26 @@ class TranscriberConfig:
     # Model path override (if using local models)
     model_path: Optional[str] = None
 
+    # Optional AssemblyAI cloud backend settings.
+    # API key should generally be provided via ASSEMBLYAI_API_KEY.
+    assemblyai_api_key: Optional[str] = None
+    assemblyai_speech_models: Optional[List[str]] = None
+    assemblyai_poll_interval_s: float = 3.0
+    assemblyai_timeout_s: float = 7200.0
+
     @classmethod
     def from_profile(cls, speech_cfg: Dict[str, Any]) -> "TranscriberConfig":
         """Create config from profile speech settings."""
+        aai_cfg = speech_cfg.get("assemblyai", {})
+        if not isinstance(aai_cfg, dict):
+            aai_cfg = {}
+
+        raw_aai_models = speech_cfg.get("assemblyai_speech_models", aai_cfg.get("speech_models"))
+        if isinstance(raw_aai_models, str):
+            raw_aai_models = [p.strip() for p in raw_aai_models.split(",") if p.strip()]
+        elif not isinstance(raw_aai_models, list):
+            raw_aai_models = None
+
         return cls(
             backend=speech_cfg.get("backend", "auto"),
             model=speech_cfg.get("model_size", speech_cfg.get("model", "small")),
@@ -212,6 +239,14 @@ class TranscriberConfig:
             diarize_min_speakers=speech_cfg.get("diarize_min_speakers"),
             diarize_max_speakers=speech_cfg.get("diarize_max_speakers"),
             hf_token=speech_cfg.get("hf_token"),
+            assemblyai_api_key=speech_cfg.get("assemblyai_api_key", aai_cfg.get("api_key")),
+            assemblyai_speech_models=raw_aai_models,
+            assemblyai_poll_interval_s=float(
+                speech_cfg.get("assemblyai_poll_interval_s", aai_cfg.get("poll_interval_s", 3.0))
+            ),
+            assemblyai_timeout_s=float(
+                speech_cfg.get("assemblyai_timeout_s", aai_cfg.get("timeout_s", 7200.0))
+            ),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -234,6 +269,10 @@ class TranscriberConfig:
             "diarize_min_speakers": self.diarize_min_speakers,
             "diarize_max_speakers": self.diarize_max_speakers,
             "hf_token": self.hf_token,
+            "assemblyai_api_key": self.assemblyai_api_key,
+            "assemblyai_speech_models": self.assemblyai_speech_models,
+            "assemblyai_poll_interval_s": self.assemblyai_poll_interval_s,
+            "assemblyai_timeout_s": self.assemblyai_timeout_s,
         }
 
 

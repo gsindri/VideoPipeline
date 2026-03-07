@@ -135,6 +135,7 @@ def compute_reaction_audio_features(
     proj: Project,
     *,
     cfg: ReactionAudioConfig,
+    source_audio_path: Optional[Path] = None,
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Compute reaction-focused audio features.
@@ -150,7 +151,7 @@ def compute_reaction_audio_features(
       - analysis/reaction_audio_features.npz
       - project.json -> analysis.reaction_audio section
     """
-    video_path = Path(proj.audio_source)  # Use audio_source for fallback during early analysis
+    video_path = Path(source_audio_path) if source_audio_path is not None else Path(proj.audio_source)
     duration_s = ffprobe_duration_seconds(video_path)
 
     hop_samples = int(cfg.sample_rate * cfg.hop_seconds)
@@ -180,7 +181,23 @@ def compute_reaction_audio_features(
 
     _report(0.05, "Extracting audio blocks")
 
-    for block in stream_audio_blocks_f32le(video_path, params=params, block_samples=hop_samples):
+    block_iter = None
+    if video_path.suffix.lower() == ".wav":
+        try:
+            from .analysis_audio_decode import stream_decoded_audio_blocks_f32
+
+            block_iter = stream_decoded_audio_blocks_f32(
+                video_path,
+                block_samples=hop_samples,
+                expected_sample_rate=cfg.sample_rate,
+            )
+        except Exception:
+            block_iter = None
+
+    if block_iter is None:
+        block_iter = stream_audio_blocks_f32le(video_path, params=params, block_samples=hop_samples)
+
+    for block in block_iter:
         # RMS
         rms = _compute_rms(block)
         rms_values.append(rms)

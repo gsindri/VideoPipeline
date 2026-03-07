@@ -221,6 +221,91 @@ def _iter_audio_frames_ffmpeg(
             raise RuntimeError(f"FFmpeg audio decode failed (rc={rc}): {msg}")
 
 
+def _iter_audio_frames_wav(
+    media_path: Path,
+    *,
+    sample_rate: int,
+    window_size_samples: int,
+    duration_s: float,
+    on_progress: Optional[Callable[[float], None]] = None,
+):
+    """Yield mono float32 frames from PCM16 WAV without spawning ffmpeg."""
+    import wave
+
+    with wave.open(str(media_path), "rb") as wf:
+        channels = int(wf.getnchannels())
+        sample_width = int(wf.getsampwidth())
+        sr = int(wf.getframerate())
+        total_frames = int(wf.getnframes())
+
+        if channels != 1:
+            raise RuntimeError(f"WAV stream requires mono audio (got channels={channels})")
+        if sample_width != 2:
+            raise RuntimeError(f"WAV stream requires PCM16 audio (got sample_width={sample_width})")
+        if sr != int(sample_rate):
+            raise RuntimeError(f"WAV sample rate mismatch (expected {sample_rate}, got {sr})")
+
+        expected_total = max(1.0, float(duration_s)) * sample_rate
+        read_total = 0
+        last_progress_emit = 0.0
+
+        while True:
+            raw = wf.readframes(window_size_samples)
+            if not raw:
+                break
+
+            n = len(raw) // 2
+            if n <= 0:
+                break
+
+            # Keep old behavior: drop final short frame.
+            if n < window_size_samples:
+                break
+
+            x_i16 = np.frombuffer(raw[: n * 2], dtype="<i2")
+            x = x_i16.astype(np.float32) / 32768.0
+
+            read_total += n
+            if on_progress:
+                p = min(0.95, 0.05 + 0.9 * (read_total / expected_total))
+                if p - last_progress_emit >= 0.01:
+                    last_progress_emit = p
+                    on_progress(p)
+
+            yield x
+
+
+def _iter_audio_frames(
+    media_path: Path,
+    *,
+    sample_rate: int,
+    window_size_samples: int,
+    duration_s: float,
+    on_progress: Optional[Callable[[float], None]] = None,
+):
+    """Yield audio frames, preferring direct WAV reads when possible."""
+    if media_path.suffix.lower() == ".wav":
+        try:
+            yield from _iter_audio_frames_wav(
+                media_path,
+                sample_rate=sample_rate,
+                window_size_samples=window_size_samples,
+                duration_s=duration_s,
+                on_progress=on_progress,
+            )
+            return
+        except Exception as exc:
+            logger.info("[audio_vad] WAV stream unavailable (%s); falling back to ffmpeg", exc)
+
+    yield from _iter_audio_frames_ffmpeg(
+        media_path,
+        sample_rate=sample_rate,
+        window_size_samples=window_size_samples,
+        duration_s=duration_s,
+        on_progress=on_progress,
+    )
+
+
 def _segments_from_vad(
     media_path: Path,
     *,
@@ -237,14 +322,24 @@ def _segments_from_vad(
     model, VADIterator, source = _load_silero_vad_iterator(cfg)
     logger.info(f"[audio_vad] Using Silero VAD ({source}), sr={cfg.sample_rate}")
 
+    run_device = "cpu"
+
     # Move model if possible.
     try:
         import torch
 
-        if cfg.device and cfg.device != "cpu":
-            model = model.to(cfg.device)
-    except Exception:
-        pass
+        requested_device = str(cfg.device or "cpu").strip().lower()
+        if requested_device and requested_device != "cpu":
+            if torch.cuda.is_available():
+                model = model.to(cfg.device)
+                run_device = str(cfg.device)
+            else:
+                logger.warning(
+                    "[audio_vad] Requested device '%s' but CUDA is unavailable; falling back to CPU",
+                    cfg.device,
+                )
+    except Exception as exc:
+        logger.warning("[audio_vad] Could not initialize requested device '%s': %s", cfg.device, exc)
 
     # Instantiate iterator; API varies slightly across versions.
     try:
@@ -265,7 +360,7 @@ def _segments_from_vad(
     segments_samples: List[Tuple[int, int]] = []
 
     # Stream frames from ffmpeg -> VADIterator
-    for x in _iter_audio_frames_ffmpeg(
+    for x in _iter_audio_frames(
         media_path,
         sample_rate=cfg.sample_rate,
         window_size_samples=window_size,
@@ -275,6 +370,8 @@ def _segments_from_vad(
         import torch
 
         xt = torch.from_numpy(x)
+        if run_device != "cpu":
+            xt = xt.to(run_device)
         event = vad_iter(xt, return_seconds=False)
 
         if not event:
@@ -386,6 +483,7 @@ def compute_audio_vad_analysis(
     proj: Project,
     *,
     cfg: VadConfig,
+    source_audio_path: Optional[Path] = None,
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Compute Silero VAD speech segments and persist to analysis/audio_vad.npz."""
@@ -393,7 +491,7 @@ def compute_audio_vad_analysis(
         logger.info("[audio_vad] Disabled via config.")
         return {"disabled": True}
 
-    media_path = Path(proj.audio_source)
+    media_path = Path(source_audio_path) if source_audio_path is not None else Path(proj.audio_source)
     if not media_path.exists():
         raise FileNotFoundError(f"Audio source not found: {media_path}")
 

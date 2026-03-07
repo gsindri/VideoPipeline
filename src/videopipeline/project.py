@@ -212,6 +212,18 @@ class Project:
         return self.analysis_dir / "audio_events_features.npz"
 
     @property
+    def audio_decode_dir(self) -> Path:
+        return self.analysis_dir / "audio_decode"
+
+    @property
+    def audio_decode_index_path(self) -> Path:
+        return self.audio_decode_dir / "index.json"
+
+    @property
+    def audio_decode_wav_path(self) -> Path:
+        return self.audio_decode_dir / "mono_16k.wav"
+
+    @property
     def exports_dir(self) -> Path:
         return self.project_dir / "exports"
 

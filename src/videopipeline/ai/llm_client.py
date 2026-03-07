@@ -1,21 +1,21 @@
-"""HTTP client for local LLM server (llama.cpp).
+"""HTTP client for OpenAI-compatible chat-completions endpoints.
 
-Provides a simple interface to call a local llama.cpp server over HTTP
-with JSON output enforcement and response caching.
+Supports both local llama.cpp servers and hosted APIs (for example OpenAI).
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import urllib.request
 import urllib.error
+import urllib.parse
 
 # Import heartbeat for idle timer reset
 try:
@@ -32,6 +32,7 @@ class LLMClientConfig:
     max_tokens: int = 512
     temperature: float = 0.2
     model_name: str = "local-gguf"
+    api_key: Optional[str] = None
     # Cache settings
     cache_enabled: bool = True
     cache_db_path: Optional[Path] = None
@@ -66,6 +67,18 @@ def _compute_cache_key(
         "max_tokens": max_tokens,
     }, sort_keys=True)
     return hashlib.sha256(key_data.encode()).hexdigest()[:32]
+
+
+def _resolve_api_key(explicit_key: Optional[str]) -> Optional[str]:
+    """Resolve API key from explicit config or environment."""
+    if explicit_key and explicit_key.strip():
+        return explicit_key.strip()
+
+    env_key = os.environ.get("OPENAI_API_KEY")
+    if env_key and env_key.strip():
+        return env_key.strip()
+
+    return None
 
 
 class LLMResponseCache:
@@ -205,28 +218,52 @@ def _extract_json_from_response(text: str) -> Any:
 
 
 class LLMClient:
-    """HTTP client for local llama.cpp server."""
+    """HTTP client for OpenAI-compatible chat completions."""
 
     def __init__(self, cfg: LLMClientConfig):
         self.cfg = cfg
+        self._api_key = _resolve_api_key(cfg.api_key)
         self._cache: Optional[LLMResponseCache] = None
 
         if cfg.cache_enabled and cfg.cache_db_path:
             self._cache = LLMResponseCache(cfg.cache_db_path)
+
+    def _build_headers(self, *, include_json_content_type: bool = False) -> Dict[str, str]:
+        headers: Dict[str, str] = {}
+        if include_json_content_type:
+            headers["Content-Type"] = "application/json"
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
+
+    def _is_local_endpoint(self) -> bool:
+        try:
+            host = (urllib.parse.urlparse(self.cfg.endpoint).hostname or "").strip().lower()
+        except Exception:
+            return False
+        return host in {"127.0.0.1", "localhost", "::1"}
 
     def is_available(self) -> bool:
         """Check if the LLM server is available."""
         try:
             # Try to hit the health endpoint
             health_url = f"{self.cfg.endpoint}/health"
-            req = urllib.request.Request(health_url, method="GET")
+            req = urllib.request.Request(
+                health_url,
+                headers=self._build_headers(),
+                method="GET",
+            )
             with urllib.request.urlopen(req, timeout=5.0) as resp:
                 return resp.status == 200
         except Exception:
             # Also try v1/models for OpenAI-compatible endpoint
             try:
                 models_url = f"{self.cfg.endpoint}/v1/models"
-                req = urllib.request.Request(models_url, method="GET")
+                req = urllib.request.Request(
+                    models_url,
+                    headers=self._build_headers(),
+                    method="GET",
+                )
                 with urllib.request.urlopen(req, timeout=5.0) as resp:
                     return resp.status == 200
             except Exception:
@@ -280,6 +317,7 @@ class LLMClient:
         messages.append({"role": "user", "content": prompt})
 
         body = {
+            "model": self.cfg.model_name,
             "messages": messages,
             "temperature": temp,
             "max_tokens": tokens,
@@ -297,13 +335,21 @@ class LLMClient:
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers=self._build_headers(include_json_content_type=True),
             method="POST",
         )
 
         try:
             with urllib.request.urlopen(req, timeout=self.cfg.timeout_s) as resp:
                 response_data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                detail = ""
+            suffix = f": {detail[:300]}" if detail else ""
+            raise LLMResponseError(f"LLM request failed ({e.code}){suffix}") from e
         except urllib.error.URLError as e:
             raise LLMServerUnavailableError(f"LLM server unavailable: {e}") from e
         except TimeoutError as e:
@@ -316,7 +362,7 @@ class LLMClient:
             raise LLMResponseError(f"Invalid response structure: {e}") from e
 
         # Update heartbeat to reset idle timer (keeps server alive)
-        if _write_heartbeat:
+        if _write_heartbeat and self._is_local_endpoint():
             _write_heartbeat()
 
         # If caller wants raw text, return it directly

@@ -540,6 +540,8 @@ def compute_director(
         return {"created_at": _utc_now_iso(), "enabled": False, "picks": []}
 
     if dcfg.use_llm and llm_complete is None:
+        if not dcfg.fallback_to_rules:
+            raise RuntimeError("Director LLM is required but unavailable (fallback_to_rules=false)")
         logger.warning("[director] use_llm=true but no llm_complete provided; packaging will use rules.")
 
     if on_progress:

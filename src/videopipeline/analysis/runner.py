@@ -13,6 +13,8 @@ The runner:
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
+import json
 import logging
 import os
 import time
@@ -32,6 +34,44 @@ from .artifacts import (
 from .tasks import task_registry, Task
 
 logger = logging.getLogger(__name__)
+
+# Task-specific config sections used for freshness hashing.
+# This avoids using task.name as a config key (many tasks read different sections).
+_TASK_FRESHNESS_CONFIG_KEYS: Dict[str, Set[str]] = {
+    "audio_decode": {"audio_decode"},
+    "audio_features": {"audio"},
+    "audio_events": {"audio_events"},
+    "silence": {"silence"},
+    "transcript": {"speech"},
+    "sentences": {"sentences"},
+    "speech_features": {"speech_features", "speech"},
+    "chapters": {"chapters"},
+    "audio_vad": {"vad"},
+    "diarization": {"speech", "diarization"},
+    "reaction_audio": {"reaction_audio", "audio"},
+    "chat_features": {"audio", "highlights"},
+    "chat_boundaries": {"chat_boundaries"},
+    "chat_sync": {"chat_sync"},
+    "motion_features": {"motion"},
+    "scenes": {"scenes"},
+    "boundary_graph": {"boundaries"},
+    "highlights_scores": {
+        "audio",
+        "motion",
+        "highlights",
+        "audio_events",
+        "reaction_audio",
+        "speech",
+        "diarization",
+        "include_chat",
+        "include_audio_events",
+        "include_reaction_audio",
+        "include_diarization",
+    },
+    "highlights_candidates": {"highlights", "scenes"},
+    "variants": {"variants"},
+    "director": {"director"},
+}
 
 
 # ============================================================================
@@ -179,6 +219,114 @@ class AnalysisRunner:
         logger.debug(f"[DAG] Artifact '{artifact}' -> {path.name}: exists={exists}")
         return exists
 
+    def _artifact_disabled_by_config(self, artifact: str) -> bool:
+        """True when artifact's producer task is disabled by current config."""
+        task = task_registry.get_by_artifact(artifact)
+        if task is None:
+            return False
+        return not task.is_enabled(self.config)
+
+    def _task_config_for_freshness(self, task: Task) -> Dict[str, Any]:
+        """Return the config subset that should invalidate this task's outputs."""
+        keys = _TASK_FRESHNESS_CONFIG_KEYS.get(task.name, {task.name})
+        return {
+            key: self.config[key]
+            for key in sorted(keys)
+            if key in self.config
+        }
+
+    def _artifact_fingerprint(self, artifact: str) -> str:
+        """Return a stable fingerprint for an artifact's current on-disk state."""
+        state = get_artifact_state(artifact, self.proj.analysis_dir)
+        if not state.exists or state.path is None or not state.path.exists():
+            return "missing"
+
+        try:
+            st = state.path.stat()
+            size = int(st.st_size)
+            mtime_ns = int(st.st_mtime_ns)
+        except Exception:
+            size = -1
+            mtime_ns = -1
+
+        meta = state.metadata or {}
+        return "|".join(
+            [
+                str(state.path.name),
+                str(size),
+                str(mtime_ns),
+                str(meta.get("task_version", "")),
+                str(meta.get("config_hash", "")),
+            ]
+        )
+
+    def _source_audio_fingerprint(self) -> str:
+        """Return a stable fingerprint for the current project audio source."""
+        src = Path(self.proj.audio_source)
+        if not src.exists():
+            return f"missing|{src}"
+
+        try:
+            st = src.stat()
+            size = int(st.st_size)
+            mtime_ns = int(st.st_mtime_ns)
+        except Exception:
+            size = -1
+            mtime_ns = -1
+        return f"{src}|{size}|{mtime_ns}"
+
+    def _task_input_signature(
+        self,
+        task: Task,
+        *,
+        optional_inputs: Optional[Set[str]] = None,
+    ) -> tuple[Optional[str], List[str]]:
+        """Hash current upstream artifact fingerprints for task freshness checks."""
+        tracked_optional = optional_inputs
+        if tracked_optional is None:
+            tracked_optional = {
+                opt for opt in task.optional_inputs
+                if self._artifact_exists(opt)
+            }
+
+        tracked_inputs = sorted(set(task.requires) | set(tracked_optional))
+        synthetic_inputs: Dict[str, str] = {}
+        if task.name == "audio_decode":
+            synthetic_inputs["__audio_source__"] = self._source_audio_fingerprint()
+
+        if not tracked_inputs and not synthetic_inputs:
+            return None, []
+
+        payload = {
+            "inputs": {
+                artifact: self._artifact_fingerprint(artifact)
+                for artifact in tracked_inputs
+            },
+            "synthetic_inputs": synthetic_inputs,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        signature = hashlib.md5(encoded.encode("utf-8")).hexdigest()[:16]
+        tracked = tracked_inputs + sorted(synthetic_inputs)
+        return signature, tracked
+
+    def _task_input_signature_for_freshness(self, task: Task) -> Optional[str]:
+        """Compute expected input signature for existing outputs of this task.
+
+        Required inputs are always included. Optional inputs are included only if
+        they were present when the task last ran (sources_present), so optional
+        source appearance still flows through upgrade-mode policy.
+        """
+        tracked_optional: Set[str] = set()
+        if task.optional_inputs and task.produces:
+            try:
+                state = get_artifact_state(list(task.produces)[0], self.proj.analysis_dir)
+                tracked_optional = set(state.sources_present or set()) & set(task.optional_inputs)
+            except Exception:
+                tracked_optional = set()
+
+        signature, _ = self._task_input_signature(task, optional_inputs=tracked_optional)
+        return signature
+
     def _get_gpu_concurrency(self) -> int:
         """Return max number of concurrent GPU-heavy tasks.
 
@@ -253,6 +401,23 @@ class AnalysisRunner:
         )
         
         if all_outputs_exist:
+            # Recompute if outputs exist but are stale under current config/version.
+            freshness_cfg = self._task_config_for_freshness(task)
+            input_signature = self._task_input_signature_for_freshness(task)
+            stale_outputs = [
+                a for a in sorted(task.produces)
+                if a not in self._computed
+                and not is_artifact_fresh(
+                    a,
+                    self.proj.analysis_dir,
+                    config=freshness_cfg,
+                    task_version=task.version,
+                    input_signature=input_signature,
+                )
+            ]
+            if stale_outputs:
+                return True, f"stale outputs: {stale_outputs}"
+
             # Check upgrade triggers in upgrade mode
             if self.upgrade_mode and task.upgrade_triggers:
                 # Only consider triggers that actually exist NOW (not just in self._computed)
@@ -479,6 +644,7 @@ class AnalysisRunner:
                 if actually_produced:
                     result.status = "completed"
                     result.artifacts_produced = actually_produced
+                    freshness_cfg = self._task_config_for_freshness(task)
                     
                     # Mark only actually produced artifacts as computed (thread-safe)
                     with self._computed_lock:
@@ -493,13 +659,22 @@ class AnalysisRunner:
                         for opt in task.optional_inputs:
                             if self._artifact_exists(opt):
                                 sources_present.add(opt)
+                        input_signature, input_artifacts = self._task_input_signature(
+                            task,
+                            optional_inputs=sources_present,
+                        )
+                        extra_metadata: Dict[str, Any] = {}
+                        if input_signature is not None:
+                            extra_metadata["input_signature"] = input_signature
+                            extra_metadata["input_artifacts"] = input_artifacts
                         
                         save_artifact_state(
                             artifact,
                             self.proj.analysis_dir,
-                            config=self.config.get(task.name, {}),
+                            config=freshness_cfg,
                             task_version=task.version,
                             sources_present=sources_present,
+                            extra_metadata=extra_metadata or None,
                         )
                     
                 else:
@@ -620,7 +795,10 @@ class AnalysisRunner:
             
             if not tasks:
                 logger.warning("[DAG] No tasks to run (all outputs exist)")
-                result.missing_targets = {t for t in target_set if not self._artifact_exists(t)}
+                result.missing_targets = {
+                    t for t in target_set
+                    if not self._artifact_exists(t) and not self._artifact_disabled_by_config(t)
+                }
                 if result.missing_targets:
                     logger.warning(f"[DAG] Missing targets after run: {sorted(result.missing_targets)}")
                     if explicit_targets:
@@ -653,8 +831,23 @@ class AnalysisRunner:
                 # Skip if already marked to run
                 if any(t.name == task.name for t, _ in tasks_that_should_run):
                     continue
-                
-                # Skip if task has no upgrade triggers
+
+                # Disabled tasks must stay disabled even if dependencies are being
+                # produced in this run (prevents noisy "will run -> skipped" churn).
+                if not task.is_enabled(self.config):
+                    continue
+
+                # If required dependencies are being re-produced in this run, re-run.
+                required_will_be_produced = task.requires & will_be_produced
+                if required_will_be_produced:
+                    reason = f"upstream required inputs being produced {required_will_be_produced}"
+                    tasks_that_should_run.append((task, reason))
+                    will_be_produced.update(task.produces)
+                    planned_results.pop(task.name, None)
+                    logger.info(f"[DAG] Adding '{task.name}' due to required dependency update: {required_will_be_produced}")
+                    continue
+
+                # Skip remaining checks if task has no upgrade triggers.
                 if not task.upgrade_triggers:
                     continue
                     
@@ -717,7 +910,10 @@ class AnalysisRunner:
                         tr = TaskResult(task_name=task.name, status="skipped", error="not scheduled")
                     result.tasks_run.append(tr)
 
-                result.missing_targets = {t for t in target_set if not self._artifact_exists(t)}
+                result.missing_targets = {
+                    t for t in target_set
+                    if not self._artifact_exists(t) and not self._artifact_disabled_by_config(t)
+                }
                 if result.missing_targets:
                     logger.warning(f"[DAG] Missing targets after run: {sorted(result.missing_targets)}")
                     if explicit_targets:
@@ -974,7 +1170,10 @@ class AnalysisRunner:
                 tr = TaskResult(task_name=task.name, status="skipped", error="not scheduled")
             result.tasks_run.append(tr)
 
-        result.missing_targets = {t for t in target_set if not self._artifact_exists(t)}
+        result.missing_targets = {
+            t for t in target_set
+            if not self._artifact_exists(t) and not self._artifact_disabled_by_config(t)
+        }
         if result.missing_targets:
             logger.warning(f"[DAG] Missing targets after run: {sorted(result.missing_targets)}")
             if explicit_targets and result.success:

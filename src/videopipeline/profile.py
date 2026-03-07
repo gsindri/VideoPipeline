@@ -51,7 +51,7 @@ def default_profile() -> Dict[str, Any]:
             },
             "speech": {
                 "enabled": True,
-                "backend": "openai_whisper",  # "openai_whisper", "faster_whisper", "whispercpp", or "auto"
+                "backend": "openai_whisper",  # "openai_whisper", "faster_whisper", "whispercpp", "nemo_asr", "assemblyai", or "auto"
                 "model_size": "small",  # tiny, base, small, medium, large
                 "language": None,  # None for auto-detect
                 "device": "cuda",  # cpu or cuda
@@ -61,6 +61,10 @@ def default_profile() -> Dict[str, Any]:
                 "vad_filter": True,
                 "word_timestamps": True,
                 "hop_seconds": 0.5,
+                # Optional AssemblyAI settings (only used when backend="assemblyai"):
+                # "assemblyai_speech_models": ["universal-3-pro", "universal-2"],
+                # "assemblyai_poll_interval_s": 3.0,
+                # "assemblyai_timeout_s": 7200.0,
             },
             "reaction_audio": {
                 "enabled": True,
@@ -147,9 +151,10 @@ def default_profile() -> Dict[str, Any]:
         "ai": {
             "director": {
                 "enabled": True,
-                "engine": "llama_cpp_server",
+                "engine": "llama_cpp_server",  # "llama_cpp_server" or "openai_api"
                 "endpoint": "http://127.0.0.1:11435",
                 "model_name": "local-gguf",
+                "api_key": None,  # Optional; falls back to OPENAI_API_KEY env var
                 "timeout_s": 30,
                 "max_tokens": 256,
                 "temperature": 0.2,

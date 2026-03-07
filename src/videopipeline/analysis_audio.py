@@ -156,6 +156,7 @@ def compute_audio_analysis(
     post_s: float,
     skip_start_s: float,
     min_clip_s: float = 3.0,
+    source_audio_path: Optional[Path] = None,
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Compute audio RMS excitement timeline and top highlight candidates.
@@ -192,7 +193,7 @@ def compute_audio_analysis(
         return start, end
 
     start_time = _time.time()
-    video_path = Path(proj.audio_source)  # Use audio_source for fallback during early analysis
+    video_path = Path(source_audio_path) if source_audio_path is not None else Path(proj.audio_source)
     duration_s = ffprobe_duration_seconds(video_path)
     
     # Helper for progress reporting with optional message

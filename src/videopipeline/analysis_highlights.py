@@ -1709,8 +1709,16 @@ def compute_highlights_analysis(
     # LLM Semantic Scoring (optional enhancement)
     llm_semantic_used = False
     llm_semantic_scores: Dict[int, Dict[str, Any]] = {}
-    
-    if llm_complete is not None and candidates:
+    llm_semantic_enabled = bool(highlights_cfg.get("llm_semantic_enabled", True))
+    llm_strict = bool(highlights_cfg.get("llm_strict", False))
+
+    if llm_semantic_enabled and llm_complete is None and candidates:
+        msg = "LLM semantic scoring enabled but llm_complete is unavailable"
+        if llm_strict:
+            raise RuntimeError(msg)
+        _highlight_logger.info("[highlights] %s; continuing without LLM", msg)
+
+    if llm_semantic_enabled and llm_complete is not None and candidates:
         if on_progress:
             on_progress(0.78)  # Starting LLM scoring
         
@@ -1759,6 +1767,8 @@ def compute_highlights_analysis(
                     
                 _highlight_logger.info(f"LLM semantic scoring applied to {len(llm_semantic_scores)} candidates")
         except Exception as e:
+            if llm_strict:
+                raise RuntimeError(f"LLM semantic scoring failed in strict mode: {e}") from e
             _highlight_logger.warning(f"LLM semantic scoring failed, continuing without: {e}")
 
     save_npz(
@@ -2675,11 +2685,15 @@ def compute_highlights_candidates(
     llm_semantic_used = False
     llm_semantic_scores: Dict[int, Dict[str, Any]] = {}
     llm_semantic_enabled = bool(highlights_cfg.get("llm_semantic_enabled", True))
+    llm_strict = bool(highlights_cfg.get("llm_strict", False))
     
     if not llm_semantic_enabled:
         _highlight_logger.info("[highlights_candidates] LLM semantic scoring disabled in config (llm_semantic_enabled=false)")
     elif llm_complete is None:
-        _highlight_logger.info("[highlights_candidates] LLM semantic scoring skipped (no llm_complete function provided)")
+        msg = "[highlights_candidates] LLM semantic scoring skipped (no llm_complete function provided)"
+        if llm_strict:
+            raise RuntimeError("LLM strict mode enabled but llm_complete function is unavailable")
+        _highlight_logger.info(msg)
     elif not candidates:
         _highlight_logger.info("[highlights_candidates] LLM semantic scoring skipped (no candidates)")
     
@@ -2719,6 +2733,8 @@ def compute_highlights_candidates(
                 for i, cand in enumerate(candidates, start=1):
                     cand["rank"] = i
         except Exception as e:
+            if llm_strict:
+                raise RuntimeError(f"LLM semantic scoring failed in strict mode: {e}") from e
             _highlight_logger.warning(f"LLM semantic scoring failed: {e}")
     
     _report_progress(on_progress, 0.85, "Checking LLM quality filter")
@@ -2733,6 +2749,8 @@ def compute_highlights_candidates(
     if not llm_filter_enabled:
         _highlight_logger.info("[highlights_candidates] LLM quality filter disabled in config (llm_filter_enabled=false)")
     elif llm_complete is None:
+        if llm_strict:
+            raise RuntimeError("LLM strict mode enabled but llm_complete function is unavailable")
         _highlight_logger.info("[highlights_candidates] LLM quality filter skipped (no llm_complete function provided)")
     elif not candidates:
         _highlight_logger.info("[highlights_candidates] LLM quality filter skipped (no candidates)")
@@ -2762,6 +2780,8 @@ def compute_highlights_candidates(
                     f"[highlights_candidates] LLM filter: kept {llm_filter_stats.get('kept', 0)}/{llm_filter_stats.get('total_input', 0)} candidates"
                 )
         except Exception as e:
+            if llm_strict:
+                raise RuntimeError(f"LLM quality filter failed in strict mode: {e}") from e
             _highlight_logger.warning(f"LLM quality filter failed: {e}")
     elif llm_complete is None:
         _highlight_logger.info("[highlights_candidates] LLM quality filter skipped (no llm_complete function)")

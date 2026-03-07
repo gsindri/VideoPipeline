@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -11,8 +12,51 @@ import numpy as np
 from .utils import subprocess_flags as _subprocess_flags
 
 
+def _prepend_dir_to_path(dir_path: Path) -> None:
+    """Prepend a directory to PATH for current process if not already present."""
+    p = str(dir_path)
+    current = os.environ.get("PATH", "")
+    parts = [x for x in current.split(os.pathsep) if x] if current else []
+    if p in parts:
+        return
+    os.environ["PATH"] = p + (os.pathsep + current if current else "")
+
+
+def _windows_cmd_fallback_path(cmd: str) -> str | None:
+    """Best-effort Windows fallback discovery for ffmpeg/ffprobe executables.
+
+    Some launch contexts may not hydrate user PATH/FFMPEG_SHARED_BIN into the
+    process environment. We still want a known local install to work.
+    """
+    if os.name != "nt":
+        return None
+
+    exe_name = f"{cmd}.exe"
+    candidates: list[Path] = []
+
+    # Prefer explicit env var when present.
+    raw = os.environ.get("FFMPEG_SHARED_BIN", "")
+    if raw:
+        for entry in raw.split(os.pathsep):
+            entry = entry.strip().strip('"')
+            if entry:
+                candidates.append(Path(entry))
+
+    # Common install location used by this repo setup scripts.
+    candidates.append(Path(r"C:\Tools\ffmpeg-shared\bin"))
+
+    for directory in candidates:
+        exe = directory / exe_name
+        if exe.exists():
+            _prepend_dir_to_path(directory)
+            return str(exe)
+    return None
+
+
 def _require_cmd(cmd: str) -> str:
     path = shutil.which(cmd)
+    if not path:
+        path = _windows_cmd_fallback_path(cmd)
     if not path:
         raise RuntimeError(
             f"Required executable '{cmd}' not found in PATH. "
