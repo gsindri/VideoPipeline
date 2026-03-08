@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -20,6 +21,9 @@ from ..analysis_highlights import CONTENT_TYPE_GUIDANCE
 from ..ai.helpers import get_llm_complete_fn
 from ..ingest import IngestRequest, QualityCap, SpeedMode
 from ..ingest.ytdlp_runner import DownloadCancelled, download_url
+from ..publisher.accounts import AccountStore
+from ..publisher.jobs import PublishJobStore
+from ..publisher.secrets import load_tokens
 from ..project import (
     Project,
     create_project_early,
@@ -41,6 +45,7 @@ from .dag_config import (
     resolve_llm_mode as _resolve_llm_mode_raw,
 )
 from .jobs import JOB_MANAGER, with_prevent_sleep
+from .publisher_api import is_safe_export_path, scan_project_exports
 
 
 _PROJECT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -412,8 +417,16 @@ def _profile_readiness(profile: Dict[str, Any], *, profile_path: Optional[Path],
     }
 
 
-def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Path] = None) -> APIRouter:
+def create_actions_router(
+    *,
+    profile: Dict[str, Any],
+    profile_path: Optional[Path] = None,
+    account_store: Optional[AccountStore] = None,
+    job_store: Optional[PublishJobStore] = None,
+) -> APIRouter:
     router = APIRouter(prefix="/api/actions", tags=["actions"])
+    account_store = account_store or AccountStore()
+    job_store = job_store or PublishJobStore()
 
     _default_domains = {
         "twitch.tv",
@@ -664,6 +677,133 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                 "status": status,
             },
         )
+
+    def _publish_policy() -> Dict[str, Any]:
+        return {
+            "default_privacy": "private",
+            "allow_without_approval": ["private", "unlisted"],
+            "requires_explicit_approval_for": ["public", "scheduled_release"],
+        }
+
+    def _account_has_tokens(platform: str, account_id: str) -> bool:
+        try:
+            payload = load_tokens(platform, account_id)
+        except Exception:
+            return False
+        return bool(payload)
+
+    def _build_publish_accounts_payload() -> Dict[str, Any]:
+        accounts = []
+        ready_total = 0
+        for acct in account_store.list():
+            ready = _account_has_tokens(acct.platform, acct.id)
+            if ready:
+                ready_total += 1
+            item = acct.to_dict()
+            item["ready"] = ready
+            item["has_tokens"] = ready
+            accounts.append(item)
+        accounts.sort(key=lambda item: (str(item.get("platform") or ""), str(item.get("label") or "")))
+        return {
+            "accounts": accounts,
+            "summary": {
+                "accounts_total": len(accounts),
+                "ready_accounts": ready_total,
+            },
+            "policy": _publish_policy(),
+        }
+
+    def _build_publish_exports_payload(*, project_id: str) -> Dict[str, Any]:
+        pid = _validate_project_id(project_id)
+        proj, proj_data = _load_project(pid)
+        exports = scan_project_exports(proj.exports_dir)
+        items = []
+        for exp in exports:
+            item = exp.to_dict()
+            metadata = dict(exp.metadata or {})
+            item["privacy"] = str(metadata.get("privacy") or _publish_policy()["default_privacy"]).strip().lower() or "private"
+            item["publish_at"] = str(metadata.get("publish_at") or "").strip() or None
+            items.append(item)
+        return {
+            "meta": {
+                "project_id": pid,
+                "title": proj_data.get("title") or (proj_data.get("video", {}) or {}).get("title"),
+                "exports_dir": str(proj.exports_dir),
+            },
+            "exports": items,
+            "policy": _publish_policy(),
+        }
+
+    def _resolve_publish_metadata(*, export_id: str, base_metadata: Dict[str, Any], options: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = dict(base_metadata or {})
+        if options.get("title_override"):
+            metadata["title"] = str(options["title_override"]).strip()
+        if options.get("description_override"):
+            metadata["description"] = str(options["description_override"]).strip()
+        if options.get("privacy") is not None:
+            metadata["privacy"] = str(options.get("privacy") or "").strip().lower()
+        if options.get("publish_at") is not None:
+            publish_at = str(options.get("publish_at") or "").strip()
+            metadata["publish_at"] = publish_at or None
+        if options.get("hashtags_append"):
+            existing = str(metadata.get("description") or "").strip()
+            extra = str(options["hashtags_append"]).strip()
+            metadata["description"] = f"{existing}\n\n{extra}".strip() if existing else extra
+        if not str(metadata.get("title") or "").strip():
+            metadata["title"] = export_id
+        privacy = str(metadata.get("privacy") or _publish_policy()["default_privacy"]).strip().lower() or "private"
+        if privacy not in {"private", "unlisted", "public"}:
+            raise HTTPException(status_code=400, detail="invalid_publish_privacy")
+        metadata["privacy"] = privacy
+        publish_at = str(metadata.get("publish_at") or "").strip()
+        if not publish_at:
+            metadata.pop("publish_at", None)
+        return metadata
+
+    def _require_publish_approval(*, metadata: Dict[str, Any], approved: bool) -> None:
+        privacy = str(metadata.get("privacy") or _publish_policy()["default_privacy"]).strip().lower() or "private"
+        publish_at = str(metadata.get("publish_at") or "").strip()
+        if privacy != "public" and not publish_at:
+            return
+        if approved:
+            return
+        issues = []
+        if privacy == "public":
+            issues.append("privacy=public")
+        if publish_at:
+            issues.append("publish_at")
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "public_release_approval_required",
+                "issues": issues,
+                "policy": _publish_policy(),
+            },
+        )
+
+    def _filter_publish_jobs_for_project(*, project_id: str, limit: int) -> Dict[str, Any]:
+        pid = _validate_project_id(project_id)
+        proj, _proj_data = _load_project(pid)
+        exports_dir = proj.exports_dir.resolve()
+        jobs = []
+        scan_limit = max(limit, 200)
+        for job in job_store.list_jobs(limit=scan_limit):
+            try:
+                file_path = Path(job.file_path).resolve()
+            except Exception:
+                continue
+            try:
+                if not file_path.is_relative_to(exports_dir):
+                    continue
+            except Exception:
+                continue
+            jobs.append(job.to_dict())
+            if len(jobs) >= limit:
+                break
+        return {
+            "project_id": pid,
+            "jobs": jobs,
+        }
 
     def _rate_limit(request: Request) -> str:
         actor_key = _request_actor_key(request)
@@ -940,6 +1080,39 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                         "additionalProperties": True,
                     },
                     "DiagnosticsResponse": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": True,
+                    },
+                    "PublishAccountsResponse": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": True,
+                    },
+                    "PublishExportsResponse": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": True,
+                    },
+                    "PublishQueueRequest": {
+                        "type": "object",
+                        "properties": {
+                            "project_id": {"type": "string"},
+                            "account_ids": {"type": "array", "items": {"type": "string"}},
+                            "export_ids": {"type": "array", "items": {"type": "string"}},
+                            "options": {"type": "object", "additionalProperties": True},
+                            "public_release_approved": {"type": "boolean"},
+                            "client_request_id": {"type": "string"},
+                        },
+                        "required": ["project_id", "account_ids", "export_ids"],
+                        "additionalProperties": False,
+                    },
+                    "PublishQueueResponse": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": True,
+                    },
+                    "PublishJobsResponse": {
                         "type": "object",
                         "properties": {},
                         "additionalProperties": True,
@@ -1469,6 +1642,104 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                                 "description": "Recent projects",
                                 "content": {
                                     "application/json": {"schema": {"$ref": "#/components/schemas/ProjectsRecentResponse"}}
+                                },
+                            }
+                        },
+                    }
+                },
+                "/api/actions/publish/accounts": {
+                    "get": {
+                        "summary": "List publishing accounts and readiness",
+                        "operationId": "vp_actions_publish_accounts",
+                        "x-openai-isConsequential": False,
+                        "responses": {
+                            "200": {
+                                "description": "Publishing accounts",
+                                "content": {
+                                    "application/json": {"schema": {"$ref": "#/components/schemas/PublishAccountsResponse"}}
+                                },
+                            }
+                        },
+                    }
+                },
+                "/api/actions/publish/exports": {
+                    "get": {
+                        "summary": "List exports for a project that are ready to publish",
+                        "operationId": "vp_actions_publish_exports",
+                        "x-openai-isConsequential": False,
+                        "parameters": [
+                            {"name": "project_id", "in": "query", "required": True, "schema": {"type": "string"}},
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "Project exports",
+                                "content": {
+                                    "application/json": {"schema": {"$ref": "#/components/schemas/PublishExportsResponse"}}
+                                },
+                            }
+                        },
+                    }
+                },
+                "/api/actions/publish/queue": {
+                    "post": {
+                        "summary": "Queue publish jobs for selected exports/accounts",
+                        "operationId": "vp_actions_publish_queue",
+                        "x-openai-isConsequential": True,
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/PublishQueueRequest"},
+                                    "examples": {
+                                        "private_batch": {
+                                            "summary": "Queue safe private uploads",
+                                            "value": {
+                                                "project_id": "<project_id from export>",
+                                                "account_ids": ["<youtube_account_id>"],
+                                                "export_ids": ["clip_001", "clip_002"],
+                                                "options": {"privacy": "private"},
+                                                "client_request_id": "publish-001",
+                                            },
+                                        },
+                                        "public_release_approved": {
+                                            "summary": "Queue a public release with explicit approval",
+                                            "value": {
+                                                "project_id": "<project_id from export>",
+                                                "account_ids": ["<youtube_account_id>"],
+                                                "export_ids": ["clip_001"],
+                                                "options": {"privacy": "public"},
+                                                "public_release_approved": True,
+                                                "client_request_id": "publish-002",
+                                            },
+                                        },
+                                    },
+                                }
+                            },
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "Publish jobs created",
+                                "content": {
+                                    "application/json": {"schema": {"$ref": "#/components/schemas/PublishQueueResponse"}}
+                                },
+                            }
+                        },
+                    }
+                },
+                "/api/actions/publish/jobs": {
+                    "get": {
+                        "summary": "List publish jobs for a project",
+                        "operationId": "vp_actions_publish_jobs",
+                        "x-openai-isConsequential": False,
+                        "parameters": [
+                            {"name": "project_id", "in": "query", "required": True, "schema": {"type": "string"}},
+                            {"name": "limit", "in": "query", "required": False, "schema": {"type": "integer", "default": 50}},
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "Publish jobs",
+                                "content": {
+                                    "application/json": {"schema": {"$ref": "#/components/schemas/PublishJobsResponse"}}
                                 },
                             }
                         },
@@ -2709,6 +2980,116 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
             it.pop("_mtime", None)
             out.append(it)
         return JSONResponse({"projects": out})
+
+    @router.get("/publish/accounts", openapi_extra={"x-openai-isConsequential": False})
+    def publish_accounts(request: Request):
+        _rate_limit(request)
+        return JSONResponse(_build_publish_accounts_payload())
+
+    @router.get("/publish/exports", openapi_extra={"x-openai-isConsequential": False})
+    def publish_exports(request: Request, project_id: str):
+        _rate_limit(request)
+        return JSONResponse(_build_publish_exports_payload(project_id=project_id))
+
+    @router.post("/publish/queue", openapi_extra={"x-openai-isConsequential": True})
+    def publish_queue(request: Request, body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        actor_key = _rate_limit(request)
+
+        client_request_id = str(body.get("client_request_id") or "").strip()
+        existing = idem.get(actor_key, client_request_id)
+        if existing:
+            return JSONResponse(existing)
+
+        project_id = _validate_project_id(str(body.get("project_id") or ""))
+        options = body.get("options") or {}
+        if not isinstance(options, dict):
+            raise HTTPException(status_code=400, detail="invalid_publish_options")
+        public_release_approved = bool(body.get("public_release_approved", False))
+
+        account_ids = body.get("account_ids")
+        if account_ids is None and body.get("account_id"):
+            account_ids = [body.get("account_id")]
+        if not isinstance(account_ids, list) or not account_ids:
+            raise HTTPException(status_code=400, detail="account_ids_required")
+        account_ids = [str(aid or "").strip() for aid in account_ids if str(aid or "").strip()]
+        if not account_ids:
+            raise HTTPException(status_code=400, detail="account_ids_required")
+
+        export_ids = body.get("export_ids")
+        if export_ids is None and body.get("export_id"):
+            export_ids = [body.get("export_id")]
+        if not isinstance(export_ids, list) or not export_ids:
+            raise HTTPException(status_code=400, detail="export_ids_required")
+        export_ids = [str(eid or "").strip() for eid in export_ids if str(eid or "").strip()]
+        if not export_ids:
+            raise HTTPException(status_code=400, detail="export_ids_required")
+
+        proj, _proj_data = _load_project(project_id)
+        exports_dir = proj.exports_dir
+        export_map = {exp.export_id: exp for exp in scan_project_exports(exports_dir)}
+
+        accounts = []
+        for aid in account_ids:
+            account = account_store.get(aid)
+            if not account:
+                raise HTTPException(status_code=404, detail=f"account_not_found:{aid}")
+            if not _account_has_tokens(account.platform, account.id):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "account_not_ready", "account_id": account.id, "platform": account.platform},
+                )
+            accounts.append(account)
+
+        selected_exports = []
+        for eid in export_ids:
+            exp = export_map.get(eid)
+            if exp is None:
+                raise HTTPException(status_code=404, detail=f"export_not_found:{eid}")
+            if not is_safe_export_path(exp.mp4_path, exports_dir):
+                raise HTTPException(status_code=400, detail=f"invalid_export_path:{eid}")
+            selected_exports.append(exp)
+
+        created_jobs = []
+        for exp in selected_exports:
+            base_metadata = dict(exp.metadata or {})
+            metadata = _resolve_publish_metadata(export_id=exp.export_id, base_metadata=base_metadata, options=options)
+            _require_publish_approval(metadata=metadata, approved=public_release_approved)
+
+            for account in accounts:
+                job_metadata_path = exports_dir / f"{exp.export_id}_{uuid.uuid4().hex[:8]}_publish.json"
+                job_metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+                job = job_store.create_job(
+                    job_id=uuid.uuid4().hex,
+                    platform=account.platform,
+                    account_id=account.id,
+                    file_path=str(exp.mp4_path),
+                    metadata_path=str(job_metadata_path),
+                )
+                created_jobs.append(
+                    {
+                        "job_id": job.id,
+                        "export_id": exp.export_id,
+                        "account_id": account.id,
+                        "platform": account.platform,
+                        "privacy": metadata.get("privacy"),
+                        "publish_at": metadata.get("publish_at"),
+                    }
+                )
+
+        payload = {
+            "project_id": project_id,
+            "jobs": created_jobs,
+            "total": len(created_jobs),
+            "policy": _publish_policy(),
+        }
+        idem.set(actor_key, client_request_id, payload)
+        return JSONResponse(payload)
+
+    @router.get("/publish/jobs", openapi_extra={"x-openai-isConsequential": False})
+    def publish_jobs(request: Request, project_id: str, limit: int = 50):
+        _rate_limit(request)
+        limit = _clamp_int(limit, default=50, min_v=1, max_v=200)
+        return JSONResponse(_filter_publish_jobs_for_project(project_id=project_id, limit=limit))
 
     @router.post("/ingest_url", openapi_extra={"x-openai-isConsequential": True})
     def ingest_url(request: Request, body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
@@ -4979,6 +5360,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
         from ..chat.downloader import get_supported_platforms, get_twitch_downloader_info, is_chat_download_available
 
         backends = _diagnostics_transcription_backends()
+        publish_accounts = _build_publish_accounts_payload()
         return JSONResponse(
             {
                 "token_required": bool(os.environ.get("VP_API_TOKEN", "").strip()),
@@ -5001,6 +5383,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                     "default_mode": _profile_default_llm_mode(),
                     "profile_external_ai_requirements": _profile_external_ai_requirements(),
                 },
+                "publisher": publish_accounts,
                 "profile": _profile_readiness(profile, profile_path=profile_path, backends=backends),
                 "paths": {
                     "projects_root": str(default_projects_root()),

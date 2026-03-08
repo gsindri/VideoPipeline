@@ -34,13 +34,20 @@ def _make_client(tmp_path: Path, monkeypatch, *, token: str | None = None, profi
         monkeypatch.setenv("VP_API_TOKEN", token)
 
     projects_root = tmp_path / "outputs" / "projects"
+    publisher_state_root = tmp_path / "publisher_state"
+    accounts_json = publisher_state_root / "accounts.json"
+    publisher_db = publisher_state_root / "publisher.sqlite"
 
     import videopipeline.project as project_mod
+    import videopipeline.publisher.accounts as publisher_accounts_mod
+    import videopipeline.publisher.jobs as publisher_jobs_mod
     import videopipeline.studio.actions_api as actions_api
     from videopipeline.studio.app import create_app
 
     monkeypatch.setattr(project_mod, "default_projects_root", lambda: projects_root)
     monkeypatch.setattr(actions_api, "default_projects_root", lambda: projects_root)
+    monkeypatch.setattr(publisher_accounts_mod, "accounts_path", lambda: accounts_json)
+    monkeypatch.setattr(publisher_jobs_mod, "publisher_db_path", lambda: publisher_db)
 
     app = create_app(video_path=None, profile_path=profile_path)
     return TestClient(app)
@@ -205,6 +212,9 @@ analysis:
         "chapters": True,
         "director": True,
     }
+    assert data["publisher"]["summary"]["accounts_total"] == 0
+    assert data["publisher"]["summary"]["ready_accounts"] == 0
+    assert data["publisher"]["policy"]["default_privacy"] == "private"
     assert any("speech:" in issue for issue in data["profile"]["readiness"]["issues"])
     assert any("audio_events:" in issue for issue in data["profile"]["readiness"]["issues"])
 
@@ -416,6 +426,19 @@ def test_actions_openapi_includes_job_wait_endpoint(tmp_path, monkeypatch):
     assert "/api/actions/jobs/{job_id}/wait" in paths
 
 
+def test_actions_openapi_publish_queue_is_consequential(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    r = client.get("/api/actions/openapi.json", headers=hdr)
+    assert r.status_code == 200
+    spec = r.json()
+    paths = spec.get("paths") or {}
+    op = (((paths.get("/api/actions/publish/queue") or {}).get("post")) or {})
+    assert op.get("x-openai-isConsequential") is True
+    client.close()
+
+
 def test_actions_runs_last_returns_after_creating_run(tmp_path, monkeypatch):
     client = _make_client(tmp_path, monkeypatch, token="secret")
     hdr = {"Authorization": "Bearer secret"}
@@ -538,6 +561,205 @@ def test_actions_analyze_full_external_llm_skips_local_llm(tmp_path, monkeypatch
     assert job is not None
     assert job.status == "succeeded"
     assert called["n"] == 0
+
+
+def test_actions_publish_accounts_reports_readiness(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    from videopipeline.publisher.accounts import AccountStore
+    import videopipeline.studio.actions_api as actions_api
+
+    store = AccountStore()
+    ready = store.add(platform="youtube", label="Ready Channel")
+    missing = store.add(platform="youtube", label="Missing Tokens")
+
+    monkeypatch.setattr(
+        actions_api,
+        "load_tokens",
+        lambda platform, account_id: {"access_token": "token"} if account_id == ready.id else None,
+    )
+
+    r = client.get("/api/actions/publish/accounts", headers=hdr)
+    assert r.status_code == 200
+    data = r.json()
+    accounts = {item["id"]: item for item in data["accounts"]}
+    assert accounts[ready.id]["ready"] is True
+    assert accounts[missing.id]["ready"] is False
+    assert data["summary"]["accounts_total"] == 2
+    assert data["summary"]["ready_accounts"] == 1
+    assert data["policy"]["default_privacy"] == "private"
+    client.close()
+
+
+def test_actions_publish_exports_lists_project_exports(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    pid = hashlib.sha256("twitch_publish_exports".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "video").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "exports").mkdir(parents=True, exist_ok=True)
+    video_path = proj_dir / "video" / "video.mp4"
+    video_path.write_bytes(b"")
+    (proj_dir / "project.json").write_text(
+        json.dumps(
+            {
+                "project_id": pid,
+                "created_at": "now",
+                "video": {"path": str(video_path), "duration_seconds": 90.0},
+                "analysis": {"highlights": {"candidates": []}},
+                "layout": {},
+                "selections": [],
+                "exports": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (proj_dir / "exports" / "clip1.mp4").write_bytes(b"fake video")
+    (proj_dir / "exports" / "clip1.json").write_text(
+        json.dumps({"title": "Clip 1", "description": "desc", "privacy": "unlisted"}),
+        encoding="utf-8",
+    )
+
+    r = client.get(f"/api/actions/publish/exports?project_id={pid}", headers=hdr)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["meta"]["project_id"] == pid
+    assert len(data["exports"]) == 1
+    assert data["exports"][0]["export_id"] == "clip1"
+    assert data["exports"][0]["privacy"] == "unlisted"
+    client.close()
+
+
+@pytest.mark.parametrize(
+    ("options", "expected_issue"),
+    [
+        ({"privacy": "public"}, "privacy=public"),
+        ({"publish_at": "2026-03-10T12:00:00Z"}, "publish_at"),
+    ],
+)
+def test_actions_publish_queue_requires_public_release_approval(tmp_path, monkeypatch, options, expected_issue):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    from videopipeline.publisher.accounts import AccountStore
+    import videopipeline.studio.actions_api as actions_api
+
+    store = AccountStore()
+    account = store.add(platform="youtube", label="Main Channel")
+    monkeypatch.setattr(actions_api, "load_tokens", lambda platform, account_id: {"access_token": "token"})
+
+    pid = hashlib.sha256("twitch_publish_approval".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "video").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "exports").mkdir(parents=True, exist_ok=True)
+    video_path = proj_dir / "video" / "video.mp4"
+    video_path.write_bytes(b"")
+    (proj_dir / "project.json").write_text(
+        json.dumps(
+            {
+                "project_id": pid,
+                "created_at": "now",
+                "video": {"path": str(video_path), "duration_seconds": 90.0},
+                "analysis": {"highlights": {"candidates": []}},
+                "layout": {},
+                "selections": [],
+                "exports": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (proj_dir / "exports" / "clip1.mp4").write_bytes(b"fake video")
+    (proj_dir / "exports" / "clip1.json").write_text(json.dumps({"title": "Clip 1"}), encoding="utf-8")
+
+    r = client.post(
+        "/api/actions/publish/queue",
+        headers=hdr,
+        json={
+            "project_id": pid,
+            "account_ids": [account.id],
+            "export_ids": ["clip1"],
+            "options": options,
+            "client_request_id": f"publish-approval-{expected_issue}",
+        },
+    )
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "public_release_approval_required"
+    assert expected_issue in detail["issues"]
+    client.close()
+
+
+def test_actions_publish_queue_creates_jobs_and_lists_them(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    from videopipeline.publisher.accounts import AccountStore
+    from videopipeline.publisher.jobs import PublishJobStore
+    import videopipeline.studio.actions_api as actions_api
+
+    store = AccountStore()
+    account = store.add(platform="youtube", label="Main Channel")
+    monkeypatch.setattr(actions_api, "load_tokens", lambda platform, account_id: {"access_token": "token"})
+
+    pid = hashlib.sha256("twitch_publish_queue".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "video").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "exports").mkdir(parents=True, exist_ok=True)
+    video_path = proj_dir / "video" / "video.mp4"
+    video_path.write_bytes(b"")
+    (proj_dir / "project.json").write_text(
+        json.dumps(
+            {
+                "project_id": pid,
+                "created_at": "now",
+                "video": {"path": str(video_path), "duration_seconds": 90.0},
+                "analysis": {"highlights": {"candidates": []}},
+                "layout": {},
+                "selections": [],
+                "exports": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (proj_dir / "exports" / "clip1.mp4").write_bytes(b"fake video")
+    (proj_dir / "exports" / "clip1.json").write_text(
+        json.dumps({"title": "Clip 1", "description": "desc"}),
+        encoding="utf-8",
+    )
+
+    r = client.post(
+        "/api/actions/publish/queue",
+        headers=hdr,
+        json={
+            "project_id": pid,
+            "account_ids": [account.id],
+            "export_ids": ["clip1"],
+            "options": {"privacy": "unlisted"},
+            "client_request_id": "publish-queue-1",
+        },
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["project_id"] == pid
+    assert data["total"] == 1
+    assert data["jobs"][0]["privacy"] == "unlisted"
+
+    job_id = data["jobs"][0]["job_id"]
+    job = PublishJobStore().get_job(job_id)
+    assert job.status == "queued"
+    assert job.account_id == account.id
+
+    jobs_r = client.get(f"/api/actions/publish/jobs?project_id={pid}&limit=10", headers=hdr)
+    assert jobs_r.status_code == 200
+    jobs_data = jobs_r.json()
+    assert jobs_data["project_id"] == pid
+    assert any(item["id"] == job_id for item in jobs_data["jobs"])
+    client.close()
 
 
 def test_actions_ai_bundle_reports_external_status(tmp_path, monkeypatch):
