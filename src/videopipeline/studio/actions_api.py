@@ -37,6 +37,8 @@ from .dag_config import (
     llm_mode_is_strict_external,
     llm_mode_uses_local,
     normalize_llm_mode as _normalize_llm_mode_raw,
+    profile_default_llm_mode as _profile_default_llm_mode_raw,
+    resolve_llm_mode as _resolve_llm_mode_raw,
 )
 from .jobs import JOB_MANAGER, with_prevent_sleep
 
@@ -457,6 +459,18 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
         except ValueError:
             raise HTTPException(status_code=400, detail="invalid_llm_mode")
 
+    def _profile_default_llm_mode() -> str:
+        try:
+            return _profile_default_llm_mode_raw(profile)
+        except ValueError:
+            raise HTTPException(status_code=500, detail="invalid_profile_default_llm_mode")
+
+    def _resolve_llm_mode(value: Any) -> str:
+        try:
+            return _resolve_llm_mode_raw(value, profile=profile)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid_llm_mode")
+
     _LLM_MODE_ENUM = ["local", "external", "external_strict"]
     _EXTERNAL_AI_SOURCES = {"chatgpt_actions", "external_ai", "gondull"}
 
@@ -729,8 +743,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                             "llm_mode": {
                                 "type": "string",
                                 "enum": list(_LLM_MODE_ENUM),
-                                "default": "local",
-                                "description": "LLM mode for analysis: local uses in-app AI, external skips in-app AI, external_strict skips in-app AI and requires external AI completion before export.",
+                                "description": "LLM mode for analysis: local uses in-app AI, external skips in-app AI, external_strict skips in-app AI and requires external AI completion before export. If omitted, the active profile default is used (local when unspecified).",
                             },
                             "client_request_id": {"type": "string"},
                         },
@@ -780,8 +793,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                             "llm_mode": {
                                 "type": "string",
                                 "enum": list(_LLM_MODE_ENUM),
-                                "default": "local",
-                                "description": "LLM mode for analysis: local uses in-app AI, external skips in-app AI, external_strict skips in-app AI and requires the external AI checkpoint before export.",
+                                "description": "LLM mode for analysis: local uses in-app AI, external skips in-app AI, external_strict skips in-app AI and requires the external AI checkpoint before export. If omitted, the active profile default is used (local when unspecified).",
                             },
                             "client_request_id": {"type": "string"},
                         },
@@ -811,8 +823,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                             "llm_mode": {
                                 "type": "string",
                                 "enum": list(_LLM_MODE_ENUM),
-                                "default": "local",
-                                "description": "LLM mode for unattended runs: local uses in-app AI, external skips in-app AI, external_strict rejects unattended export so external AI must checkpoint first.",
+                                "description": "LLM mode for unattended runs: local uses in-app AI, external skips in-app AI, external_strict rejects unattended export so external AI must checkpoint first. If omitted, the active profile default is used (local when unspecified).",
                             },
                             "client_request_id": {"type": "string"},
                         },
@@ -1070,7 +1081,11 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                         "properties": {
                             "project_id": {"type": "string"},
                             "limit": {"type": "integer"},
-                            "llm_mode": {"type": "string", "enum": list(_LLM_MODE_ENUM), "default": "local"},
+                            "llm_mode": {
+                                "type": "string",
+                                "enum": list(_LLM_MODE_ENUM),
+                                "description": "If omitted, the active profile default is used (local when unspecified).",
+                            },
                             "export": {"type": "object", "additionalProperties": True},
                             "captions": {"type": "object", "additionalProperties": True},
                             "hook_text": {"type": "object", "additionalProperties": True},
@@ -2475,7 +2490,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
         analyze_overrides = body.get("analyze_overrides") or body.get("overrides") or {}
         if analyze_overrides and not isinstance(analyze_overrides, dict):
             raise HTTPException(status_code=400, detail="invalid_analyze_overrides")
-        llm_mode = _normalize_llm_mode(body.get("llm_mode"))
+        llm_mode = _resolve_llm_mode(body.get("llm_mode"))
 
         content_id = _extract_content_id(url)
         proj = create_project_early(content_id, source_url=url)
@@ -2508,7 +2523,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
         analyze_overrides = body.get("analyze_overrides") or body.get("overrides") or {}
         if analyze_overrides and not isinstance(analyze_overrides, dict):
             raise HTTPException(status_code=400, detail="invalid_analyze_overrides")
-        llm_mode = _normalize_llm_mode(body.get("llm_mode"))
+        llm_mode = _resolve_llm_mode(body.get("llm_mode"))
 
         top_n = _clamp_int(body.get("top"), default=5, min_v=1, max_v=30)
 
@@ -2559,7 +2574,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
         analyze_overrides = body.get("analyze_overrides") or body.get("overrides") or {}
         if analyze_overrides and not isinstance(analyze_overrides, dict):
             raise HTTPException(status_code=400, detail="invalid_analyze_overrides")
-        llm_mode = _normalize_llm_mode(body.get("llm_mode"))
+        llm_mode = _resolve_llm_mode(body.get("llm_mode"))
 
         top_n = _clamp_int(body.get("top"), default=5, min_v=1, max_v=30)
 
@@ -2864,7 +2879,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
 
         project_id = _validate_project_id(str(body.get("project_id") or ""))
         overrides = body.get("overrides") or {}
-        llm_mode = _normalize_llm_mode(body.get("llm_mode"))
+        llm_mode = _resolve_llm_mode(body.get("llm_mode"))
 
         proj, _proj_data = _load_project(project_id)
         if not Path(proj.video_path).exists():
@@ -4548,7 +4563,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
 
         project_id = _validate_project_id(str(body.get("project_id") or ""))
         limit = _clamp_int(body.get("limit"), default=5, min_v=1, max_v=30)
-        llm_mode = _normalize_llm_mode(body.get("llm_mode"))
+        llm_mode = _resolve_llm_mode(body.get("llm_mode"))
 
         proj, proj_data = _load_project(project_id)
         if not Path(proj.video_path).exists():
@@ -4983,6 +4998,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                     "supported_modes": list(_LLM_MODE_ENUM),
                     "aliases": {"gondull": "external_strict"},
                     "preferred_mode": "external_strict",
+                    "default_mode": _profile_default_llm_mode(),
                     "profile_external_ai_requirements": _profile_external_ai_requirements(),
                 },
                 "profile": _profile_readiness(profile, profile_path=profile_path, backends=backends),

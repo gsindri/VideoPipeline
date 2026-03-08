@@ -60,6 +60,8 @@ function getLlmModeStorageKey() {
 }
 
 function getDefaultLlmMode() {
+  const explicit = profile?.studio?.default_llm_mode ?? profile?.ai?.default_llm_mode;
+  if (explicit != null && String(explicit).trim()) return normalizeLlmMode(explicit);
   const engine = String(profile?.ai?.director?.engine || '').trim().toLowerCase();
   // OpenAI API profile should default to in-app mode (uses hosted API, not local llama).
   if (engine === 'openai_api') return 'local';

@@ -199,3 +199,6 @@ context:
   silence_noise_db: -30.0
   silence_min_duration: 0.3
   max_sentence_words: 30
+
+studio:
+  default_llm_mode: external_strict

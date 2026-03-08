@@ -56,7 +56,7 @@ from .dag_config import (
     dag_config_needs_llm,
     llm_mode_is_external,
     llm_mode_uses_local,
-    normalize_llm_mode,
+    resolve_llm_mode,
 )
 from ..ingest import (
     IngestRequest,
@@ -1676,10 +1676,8 @@ def create_app(
 
         opts = body.get("options") or {}
         auto_open = bool(body.get("auto_open", True))
-        llm_mode_raw = str(body.get("llm_mode") or "").strip().lower()
-        llm_mode = "local" if llm_mode_raw == "" else llm_mode_raw
         try:
-            llm_mode = normalize_llm_mode(llm_mode)
+            llm_mode = resolve_llm_mode(body.get("llm_mode"), profile=ctx.profile)
         except ValueError:
             raise HTTPException(status_code=400, detail="invalid_llm_mode")
 
@@ -6080,10 +6078,8 @@ def create_app(
 
         # Get source URL from body or project
         source_url = str(body.get("source_url") or "").strip()
-        llm_mode_raw = str(body.get("llm_mode") or "").strip().lower()
-        llm_mode = "local" if llm_mode_raw == "" else llm_mode_raw
         try:
-            llm_mode = normalize_llm_mode(llm_mode)
+            llm_mode = resolve_llm_mode(body.get("llm_mode"), profile=ctx.profile)
         except ValueError:
             raise HTTPException(status_code=400, detail="invalid_llm_mode")
         if not source_url:

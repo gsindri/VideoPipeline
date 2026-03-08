@@ -134,6 +134,8 @@ def test_actions_diagnostics_reports_profile_readiness(tmp_path, monkeypatch):
     profile_path = tmp_path / "gaming_nvidia.yaml"
     profile_path.write_text(
         """
+studio:
+  default_llm_mode: external_strict
 analysis:
   fail_fast: true
   speech:
@@ -197,6 +199,7 @@ analysis:
     assert data["llm"]["supported_modes"] == ["local", "external", "external_strict"]
     assert data["llm"]["aliases"]["gondull"] == "external_strict"
     assert data["llm"]["preferred_mode"] == "external_strict"
+    assert data["llm"]["default_mode"] == "external_strict"
     assert data["llm"]["profile_external_ai_requirements"] == {
         "semantic": True,
         "chapters": True,
@@ -1244,6 +1247,32 @@ def test_actions_run_full_export_top_external_strict_requires_checkpoint(tmp_pat
             "top": 1,
             "llm_mode": "external_strict",
             "client_request_id": f"strict-checkpoint-{path.rsplit('/', 1)[-1]}",
+        },
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"] == "external_strict_requires_ai_checkpoint"
+
+
+@pytest.mark.parametrize("path", ["/api/actions/run_full_export_top", "/api/actions/run_full_export_top_unattended"])
+def test_actions_run_full_export_top_uses_profile_default_llm_mode(tmp_path, monkeypatch, path):
+    profile_path = tmp_path / "strict_default.yaml"
+    profile_path.write_text(
+        """
+studio:
+  default_llm_mode: external_strict
+""".strip(),
+        encoding="utf-8",
+    )
+    client = _make_client(tmp_path, monkeypatch, token="secret", profile_path=profile_path)
+    hdr = {"Authorization": "Bearer secret"}
+
+    r = client.post(
+        path,
+        headers=hdr,
+        json={
+            "url": "https://www.twitch.tv/videos/123456789",
+            "top": 1,
+            "client_request_id": f"profile-default-{path.rsplit('/', 1)[-1]}",
         },
     )
     assert r.status_code == 409

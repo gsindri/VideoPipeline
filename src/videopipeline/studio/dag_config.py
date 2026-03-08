@@ -13,6 +13,45 @@ def normalize_llm_mode(value: Any) -> str:
     return mode
 
 
+def profile_default_llm_mode(
+    profile: Optional[Mapping[str, Any]],
+    *,
+    fallback: str = "local",
+) -> str:
+    """Return the default llm_mode configured by the active profile."""
+    fallback_mode = normalize_llm_mode(fallback)
+    if not isinstance(profile, Mapping):
+        return fallback_mode
+
+    studio_cfg = profile.get("studio", {}) or {}
+    if isinstance(studio_cfg, Mapping):
+        raw = studio_cfg.get("default_llm_mode")
+        if raw is not None and str(raw).strip():
+            return normalize_llm_mode(raw)
+
+    ai_cfg = profile.get("ai", {}) or {}
+    if isinstance(ai_cfg, Mapping):
+        raw = ai_cfg.get("default_llm_mode")
+        if raw is not None and str(raw).strip():
+            return normalize_llm_mode(raw)
+
+    return fallback_mode
+
+
+def resolve_llm_mode(
+    value: Any,
+    *,
+    profile: Optional[Mapping[str, Any]] = None,
+    fallback: str = "local",
+) -> str:
+    """Resolve llm_mode from request input, falling back to profile defaults."""
+    if value is None:
+        return profile_default_llm_mode(profile, fallback=fallback)
+    if isinstance(value, str) and not value.strip():
+        return profile_default_llm_mode(profile, fallback=fallback)
+    return normalize_llm_mode(value)
+
+
 def llm_mode_uses_local(value: Any) -> bool:
     """Return True when the selected mode is allowed to invoke in-app LLMs."""
     return normalize_llm_mode(value) == "local"
