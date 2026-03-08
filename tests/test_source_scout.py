@@ -110,3 +110,46 @@ def test_fetch_source_entries_twitch_helix_by_login(monkeypatch):
     assert entries[0]["channel_name"] == "Ludwig"
     assert entries[0]["duration_seconds"] == 8392.0
     assert entries[0]["platform"] == "twitch"
+
+
+def test_build_source_profile_separates_metrics_and_judgments():
+    profile = source_scout_mod.build_source_profile(
+        {
+            "id": "ludwig-twitch",
+            "priority": 5,
+            "profile": {
+                "category": "anchor",
+                "clip_density_rating": 4,
+                "style_fit_rating": 5,
+                "saturation_rating": 4,
+                "rights_risk_rating": 3,
+                "rated_by": "sindri",
+                "rated_at": "2026-03-08",
+                "notes": "High reach and strong fit, but already saturated.",
+            },
+        },
+        {
+            "source_stats": {
+                "ludwig-twitch": {
+                    "project_count": 4,
+                    "projects_with_candidates": 4,
+                    "projects_with_director_picks": 3,
+                    "projects_with_exports": 2,
+                }
+            }
+        },
+    )
+
+    assert profile["category"] == "anchor"
+    assert profile["metrics"]["project_count"] == 4
+    assert profile["metrics"]["candidate_hit_rate"] == 1.0
+    assert profile["metrics"]["director_pick_rate"] == 0.75
+    assert profile["metrics"]["export_success_rate"] == 0.5
+    assert profile["judgments"]["clip_density_rating"] == 4
+    assert profile["judgments"]["style_fit_rating"] == 5
+    assert profile["judgments"]["saturation_rating"] == 4
+    assert profile["judgments"]["rights_risk_rating"] == 3
+    assert profile["judgments"]["rated_by"] == "sindri"
+    assert profile["judgments"]["notes"] == "High reach and strong fit, but already saturated."
+    assert profile["recommendation"]["band"] in {"medium", "high"}
+    assert any("clip density rated 4/5" in reason for reason in profile["recommendation"]["reasons"])

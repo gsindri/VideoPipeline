@@ -560,12 +560,170 @@ def build_project_history(projects_root: Optional[Path] = None) -> Dict[str, Any
     }
 
 
+def _safe_rating(value: Any) -> Optional[int]:
+    try:
+        rating = int(value)
+    except Exception:
+        return None
+    if rating < 1 or rating > 5:
+        return None
+    return rating
+
+
+def _weighted_average(parts: list[tuple[Optional[float], float]]) -> Optional[float]:
+    total_weight = 0.0
+    total_value = 0.0
+    for value, weight in parts:
+        if value is None or weight <= 0:
+            continue
+        total_weight += float(weight)
+        total_value += float(value) * float(weight)
+    if total_weight <= 0:
+        return None
+    return total_value / total_weight
+
+
+def _positive_rating_score(rating: Optional[int]) -> Optional[float]:
+    if rating is None:
+        return None
+    return (float(rating) - 1.0) / 4.0
+
+
+def _inverse_rating_score(rating: Optional[int]) -> Optional[float]:
+    if rating is None:
+        return None
+    return (5.0 - float(rating)) / 4.0
+
+
+def _source_profile_input(source: Dict[str, Any]) -> Dict[str, Any]:
+    profile = source.get("profile") or {}
+    if not isinstance(profile, dict):
+        profile = {}
+    judgments = profile.get("judgments") or {}
+    if isinstance(judgments, dict):
+        merged = dict(profile)
+        for key, value in judgments.items():
+            merged.setdefault(key, value)
+        return merged
+    return dict(profile)
+
+
+def build_source_profile(source: Dict[str, Any], history: Dict[str, Any]) -> Dict[str, Any]:
+    source_id = str(source.get("id") or "").strip()
+    source_stats = ((history.get("source_stats") or {}).get(source_id) or {}) if source_id else {}
+    projects = _safe_int(source_stats.get("project_count"), 0)
+    candidate_projects = _safe_int(source_stats.get("projects_with_candidates"), 0)
+    director_projects = _safe_int(source_stats.get("projects_with_director_picks"), 0)
+    export_projects = _safe_int(source_stats.get("projects_with_exports"), 0)
+
+    candidate_rate = (candidate_projects / projects) if projects else None
+    director_rate = (director_projects / projects) if projects else None
+    export_rate = (export_projects / projects) if projects else None
+    objective_score = _weighted_average(
+        [
+            (candidate_rate, 0.35),
+            (director_rate, 0.35),
+            (export_rate, 0.30),
+        ]
+    )
+    confidence = min(1.0, (projects / 6.0)) if projects else 0.0
+
+    profile_cfg = _source_profile_input(source)
+    clip_density_rating = _safe_rating(profile_cfg.get("clip_density_rating"))
+    style_fit_rating = _safe_rating(profile_cfg.get("style_fit_rating"))
+    saturation_rating = _safe_rating(profile_cfg.get("saturation_rating"))
+    rights_risk_rating = _safe_rating(profile_cfg.get("rights_risk_rating"))
+    judgment_score = _weighted_average(
+        [
+            (_positive_rating_score(clip_density_rating), 0.35),
+            (_positive_rating_score(style_fit_rating), 0.25),
+            (_inverse_rating_score(saturation_rating), 0.20),
+            (_inverse_rating_score(rights_risk_rating), 0.20),
+        ]
+    )
+    composite_signal = _weighted_average(
+        [
+            (objective_score, 0.55),
+            (judgment_score, 0.45),
+        ]
+    )
+
+    band = "unscored"
+    if rights_risk_rating is not None and rights_risk_rating >= 5:
+        band = "blocked"
+    elif composite_signal is not None:
+        if composite_signal >= 0.75:
+            band = "high"
+        elif composite_signal >= 0.55:
+            band = "medium"
+        else:
+            band = "low"
+        if rights_risk_rating is not None and rights_risk_rating >= 4 and band == "high":
+            band = "medium"
+        if saturation_rating is not None and saturation_rating >= 5 and band == "high":
+            band = "medium"
+
+    reasons: list[str] = []
+    if objective_score is not None:
+        reasons.append(f"history objective_score={objective_score:.2f}")
+    else:
+        reasons.append("history objective_score unavailable")
+    if projects:
+        reasons.append(f"history confidence={confidence:.2f} from {projects} project(s)")
+    if export_rate is not None:
+        reasons.append(f"export success rate={export_rate:.2f}")
+    if clip_density_rating is not None:
+        reasons.append(f"clip density rated {clip_density_rating}/5")
+    if style_fit_rating is not None:
+        reasons.append(f"style fit rated {style_fit_rating}/5")
+    if saturation_rating is not None:
+        reasons.append(f"saturation rated {saturation_rating}/5")
+    if rights_risk_rating is not None:
+        reasons.append(f"rights risk rated {rights_risk_rating}/5")
+    if rights_risk_rating is not None and rights_risk_rating >= 4:
+        reasons.append("higher rights risk requires extra caution")
+    if saturation_rating is not None and saturation_rating >= 4:
+        reasons.append("high saturation means stronger competition")
+
+    return {
+        "category": str(profile_cfg.get("category") or "").strip() or None,
+        "metrics": {
+            "project_count": projects,
+            "projects_with_candidates": candidate_projects,
+            "projects_with_director_picks": director_projects,
+            "projects_with_exports": export_projects,
+            "candidate_hit_rate": round(candidate_rate, 4) if candidate_rate is not None else None,
+            "director_pick_rate": round(director_rate, 4) if director_rate is not None else None,
+            "export_success_rate": round(export_rate, 4) if export_rate is not None else None,
+            "objective_score": round(objective_score, 4) if objective_score is not None else None,
+            "confidence": round(confidence, 4),
+        },
+        "judgments": {
+            "operator_priority": _safe_float(source.get("priority"), 1.0),
+            "clip_density_rating": clip_density_rating,
+            "style_fit_rating": style_fit_rating,
+            "saturation_rating": saturation_rating,
+            "rights_risk_rating": rights_risk_rating,
+            "judgment_score": round(judgment_score, 4) if judgment_score is not None else None,
+            "rated_by": str(profile_cfg.get("rated_by") or "").strip() or None,
+            "rated_at": str(profile_cfg.get("rated_at") or "").strip() or None,
+            "notes": str(profile_cfg.get("notes") or "").strip() or None,
+        },
+        "recommendation": {
+            "band": band,
+            "composite_signal": round(composite_signal, 4) if composite_signal is not None else None,
+            "reasons": reasons,
+        },
+    }
+
+
 def _score_candidate(
     *,
     source: Dict[str, Any],
     entry: Dict[str, Any],
     history: Dict[str, Any],
     now_ts: float,
+    source_profile: Optional[Dict[str, Any]] = None,
 ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     url = _normalize_url(str(entry.get("url") or ""))
     if not url:
@@ -626,7 +784,14 @@ def _score_candidate(
     history_score = 0.5
     source_id = str(source.get("id") or "").strip()
     source_stats = ((history.get("source_stats") or {}).get(source_id) or {}) if source_id else {}
-    if source_stats:
+    profile_metrics = ((source_profile or {}).get("metrics") or {}) if isinstance(source_profile, dict) else {}
+    profile_recommendation = (
+        ((source_profile or {}).get("recommendation") or {}) if isinstance(source_profile, dict) else {}
+    )
+    objective_score = profile_metrics.get("objective_score")
+    if objective_score is not None:
+        history_score = max(0.0, min(1.0, _safe_float(objective_score, 0.5)))
+    elif source_stats:
         projects = max(1, _safe_int(source_stats.get("project_count"), 1))
         history_score = min(
             1.0,
@@ -655,6 +820,19 @@ def _score_candidate(
         reasons.append(f"title matched preferred words: {', '.join(include_matches)}")
     if age_hours is not None:
         reasons.append(f"age_hours={age_hours:.1f}")
+    band = str(profile_recommendation.get("band") or "").strip()
+    if band and band != "unscored":
+        reasons.append(f"source profile band={band}")
+    judgments = ((source_profile or {}).get("judgments") or {}) if isinstance(source_profile, dict) else {}
+    clip_density_rating = judgments.get("clip_density_rating")
+    if clip_density_rating is not None:
+        reasons.append(f"clip density rating={clip_density_rating}/5")
+    saturation_rating = judgments.get("saturation_rating")
+    if saturation_rating is not None:
+        reasons.append(f"saturation rating={saturation_rating}/5")
+    rights_risk_rating = judgments.get("rights_risk_rating")
+    if rights_risk_rating is not None:
+        reasons.append(f"rights risk rating={rights_risk_rating}/5")
 
     return (
         {
@@ -682,6 +860,7 @@ def _score_candidate(
                 "projects_with_director_picks": _safe_int(source_stats.get("projects_with_director_picks"), 0),
                 "projects_with_exports": _safe_int(source_stats.get("projects_with_exports"), 0),
             },
+            "source_profile": source_profile,
         },
         None,
     )
@@ -707,6 +886,12 @@ def build_source_scout_report(
     enabled_sources = [
         item for item in (watchlist.get("sources") or []) if bool(item.get("enabled", True))
     ]
+    source_profiles: Dict[str, Dict[str, Any]] = {}
+    for source in enabled_sources:
+        source_id = str(source.get("id") or "").strip()
+        if not source_id:
+            continue
+        source_profiles[source_id] = build_source_profile(source, history)
 
     source_reports: list[Dict[str, Any]] = []
     candidates: list[Dict[str, Any]] = []
@@ -798,6 +983,7 @@ def build_source_scout_report(
             "tags": [str(item).strip() for item in list(source.get("tags") or []) if str(item).strip()],
             "status": "ok",
             "error": None,
+            "profile": source_profiles.get(source_id) if source_id else None,
         }
         try:
             raw_entries = fetch_entries_fn(source, limit=source_limit)
@@ -814,6 +1000,7 @@ def build_source_scout_report(
                 entry=entry,
                 history=history,
                 now_ts=now_ts,
+                source_profile=source_profiles.get(source_id) if source_id else None,
             )
             if candidate is None:
                 if skip_reason:
@@ -863,6 +1050,19 @@ def build_source_scout_report(
                 "title cues",
                 "source hit history",
             ],
+            "source_profile_model": {
+                "objective_metrics": [
+                    "candidate_hit_rate",
+                    "director_pick_rate",
+                    "export_success_rate",
+                ],
+                "manual_judgments": [
+                    "clip_density_rating",
+                    "style_fit_rating",
+                    "saturation_rating",
+                    "rights_risk_rating",
+                ],
+            },
             "dedupe": {
                 "processed_url_count": len(history.get("processed_urls") or set()),
                 "processed_content_count": len(history.get("processed_content_keys") or set()),

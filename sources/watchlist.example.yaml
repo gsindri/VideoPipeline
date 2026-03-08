@@ -23,6 +23,15 @@ sources:
       - rerun
       - test
       - archive
+    profile:
+      category: opportunity
+      clip_density_rating: 4
+      style_fit_rating: 4
+      saturation_rating: 2
+      rights_risk_rating: 3
+      rated_by: sindri
+      rated_at: 2026-03-08
+      notes: Strong clip density, moderate legal/saturation caution.
     tags:
       - gaming
       - twitch
@@ -46,5 +55,14 @@ sources:
     title_exclude_any:
       - shorts
       - stream archive
+    profile:
+      category: anchor
+      clip_density_rating: 3
+      style_fit_rating: 4
+      saturation_rating: 4
+      rights_risk_rating: 3
+      rated_by: sindri
+      rated_at: 2026-03-08
+      notes: High reach but more saturated than the twitch lane.
     tags:
       - gaming

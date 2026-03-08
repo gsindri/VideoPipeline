@@ -341,6 +341,15 @@ sources:
     max_duration_s: 14400
     title_include_any: [challenge, insane]
     title_exclude_any: [rerun]
+    profile:
+      category: opportunity
+      clip_density_rating: 4
+      style_fit_rating: 5
+      saturation_rating: 2
+      rights_risk_rating: 3
+      rated_by: sindri
+      rated_at: 2026-03-08
+      notes: Strong fit with moderate competition.
 """.strip(),
         encoding="utf-8",
     )
@@ -417,6 +426,9 @@ sources:
     assert data["recommended"]["url"] == "https://www.twitch.tv/videos/222"
     assert data["recommended"]["source_id"] == "rebbi-twitch"
     assert data["recommended"]["history"]["source_project_count"] == 1
+    assert data["recommended"]["source_profile"]["category"] == "opportunity"
+    assert data["recommended"]["source_profile"]["judgments"]["clip_density_rating"] == 4
+    assert data["sources"][0]["profile"]["recommendation"]["band"] in {"medium", "high"}
     assert data["skipped"]["already_processed"] == 1
     assert data["skipped"]["title_excluded"] == 1
 
