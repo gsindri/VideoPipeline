@@ -828,9 +828,188 @@ def test_actions_ai_bundle_reports_external_status(tmp_path, monkeypatch):
     assert data["workflow"]["external_ai_status"]["completed"]["semantic"] is False
     assert data["workflow"]["external_ai_status"]["completed"]["director"] is False
     assert data["workflow"]["chapters_available"] is True
+    assert data["workflow"]["next_actions"]["clip_review"] == "GET /api/actions/ai/clip_review"
     assert len(data["candidates"]) == 1
     assert len(data["variants"]) == 1
     assert len(data["chapters"]) == 1
+    assert data["clip_review"]["meta"]["clip_count"] == 1
+    assert data["clip_review"]["clips"][0]["candidate"]["candidate_id"] == "cid1"
+
+
+def test_actions_ai_clip_review_joins_director_exports_and_chapters(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    pid = hashlib.sha256("twitch_clip_review".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "video").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "exports").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "video" / "video.mp4").write_bytes(b"")
+
+    export_path = proj_dir / "exports" / "clip1.mp4"
+    export_path.write_bytes(b"fake video bytes")
+    (proj_dir / "exports" / "clip1.metadata.json").write_text(
+        json.dumps(
+            {
+                "title": "Rebbi Test Clip",
+                "description": "Packaged export metadata",
+                "template": "vertical_blur",
+                "duration_seconds": 19.5,
+                "privacy": "unlisted",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(proj_dir / "video" / "video.mp4"), "duration_seconds": 120.0},
+        "analysis": {
+            "highlights": {
+                "candidates": [
+                    {
+                        "rank": 1,
+                        "candidate_id": "cid1",
+                        "score": 1.0,
+                        "start_s": 40.0,
+                        "end_s": 58.0,
+                        "peak_time_s": 50.0,
+                        "title": "Boss fight clutch",
+                        "hook_text": "no way",
+                    },
+                ]
+            }
+        },
+        "layout": {},
+        "selections": [
+            {
+                "id": "sel1",
+                "created_at": "now",
+                "start_s": 40.0,
+                "end_s": 59.5,
+                "title": "Boss fight clutch",
+                "template": "vertical_blur",
+                "candidate_rank": 1,
+                "candidate_peak_time_s": 50.0,
+                "variant_id": "medium",
+                "director_confidence": 0.91,
+            }
+        ],
+        "exports": [
+            {
+                "created_at": "now",
+                "selection_id": "sel1",
+                "output": str(export_path),
+                "template": "vertical_blur",
+                "with_captions": False,
+                "status": "succeeded",
+            }
+        ],
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+    (proj_dir / "analysis" / "variants.json").write_text(
+        json.dumps(
+            {
+                "created_at": "now",
+                "candidates": [
+                    {
+                        "candidate_rank": 1,
+                        "candidate_id": "cid1",
+                        "candidate_peak_time_s": 50.0,
+                        "variants": [
+                            {
+                                "variant_id": "medium",
+                                "start_s": 40.0,
+                                "end_s": 59.5,
+                                "duration_s": 19.5,
+                                "description": "Best cut",
+                            },
+                            {
+                                "variant_id": "long",
+                                "start_s": 35.0,
+                                "end_s": 65.0,
+                                "duration_s": 30.0,
+                                "description": "Longer setup",
+                            },
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (proj_dir / "analysis" / "chapters.json").write_text(
+        json.dumps(
+            {
+                "generated_at": "now",
+                "chapters": [
+                    {"id": 0, "start_s": 0.0, "end_s": 30.0, "title": "Setup", "summary": "Warmup", "keywords": ["warmup"]},
+                    {"id": 1, "start_s": 30.0, "end_s": 70.0, "title": "Boss fight", "summary": "Main action", "keywords": ["boss"]},
+                    {"id": 2, "start_s": 70.0, "end_s": 120.0, "title": "Aftermath", "summary": "Wrap-up", "keywords": ["ending"]},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (proj_dir / "analysis" / "director.json").write_text(
+        json.dumps(
+            {
+                "created_at": "now",
+                "provenance": {"source": "gondull", "model": "gpt-5.3"},
+                "config": {"source": "gondull"},
+                "pick_count": 1,
+                "picks": [
+                    {
+                        "rank": 1,
+                        "candidate_rank": 1,
+                        "candidate_id": "cid1",
+                        "variant_id": "medium",
+                        "start_s": 40.0,
+                        "end_s": 59.5,
+                        "duration_s": 19.5,
+                        "title": "REBBI WINS",
+                        "hook": "NO WAY",
+                        "description": "Clutch finish",
+                        "hashtags": ["gaming", "clips", "shorts"],
+                        "template": "vertical_blur",
+                        "confidence": 0.91,
+                        "reasons": ["clean payoff"],
+                        "chapter_index": 1,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    r = client.get(
+        f"/api/actions/ai/clip_review?project_id={pid}&top_n=1&chat_top_n=0&chapter_limit=10",
+        headers=hdr,
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["meta"]["clip_count"] == 1
+    assert data["meta"]["export_count"] == 1
+    assert data["workflow"]["external_ai_status"]["completed"]["director"] is True
+    clip = data["clips"][0]
+    assert clip["review_id"] == "cid1"
+    assert clip["candidate"]["candidate_id"] == "cid1"
+    assert clip["primary_variant"]["variant_id"] == "medium"
+    assert clip["primary_variant_source"] == "director_pick"
+    assert clip["director_pick"]["variant_id"] == "medium"
+    assert clip["director_pick"]["title"] == "REBBI WINS"
+    assert clip["chapter_context"]["current"]["title"] == "Boss fight"
+    assert clip["chapter_context"]["previous"]["title"] == "Setup"
+    assert clip["chapter_context"]["next"]["title"] == "Aftermath"
+    assert clip["selections"][0]["id"] == "sel1"
+    assert clip["selections"][0]["variant_id"] == "medium"
+    assert clip["exports"][0]["export_id"] == "clip1"
+    assert clip["exports"][0]["title"] == "Rebbi Test Clip"
+    assert clip["exports"][0]["privacy"] == "unlisted"
+    assert clip["exports"][0]["selection_id"] == "sel1"
+    assert clip["status"]["has_export"] is True
 
 
 def test_actions_ai_candidates_returns_transcript_excerpt(tmp_path, monkeypatch):

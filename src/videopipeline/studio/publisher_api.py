@@ -67,6 +67,22 @@ class ExportInfo:
         }
 
 
+def _metadata_path_candidates(mp4_path: Path) -> List[Path]:
+    """Return supported metadata filename variants for an export."""
+    return [
+        mp4_path.with_suffix(".json"),
+        mp4_path.parent / f"{mp4_path.stem}_metadata.json",
+        mp4_path.with_suffix(".metadata.json"),
+    ]
+
+
+def _find_export_metadata_path(mp4_path: Path) -> Optional[Path]:
+    for candidate in _metadata_path_candidates(mp4_path):
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def scan_project_exports(exports_dir: Path) -> List[ExportInfo]:
     """Scan the exports directory for mp4 files with optional metadata.json."""
     exports = []
@@ -76,13 +92,10 @@ def scan_project_exports(exports_dir: Path) -> List[ExportInfo]:
 
     for mp4_path in exports_dir.glob("*.mp4"):
         # Look for matching metadata.json
-        metadata_path = mp4_path.with_suffix(".json")
-        if not metadata_path.exists():
-            # Try _metadata.json pattern
-            metadata_path = mp4_path.parent / f"{mp4_path.stem}_metadata.json"
+        metadata_path = _find_export_metadata_path(mp4_path)
 
         metadata: Dict[str, Any] = {}
-        if metadata_path.exists():
+        if metadata_path is not None and metadata_path.exists():
             try:
                 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
@@ -215,11 +228,9 @@ def create_publisher_router(
             raise HTTPException(status_code=400, detail="invalid_export_path")
 
         # Find or create metadata
-        metadata_path = mp4_path.with_suffix(".json")
-        if not metadata_path.exists():
-            metadata_path = exports_dir / f"{export_id}_metadata.json"
+        metadata_path = _find_export_metadata_path(mp4_path)
 
-        if not metadata_path.exists():
+        if metadata_path is None or not metadata_path.exists():
             # Create a minimal metadata file
             metadata = {
                 "title": options.get("title_override") or export_id,
@@ -306,12 +317,10 @@ def create_publisher_router(
 
         for export_id, mp4_path in exports:
             # Find or create metadata for this export
-            metadata_path = mp4_path.with_suffix(".json")
-            if not metadata_path.exists():
-                metadata_path = exports_dir / f"{export_id}_metadata.json"
+            metadata_path = _find_export_metadata_path(mp4_path)
 
             base_metadata: Dict[str, Any] = {}
-            if metadata_path.exists():
+            if metadata_path is not None and metadata_path.exists():
                 try:
                     base_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
                 except (json.JSONDecodeError, OSError):

@@ -85,6 +85,20 @@ class TestExportScanning:
         assert len(result) == 1
         assert result[0].metadata["title"] == "Alt Pattern"
 
+    def test_scan_with_dot_metadata_json(self, tmp_path: Path):
+        """Finds .metadata.json pattern written by the export jobs."""
+        exports_dir = tmp_path / "exports"
+        exports_dir.mkdir()
+
+        (exports_dir / "clip1.mp4").write_bytes(b"fake video")
+        metadata = {"title": "Dot Pattern", "privacy": "unlisted"}
+        (exports_dir / "clip1.metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+        result = scan_project_exports(exports_dir)
+        assert len(result) == 1
+        assert result[0].metadata["title"] == "Dot Pattern"
+        assert result[0].metadata["privacy"] == "unlisted"
+
     def test_scan_handles_invalid_json(self, tmp_path: Path):
         """Gracefully handles invalid JSON metadata."""
         exports_dir = tmp_path / "exports"

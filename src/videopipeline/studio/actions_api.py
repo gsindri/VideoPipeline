@@ -1127,6 +1127,11 @@ def create_actions_router(
                         "properties": {},
                         "additionalProperties": True,
                     },
+                    "AiClipReviewResponse": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": True,
+                    },
                     "AiVariantsResponse": {
                         "type": "object",
                         "properties": {},
@@ -1817,6 +1822,32 @@ def create_actions_router(
                                 "description": "AI work bundle",
                                 "content": {
                                     "application/json": {"schema": {"$ref": "#/components/schemas/AiBundleResponse"}}
+                                },
+                            }
+                        },
+                    }
+                },
+                "/api/actions/ai/clip_review": {
+                    "get": {
+                        "summary": "Fetch bot-ready shortlisted clip review packets",
+                        "operationId": "vp_actions_ai_clip_review",
+                        "x-openai-isConsequential": False,
+                        "parameters": [
+                            {"name": "project_id", "in": "query", "required": True, "schema": {"type": "string"}},
+                            {"name": "top_n", "in": "query", "required": False, "schema": {"type": "integer"}},
+                            {"name": "chat_top_n", "in": "query", "required": False, "schema": {"type": "integer"}},
+                            {"name": "window_s", "in": "query", "required": False, "schema": {"type": "number"}},
+                            {"name": "max_chars", "in": "query", "required": False, "schema": {"type": "integer"}},
+                            {"name": "chat_lines", "in": "query", "required": False, "schema": {"type": "integer"}},
+                            {"name": "max_variants", "in": "query", "required": False, "schema": {"type": "integer"}},
+                            {"name": "chapter_limit", "in": "query", "required": False, "schema": {"type": "integer"}},
+                            {"name": "chapter_max_chars", "in": "query", "required": False, "schema": {"type": "integer"}},
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "Shortlisted clip review packets",
+                                "content": {
+                                    "application/json": {"schema": {"$ref": "#/components/schemas/AiClipReviewResponse"}}
                                 },
                             }
                         },
@@ -4252,6 +4283,503 @@ def create_actions_router(
             )
         )
 
+    def _build_ai_clip_review_payload(
+        *,
+        project_id: str,
+        candidates_payload: Dict[str, Any],
+        variants_payload: Dict[str, Any],
+        chapters_payload: Dict[str, Any],
+        proj: Optional[Project] = None,
+        proj_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        pid = _validate_project_id(project_id)
+        if proj is None or proj_data is None:
+            proj, proj_data = _load_project(pid)
+
+        candidate_items = [
+            item for item in (candidates_payload.get("candidates") or []) if isinstance(item, dict)
+        ]
+        variant_rows = [item for item in (variants_payload.get("candidates") or []) if isinstance(item, dict)]
+        chapter_rows = [item for item in (chapters_payload.get("chapters") or []) if isinstance(item, dict)]
+
+        def _norm_rank(value: Any) -> Optional[int]:
+            try:
+                rank = int(value)
+            except Exception:
+                return None
+            return rank if rank > 0 else None
+
+        def _norm_variant_id(value: Any) -> str:
+            return str(value or "").strip()
+
+        def _norm_time_key(start_v: Any, end_v: Any) -> Optional[Tuple[int, int]]:
+            try:
+                start = float(start_v)
+                end = float(end_v)
+            except Exception:
+                return None
+            if not (end > start):
+                return None
+            return (int(round(start * 1000.0)), int(round(end * 1000.0)))
+
+        def _path_key(value: Any) -> Optional[str]:
+            raw = str(value or "").strip()
+            if not raw:
+                return None
+            try:
+                return str(Path(raw).resolve())
+            except Exception:
+                return str(Path(raw))
+
+        def _chapter_token(chapter: Dict[str, Any], idx: int) -> Tuple[Any, int, int]:
+            return (
+                chapter.get("id", idx),
+                int(round(_safe_float(chapter.get("start_s"), -1.0) * 1000.0)),
+                int(round(_safe_float(chapter.get("end_s"), -1.0) * 1000.0)),
+            )
+
+        chapter_excerpt_by_token: Dict[Tuple[Any, int, int], Optional[Dict[str, Any]]] = {}
+        for idx, chapter in enumerate(chapter_rows):
+            excerpt = chapter.get("transcript_excerpt")
+            chapter_excerpt_by_token[_chapter_token(chapter, idx)] = excerpt if isinstance(excerpt, dict) else None
+
+        raw_chapters = chapter_rows
+        chapters_path = proj.analysis_dir / "chapters.json"
+        if chapters_path.exists():
+            try:
+                data = json.loads(chapters_path.read_text(encoding="utf-8"))
+                loaded = [item for item in (data.get("chapters") or []) if isinstance(item, dict)]
+                if loaded:
+                    raw_chapters = loaded
+            except Exception:
+                pass
+
+        chapter_items: list[Dict[str, Any]] = []
+        for idx, chapter in enumerate(raw_chapters):
+            item = {
+                "index": idx,
+                "id": chapter.get("id"),
+                "start_s": chapter.get("start_s"),
+                "end_s": chapter.get("end_s"),
+                "title": chapter.get("title"),
+                "summary": chapter.get("summary"),
+                "keywords": chapter.get("keywords"),
+                "type": chapter.get("type"),
+                "transcript_excerpt": chapter_excerpt_by_token.get(_chapter_token(chapter, idx)),
+            }
+            chapter_items.append(item)
+
+        def _chapter_context_for_time(t: float) -> Dict[str, Any]:
+            current_idx: Optional[int] = None
+            for idx, chapter in enumerate(chapter_items):
+                start_s = _safe_float(chapter.get("start_s"), -1.0)
+                end_s = _safe_float(chapter.get("end_s"), -1.0)
+                if end_s > start_s >= 0.0 and start_s <= t < end_s:
+                    current_idx = idx
+                    break
+            if current_idx is None and chapter_items:
+                last = chapter_items[-1]
+                if t >= _safe_float(last.get("start_s"), float("inf")):
+                    current_idx = len(chapter_items) - 1
+            return {
+                "chapter_index": current_idx,
+                "current": chapter_items[current_idx] if current_idx is not None else None,
+                "previous": chapter_items[current_idx - 1] if current_idx is not None and current_idx > 0 else None,
+                "next": chapter_items[current_idx + 1] if current_idx is not None and (current_idx + 1) < len(chapter_items) else None,
+            }
+
+        variants_by_rank: Dict[int, Dict[str, Any]] = {}
+        variants_by_id: Dict[str, Dict[str, Any]] = {}
+        for row in variant_rows:
+            rank = _norm_rank(row.get("candidate_rank"))
+            if rank is not None and rank not in variants_by_rank:
+                variants_by_rank[rank] = row
+            candidate_id = str(row.get("candidate_id") or "").strip()
+            if candidate_id and candidate_id not in variants_by_id:
+                variants_by_id[candidate_id] = row
+
+        director_picks: list[Dict[str, Any]] = []
+        director_path = proj.analysis_dir / "director.json"
+        director_source = None
+        director_provenance = None
+        if director_path.exists():
+            try:
+                director_payload = json.loads(director_path.read_text(encoding="utf-8"))
+                director_picks = [
+                    item for item in (director_payload.get("picks") or []) if isinstance(item, dict)
+                ]
+                director_source = (
+                    str(
+                        (director_payload.get("config") or {}).get("source")
+                        or director_payload.get("source")
+                        or ""
+                    ).strip()
+                    or None
+                )
+                payload_provenance = director_payload.get("provenance")
+                if isinstance(payload_provenance, dict):
+                    director_provenance = payload_provenance
+            except Exception:
+                director_picks = []
+
+        director_by_rank: Dict[int, Dict[str, Any]] = {}
+        director_by_id: Dict[str, Dict[str, Any]] = {}
+        for pick in director_picks:
+            rank = _norm_rank(pick.get("candidate_rank") or pick.get("rank"))
+            if rank is not None and rank not in director_by_rank:
+                director_by_rank[rank] = pick
+            candidate_id = str(pick.get("candidate_id") or "").strip()
+            if candidate_id and candidate_id not in director_by_id:
+                director_by_id[candidate_id] = pick
+
+        selections = [item for item in (proj_data.get("selections") or []) if isinstance(item, dict)]
+        selection_by_id: Dict[str, Dict[str, Any]] = {}
+        selections_by_rank: Dict[int, list[Dict[str, Any]]] = {}
+        selections_by_key: Dict[Tuple[int, str], list[Dict[str, Any]]] = {}
+        for selection in selections:
+            selection_id = str(selection.get("id") or "").strip()
+            if selection_id:
+                selection_by_id[selection_id] = selection
+            rank = _norm_rank(selection.get("candidate_rank") or selection.get("rank"))
+            if rank is None:
+                continue
+            selections_by_rank.setdefault(rank, []).append(selection)
+            variant_id = _norm_variant_id(
+                selection.get("variant_id")
+                or selection.get("best_variant_id")
+                or selection.get("chosen_variant_id")
+            )
+            if variant_id:
+                selections_by_key.setdefault((rank, variant_id), []).append(selection)
+
+        project_export_records = [item for item in (proj_data.get("exports") or []) if isinstance(item, dict)]
+        export_record_by_output: Dict[str, Dict[str, Any]] = {}
+        export_record_by_id: Dict[str, Dict[str, Any]] = {}
+        for record in project_export_records:
+            output_key = _path_key(record.get("output"))
+            if output_key and output_key not in export_record_by_output:
+                export_record_by_output[output_key] = record
+            output_raw = str(record.get("output") or "").strip()
+            if output_raw:
+                export_record_by_id.setdefault(Path(output_raw).stem, record)
+
+        exports_by_rank: Dict[int, list[Dict[str, Any]]] = {}
+        exports_by_key: Dict[Tuple[int, str], list[Dict[str, Any]]] = {}
+        scanned_exports = scan_project_exports(proj.exports_dir)
+        for export in scanned_exports:
+            record = (
+                export_record_by_output.get(_path_key(export.mp4_path))
+                or export_record_by_id.get(export.export_id)
+            )
+            selection_id = str((record or {}).get("selection_id") or "").strip()
+            selection = selection_by_id.get(selection_id) if selection_id else None
+            metadata_selection = export.metadata.get("selection") if isinstance(export.metadata.get("selection"), dict) else {}
+            rank = _norm_rank(
+                (selection or {}).get("candidate_rank")
+                or metadata_selection.get("candidate_rank")
+            )
+            variant_id = _norm_variant_id(
+                (selection or {}).get("variant_id")
+                or metadata_selection.get("variant_id")
+            )
+            export_item = {
+                "export_id": export.export_id,
+                "mp4_path": str(export.mp4_path),
+                "mp4_filename": export.mp4_path.name,
+                "metadata_path": str(export.metadata_path) if export.metadata_path else None,
+                "created_at": export.created_at,
+                "duration_seconds": export.duration_seconds,
+                "file_size_bytes": export.file_size_bytes,
+                "title": export.metadata.get("title", ""),
+                "description": export.metadata.get("description", ""),
+                "template": export.metadata.get("template", ""),
+                "privacy": str(export.metadata.get("privacy") or _publish_policy()["default_privacy"]).strip().lower() or "private",
+                "publish_at": str(export.metadata.get("publish_at") or "").strip() or None,
+                "selection_id": selection_id or None,
+                "candidate_rank": rank,
+                "variant_id": variant_id or None,
+                "selection_status": (record or {}).get("status"),
+            }
+            if rank is not None:
+                exports_by_rank.setdefault(rank, []).append(export_item)
+                if variant_id:
+                    exports_by_key.setdefault((rank, variant_id), []).append(export_item)
+
+        def _serialize_selection(selection: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "id": str(selection.get("id") or ""),
+                "created_at": selection.get("created_at"),
+                "start_s": selection.get("start_s"),
+                "end_s": selection.get("end_s"),
+                "title": selection.get("title"),
+                "notes": selection.get("notes"),
+                "template": selection.get("template"),
+                "candidate_rank": _norm_rank(selection.get("candidate_rank") or selection.get("rank")),
+                "candidate_peak_time_s": selection.get("candidate_peak_time_s"),
+                "variant_id": _norm_variant_id(
+                    selection.get("variant_id")
+                    or selection.get("best_variant_id")
+                    or selection.get("chosen_variant_id")
+                )
+                or None,
+                "director_confidence": selection.get("director_confidence"),
+            }
+
+        clips: list[Dict[str, Any]] = []
+        for candidate in candidate_items:
+            candidate_rank = _norm_rank(candidate.get("rank"))
+            candidate_id = str(candidate.get("candidate_id") or "").strip()
+            variant_row = (
+                variants_by_id.get(candidate_id)
+                or (variants_by_rank.get(candidate_rank) if candidate_rank is not None else None)
+                or {}
+            )
+            variant_options = [
+                dict(item) for item in (variant_row.get("variants") or []) if isinstance(item, dict)
+            ]
+
+            director_pick = (
+                director_by_id.get(candidate_id)
+                or (director_by_rank.get(candidate_rank) if candidate_rank is not None else None)
+            )
+            director_pick_out = None
+            chosen_variant_id = ""
+            if isinstance(director_pick, dict):
+                chosen_variant_id = _norm_variant_id(
+                    director_pick.get("variant_id") or director_pick.get("best_variant_id")
+                )
+                director_pick_out = {
+                    "candidate_rank": _norm_rank(director_pick.get("candidate_rank") or director_pick.get("rank")),
+                    "candidate_id": director_pick.get("candidate_id"),
+                    "variant_id": chosen_variant_id or None,
+                    "start_s": director_pick.get("start_s"),
+                    "end_s": director_pick.get("end_s"),
+                    "duration_s": director_pick.get("duration_s"),
+                    "title": director_pick.get("title"),
+                    "hook": director_pick.get("hook"),
+                    "description": director_pick.get("description"),
+                    "hashtags": director_pick.get("hashtags") or director_pick.get("tags") or [],
+                    "template": director_pick.get("template"),
+                    "confidence": director_pick.get("confidence"),
+                    "reasons": director_pick.get("reasons") or [],
+                    "chapter_index": director_pick.get("chapter_index"),
+                    "provenance": director_pick.get("provenance")
+                        if isinstance(director_pick.get("provenance"), dict)
+                        else director_provenance,
+                    "source": director_pick.get("packaging_source") or director_source,
+                }
+
+            peak_time_s = _safe_float(
+                candidate.get("peak_time_s"),
+                _safe_float(candidate.get("start_s"), 0.0),
+            )
+            chapter_context = _chapter_context_for_time(peak_time_s)
+
+            matching_selections: list[Dict[str, Any]] = []
+            seen_selection_ids = set()
+            if candidate_rank is not None and chosen_variant_id:
+                for selection in selections_by_key.get((candidate_rank, chosen_variant_id), []):
+                    selection_id = str(selection.get("id") or "")
+                    if selection_id in seen_selection_ids:
+                        continue
+                    matching_selections.append(_serialize_selection(selection))
+                    seen_selection_ids.add(selection_id)
+            if candidate_rank is not None:
+                for selection in selections_by_rank.get(candidate_rank, []):
+                    selection_id = str(selection.get("id") or "")
+                    if selection_id in seen_selection_ids:
+                        continue
+                    matching_selections.append(_serialize_selection(selection))
+                    seen_selection_ids.add(selection_id)
+
+            primary_variant = None
+            primary_variant_source = None
+            if chosen_variant_id:
+                primary_variant = next(
+                    (
+                        dict(item)
+                        for item in variant_options
+                        if _norm_variant_id(item.get("variant_id")) == chosen_variant_id
+                    ),
+                    None,
+                )
+                if primary_variant is not None:
+                    primary_variant_source = "director_pick"
+            if primary_variant is None and matching_selections:
+                selection_variant_id = str(matching_selections[0].get("variant_id") or "").strip()
+                if selection_variant_id:
+                    primary_variant = next(
+                        (
+                            dict(item)
+                            for item in variant_options
+                            if _norm_variant_id(item.get("variant_id")) == selection_variant_id
+                        ),
+                        None,
+                    )
+                    if primary_variant is not None:
+                        primary_variant_source = "selection"
+            if primary_variant is None and variant_options:
+                primary_variant = dict(variant_options[0])
+                primary_variant_source = "first_available_variant"
+
+            matching_exports: list[Dict[str, Any]] = []
+            seen_export_ids = set()
+            if candidate_rank is not None and chosen_variant_id:
+                for export_item in exports_by_key.get((candidate_rank, chosen_variant_id), []):
+                    export_id = str(export_item.get("export_id") or "")
+                    if export_id in seen_export_ids:
+                        continue
+                    matching_exports.append(dict(export_item))
+                    seen_export_ids.add(export_id)
+            if candidate_rank is not None:
+                for export_item in exports_by_rank.get(candidate_rank, []):
+                    export_id = str(export_item.get("export_id") or "")
+                    if export_id in seen_export_ids:
+                        continue
+                    matching_exports.append(dict(export_item))
+                    seen_export_ids.add(export_id)
+
+            review_focus = [
+                "Does this clip hook quickly and still make sense without outside context?",
+                "Is the payoff clear enough to beat the other shortlisted clips?",
+            ]
+            if variant_options:
+                review_focus.append("Pick the strongest variant for setup/payoff balance before export.")
+            if matching_exports:
+                review_focus.append("Review the exported MP4 for pacing, captions, and upload readiness.")
+            else:
+                review_focus.append("No export exists yet; decide keep/reject and packaging before export.")
+
+            review_id = candidate_id or (f"candidate-rank-{candidate_rank}" if candidate_rank is not None else "candidate")
+            clips.append(
+                {
+                    "review_id": review_id,
+                    "candidate": dict(candidate),
+                    "chapter_context": chapter_context,
+                    "variant_options": variant_options,
+                    "primary_variant": primary_variant,
+                    "primary_variant_source": primary_variant_source,
+                    "director_pick": director_pick_out,
+                    "selections": matching_selections,
+                    "exports": matching_exports,
+                    "status": {
+                        "has_transcript_excerpt": bool(candidate.get("transcript_excerpt")),
+                        "has_chat_excerpt": bool(candidate.get("chat_excerpt")),
+                        "has_variants": bool(variant_options),
+                        "has_director_pick": director_pick_out is not None,
+                        "has_selection": bool(matching_selections),
+                        "has_export": bool(matching_exports),
+                    },
+                    "review_focus": review_focus,
+                }
+            )
+
+        return {
+            "meta": {
+                "project_id": pid,
+                "clip_count": len(clips),
+                "total_candidates": candidates_payload.get("total_candidates"),
+                "director_pick_count": len(director_picks),
+                "selection_count": len(selections),
+                "export_count": len(scanned_exports),
+            },
+            "workflow": {
+                "intended_use": "Use these packets for final LLM judgment on shortlisted clips after broad pipeline selection.",
+                "external_ai_status": _external_ai_status(proj=proj, proj_data=proj_data),
+                "next_actions": {
+                    "semantic": "POST /api/actions/ai/apply_semantic",
+                    "chapters": "POST /api/actions/ai/apply_chapter_labels",
+                    "director": "POST /api/actions/ai/apply_director_picks",
+                    "export": "POST /api/actions/export_director_picks",
+                    "publish_accounts": "GET /api/actions/publish/accounts",
+                    "publish_queue": "POST /api/actions/publish/queue",
+                },
+            },
+            "limits": {
+                "candidates": candidates_payload.get("limits") or {},
+                "variants": variants_payload.get("limits") or {},
+                "chapters": chapters_payload.get("limits") or {},
+            },
+            "review_rubric": {
+                "goal": "Choose which shortlisted clips deserve export/upload and finalize the variant plus packaging.",
+                "criteria": [
+                    "Immediate hook without confusing setup",
+                    "Clear standalone payoff",
+                    "Strong relative value versus competing shortlisted clips",
+                    "Packaging/title/hook that matches the actual clip",
+                    "Upload readiness if an exported MP4 already exists",
+                ],
+                "preferred_outputs": {
+                    "semantic": "keep/reject + semantic_score + concise reason",
+                    "director": "variant_id + title + hook + description + hashtags + confidence",
+                },
+            },
+            "clips": clips,
+        }
+
+    @router.get("/ai/clip_review", openapi_extra={"x-openai-isConsequential": False})
+    def ai_clip_review(
+        request: Request,
+        project_id: str,
+        top_n: Optional[int] = None,
+        chat_top_n: Optional[int] = None,
+        window_s: float = 4.0,
+        max_chars: int = 800,
+        chat_lines: int = 8,
+        max_variants: int = 8,
+        chapter_limit: int = 50,
+        chapter_max_chars: int = 1200,
+    ):
+        """Fetch joined shortlist review packets for final bot judgment."""
+        _rate_limit(request)
+        pid = _validate_project_id(project_id)
+        proj, proj_data = _load_project(pid)
+
+        candidates_payload = _build_ai_candidates_payload(
+            project_id=pid,
+            top_n=top_n,
+            chat_top_n=chat_top_n,
+            window_s=window_s,
+            max_chars=max_chars,
+            chat_lines=chat_lines,
+        )
+        candidate_ids = [
+            str(candidate.get("candidate_id") or "").strip()
+            for candidate in (candidates_payload.get("candidates") or [])
+            if isinstance(candidate, dict) and str(candidate.get("candidate_id") or "").strip()
+        ]
+        variants_payload = _build_ai_variants_payload(
+            project_id=pid,
+            candidate_ids=",".join(candidate_ids),
+            max_variants=max_variants,
+        )
+        try:
+            chapters_payload = _build_ai_chapters_payload(
+                project_id=pid,
+                offset=0,
+                limit=chapter_limit,
+                max_chars=chapter_max_chars,
+            )
+        except HTTPException as exc:
+            if exc.status_code != 404 or exc.detail != "no_chapters":
+                raise
+            chapters_payload = {
+                "meta": {"project_id": pid, "chapter_count": 0, "generated_at": None},
+                "limits": {"offset": 0, "limit": chapter_limit, "max_chars": chapter_max_chars},
+                "chapters": [],
+            }
+
+        return JSONResponse(
+            _build_ai_clip_review_payload(
+                project_id=pid,
+                candidates_payload=candidates_payload,
+                variants_payload=variants_payload,
+                chapters_payload=chapters_payload,
+                proj=proj,
+                proj_data=proj_data,
+            )
+        )
+
     @router.get("/ai/bundle", openapi_extra={"x-openai-isConsequential": False})
     def ai_bundle(
         request: Request,
@@ -4311,6 +4839,14 @@ def create_actions_router(
                 raise
 
         external_status = _external_ai_status(proj=proj, proj_data=proj_data)
+        clip_review_payload = _build_ai_clip_review_payload(
+            project_id=pid,
+            candidates_payload=candidates_payload,
+            variants_payload=variants_payload,
+            chapters_payload=chapters_payload,
+            proj=proj,
+            proj_data=proj_data,
+        )
         return JSONResponse(
             {
                 "meta": candidates_payload.get("meta") or {"project_id": pid},
@@ -4321,6 +4857,7 @@ def create_actions_router(
                     "chapters_available": chapters_available,
                     "chapters_reason": chapters_reason,
                     "next_actions": {
+                        "clip_review": "GET /api/actions/ai/clip_review",
                         "semantic": "POST /api/actions/ai/apply_semantic",
                         "chapters": "POST /api/actions/ai/apply_chapter_labels",
                         "director": "POST /api/actions/ai/apply_director_picks",
@@ -4337,6 +4874,7 @@ def create_actions_router(
                 "candidates": candidates_payload.get("candidates") or [],
                 "variants": variants_payload.get("candidates") or [],
                 "chapters": chapters_payload.get("chapters") or [],
+                "clip_review": clip_review_payload,
             }
         )
 
