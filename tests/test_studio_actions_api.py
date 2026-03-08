@@ -250,6 +250,37 @@ sources:
     assert data["source_scout"]["watchlist_path"] == str(watchlist_path)
     assert data["source_scout"]["shadow_mode"] is True
     assert data["source_scout"]["enabled_sources"] == 1
+    assert data["source_scout"]["inbox_pending"] == 0
+
+
+def test_actions_scout_inbox_add_and_list(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    add = client.post(
+        "/api/actions/scout/inbox/add",
+        headers=hdr,
+        json={
+            "url": "https://www.twitch.tv/videos/456",
+            "title": "Rebbi clutch VOD",
+            "notes": "Good candidate from app",
+            "priority": 6,
+            "tags": ["rebbi", "clutch"],
+            "added_by": "gondull-platform",
+        },
+    )
+    assert add.status_code == 200
+    payload = add.json()
+    assert payload["meta"]["created"] is True
+    assert payload["entry"]["status"] == "pending"
+    assert payload["entry"]["url"] == "https://www.twitch.tv/videos/456"
+
+    listing = client.get("/api/actions/scout/inbox?status=pending", headers=hdr)
+    assert listing.status_code == 200
+    data = listing.json()
+    assert data["meta"]["entry_count"] == 1
+    assert data["entries"][0]["title"] == "Rebbi clutch VOD"
+    assert data["entries"][0]["added_by"] == "gondull-platform"
 
 
 def test_actions_scout_candidates_ranks_urls_from_watchlist(tmp_path, monkeypatch):
@@ -352,6 +383,69 @@ sources:
     assert data["skipped"]["title_excluded"] == 1
 
 
+def test_actions_scout_candidates_prefers_manual_inbox(tmp_path, monkeypatch):
+    watchlist_dir = tmp_path / "sources"
+    watchlist_dir.mkdir(parents=True, exist_ok=True)
+    watchlist_path = watchlist_dir / "watchlist.yaml"
+    watchlist_path.write_text(
+        """
+shadow_mode: true
+sources:
+  - id: rebbi-twitch
+    label: Rebbi Twitch
+    url: https://www.twitch.tv/rebbi/videos
+    platform: twitch
+    enabled: true
+    priority: 3
+    recent_hours: 72
+    max_candidates: 1
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VP_SOURCE_WATCHLIST", str(watchlist_path))
+
+    import videopipeline.source_scout as source_scout_mod
+
+    monkeypatch.setattr(
+        source_scout_mod,
+        "fetch_source_entries",
+        lambda source, *, limit: [
+            {
+                "url": "https://www.twitch.tv/videos/999",
+                "title": "watchlist candidate",
+                "duration_seconds": 5400.0,
+                "published_at": "2026-03-08T01:00:00+00:00",
+            }
+        ],
+    )
+
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    add = client.post(
+        "/api/actions/scout/inbox/add",
+        headers=hdr,
+        json={
+            "url": "https://www.twitch.tv/videos/456",
+            "title": "Manual priority pick",
+            "priority": 7,
+            "added_by": "app",
+            "notes": "Should outrank watchlist",
+        },
+    )
+    assert add.status_code == 200
+    inbox_id = add.json()["entry"]["inbox_id"]
+
+    r = client.get("/api/actions/scout/candidates?limit=5&per_source=1", headers=hdr)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["meta"]["candidate_count"] == 2
+    assert data["recommended"]["url"] == "https://www.twitch.tv/videos/456"
+    assert data["recommended"]["selection_mode"] == "manual_inbox"
+    assert data["recommended"]["inbox_id"] == inbox_id
+    assert data["strategy"]["manual_inbox"]["pending_count"] == 1
+
+
 def test_actions_run_ingest_analyze_persists_scout_metadata(tmp_path, monkeypatch):
     import videopipeline.chat.downloader as chat_downloader
     import videopipeline.studio.actions_api as actions_api_mod
@@ -374,12 +468,25 @@ def test_actions_run_ingest_analyze_persists_scout_metadata(tmp_path, monkeypatc
     hdr = {"Authorization": "Bearer secret"}
 
     url = "https://www.twitch.tv/videos/12345"
+    add = client.post(
+        "/api/actions/scout/inbox/add",
+        headers=hdr,
+        json={
+            "url": url,
+            "title": "Inbox candidate",
+            "added_by": "app",
+        },
+    )
+    assert add.status_code == 200
+    inbox_id = add.json()["entry"]["inbox_id"]
+
     r = client.post(
         "/api/actions/ingest_url",
         headers=hdr,
         json={
             "url": url,
             "scout": {
+                "inbox_id": inbox_id,
                 "source_id": "rebbi-twitch",
                 "source_label": "Rebbi Twitch",
                 "candidate_id": "cand-222",
@@ -397,6 +504,7 @@ def test_actions_run_ingest_analyze_persists_scout_metadata(tmp_path, monkeypatc
     assert project_json["source"]["source_url"] == url
     assert project_json["source"]["scout"]["source_id"] == "rebbi-twitch"
     assert project_json["source"]["scout"]["candidate_id"] == "cand-222"
+    assert project_json["source"]["scout"]["inbox_id"] == inbox_id
     assert project_json["source"]["scout"]["score"] == 0.84
     assert project_json["source"]["scout"]["shadow_mode"] is True
     assert project_json["source"]["scout"]["reasons"] == [
@@ -404,6 +512,11 @@ def test_actions_run_ingest_analyze_persists_scout_metadata(tmp_path, monkeypatc
         "duration_score=1.00",
     ]
     assert project_json["source"]["scout"]["selected_at"]
+
+    inbox_listing = client.get("/api/actions/scout/inbox?status=selected", headers=hdr)
+    assert inbox_listing.status_code == 200
+    assert inbox_listing.json()["entries"][0]["inbox_id"] == inbox_id
+    assert inbox_listing.json()["entries"][0]["project_id"] == pid
 
 
 def test_actions_rate_limiting(tmp_path, monkeypatch):

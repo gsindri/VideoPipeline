@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 import yaml
 
 from .project import default_projects_root
+from .source_inbox import list_source_inbox_entries
 
 
 _YOUTUBE_ID_RE = re.compile(r"(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]+)")
@@ -424,6 +425,7 @@ def build_source_scout_report(
     resolved_path, watchlist = load_source_watchlist(watchlist_path)
     now_ts = float(now_ts if now_ts is not None else time.time())
     history = build_project_history()
+    inbox_path, inbox_entries = list_source_inbox_entries(status="pending")
 
     per_source = max(1, int(per_source))
     limit = max(1, int(limit))
@@ -436,6 +438,78 @@ def build_source_scout_report(
     source_reports: list[Dict[str, Any]] = []
     candidates: list[Dict[str, Any]] = []
     skipped: Dict[str, int] = {}
+
+    for entry in inbox_entries:
+        url = _normalize_url(str(entry.get("url") or ""))
+        if not url:
+            skipped["manual_missing_url"] = skipped.get("manual_missing_url", 0) + 1
+            continue
+        content_key = extract_content_key(url)
+        processed_urls = history.get("processed_urls") or set()
+        processed_content_keys = history.get("processed_content_keys") or set()
+        if url in processed_urls or (content_key and content_key in processed_content_keys):
+            skipped["already_processed"] = skipped.get("already_processed", 0) + 1
+            continue
+        priority_raw = max(1.0, _safe_float(entry.get("priority"), 5.0))
+        source_id = str(entry.get("source_id") or "").strip() or "manual_inbox"
+        source_stats = ((history.get("source_stats") or {}).get(source_id) or {})
+        history_score = 0.5
+        if source_stats:
+            projects = max(1, _safe_int(source_stats.get("project_count"), 1))
+            history_score = min(
+                1.0,
+                (
+                    (_safe_int(source_stats.get("projects_with_candidates"), 0) / projects) * 0.35
+                    + (_safe_int(source_stats.get("projects_with_director_picks"), 0) / projects) * 0.35
+                    + (_safe_int(source_stats.get("projects_with_exports"), 0) / projects) * 0.30
+                ),
+            )
+        score = min(1.2, 0.95 + min(0.20, priority_raw * 0.03) + (history_score * 0.05))
+        reasons = [
+            f"manual inbox priority {priority_raw:g}",
+            "user/app explicitly queued this URL",
+        ]
+        notes = str(entry.get("notes") or "").strip()
+        if notes:
+            reasons.append(f"notes: {notes}")
+        added_by = str(entry.get("added_by") or "").strip()
+        if added_by:
+            reasons.append(f"added_by={added_by}")
+        tags = [str(item).strip() for item in list(entry.get("tags") or []) if str(item).strip()]
+        candidates.append(
+            {
+                "url": url,
+                "content_key": content_key or None,
+                "source_id": None if source_id == "manual_inbox" else source_id,
+                "source_label": str(entry.get("source_label") or "Manual Inbox").strip() or "Manual Inbox",
+                "source_url": None,
+                "platform": None,
+                "score": round(score, 4),
+                "title": str(entry.get("title") or "").strip(),
+                "duration_seconds": None,
+                "published_at": None,
+                "age_hours": None,
+                "view_count": None,
+                "channel_id": None,
+                "channel_name": None,
+                "video_id": None,
+                "tags": tags,
+                "reasons": reasons,
+                "history": {
+                    "source_id": None if source_id == "manual_inbox" else source_id,
+                    "source_project_count": _safe_int(source_stats.get("project_count"), 0),
+                    "projects_with_candidates": _safe_int(source_stats.get("projects_with_candidates"), 0),
+                    "projects_with_director_picks": _safe_int(source_stats.get("projects_with_director_picks"), 0),
+                    "projects_with_exports": _safe_int(source_stats.get("projects_with_exports"), 0),
+                },
+                "selection_mode": "manual_inbox",
+                "inbox_id": str(entry.get("inbox_id") or "").strip() or None,
+                "added_at": str(entry.get("added_at") or "").strip() or None,
+                "added_by": added_by or None,
+                "notes": notes or None,
+                "source_priority": priority_raw,
+            }
+        )
 
     for source in enabled_sources:
         source_id = str(source.get("id") or "").strip()
@@ -472,6 +546,11 @@ def build_source_scout_report(
                 if skip_reason:
                     skipped[skip_reason] = skipped.get(skip_reason, 0) + 1
                 continue
+            candidate.setdefault("selection_mode", "watchlist")
+            candidate.setdefault("inbox_id", None)
+            candidate.setdefault("added_at", None)
+            candidate.setdefault("added_by", None)
+            candidate.setdefault("notes", None)
             candidate["source_priority"] = source_report["priority"]
             candidates.append(candidate)
             source_count += 1
@@ -504,6 +583,7 @@ def build_source_scout_report(
             "per_source": per_source,
             "limit": limit,
             "ranking_factors": [
+                "manual inbox priority",
                 "source priority",
                 "duration fit",
                 "recency",
@@ -513,6 +593,10 @@ def build_source_scout_report(
             "dedupe": {
                 "processed_url_count": len(history.get("processed_urls") or set()),
                 "processed_content_count": len(history.get("processed_content_keys") or set()),
+            },
+            "manual_inbox": {
+                "inbox_path": str(inbox_path) if inbox_path is not None else None,
+                "pending_count": len(inbox_entries),
             },
         },
         "sources": source_reports,

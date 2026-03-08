@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from .. import source_inbox as source_inbox_mod
 from .. import source_scout as source_scout_mod
 from ..analysis import run_analysis
 from ..analysis_director import DirectorConfig
@@ -818,6 +819,7 @@ def create_actions_router(
             "source_url",
             "candidate_id",
             "content_key",
+            "inbox_id",
             "watchlist_path",
             "selection_mode",
         ):
@@ -866,34 +868,64 @@ def create_actions_router(
             }
 
         update_project(proj, _upd)
+        inbox_id = str(scout.get("inbox_id") or "").strip()
+        if inbox_id:
+            try:
+                source_inbox_mod.update_source_inbox_entry(
+                    inbox_id,
+                    status="selected",
+                    project_id=proj.project_dir.name,
+                    selection_notes=str(scout.get("selection_mode") or "pipeline_ingest"),
+                )
+            except Exception:
+                pass
+
+    def _build_source_inbox_payload(*, status: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
+        limit = max(1, int(limit))
+        resolved, entries = source_inbox_mod.list_source_inbox_entries(status=status, limit=limit)
+        return {
+            "meta": {
+                "inbox_path": str(resolved) if resolved is not None else None,
+                "status_filter": status or None,
+                "limit": limit,
+                "entry_count": len(entries),
+            },
+            "entries": entries,
+        }
 
     def _source_scout_diagnostics() -> Dict[str, Any]:
         try:
             watchlist_path, watchlist = source_scout_mod.load_source_watchlist()
         except Exception as exc:
+            inbox_path, pending_entries = source_inbox_mod.list_source_inbox_entries(status="pending")
             return {
                 "configured": False,
                 "ready": False,
                 "watchlist_path": None,
                 "shadow_mode": True,
                 "enabled_sources": 0,
+                "inbox_path": str(inbox_path) if inbox_path is not None else None,
+                "inbox_pending": len(pending_entries),
                 "issues": [f"{type(exc).__name__}: {exc}"],
             }
 
         enabled_sources = [
             item for item in (watchlist.get("sources") or []) if bool(item.get("enabled", True))
         ]
+        inbox_path, pending_entries = source_inbox_mod.list_source_inbox_entries(status="pending")
         issues: list[str] = []
         if watchlist_path is None:
             issues.append("source watchlist not found")
-        if not enabled_sources:
-            issues.append("no enabled source scout entries")
+        if not enabled_sources and not pending_entries:
+            issues.append("no enabled scout sources or pending manual inbox entries")
         return {
             "configured": watchlist_path is not None,
-            "ready": bool(watchlist_path is not None and enabled_sources),
+            "ready": bool((watchlist_path is not None and enabled_sources) or pending_entries),
             "watchlist_path": str(watchlist_path) if watchlist_path is not None else None,
             "shadow_mode": bool(watchlist.get("shadow_mode", True)),
             "enabled_sources": len(enabled_sources),
+            "inbox_path": str(inbox_path) if inbox_path is not None else None,
+            "inbox_pending": len(pending_entries),
             "issues": issues,
         }
 
@@ -1213,6 +1245,37 @@ def create_actions_router(
                         "type": "object",
                         "properties": {},
                         "additionalProperties": True,
+                    },
+                    "ScoutInboxResponse": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": True,
+                    },
+                    "ScoutInboxAddRequest": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string"},
+                            "title": {"type": "string"},
+                            "notes": {"type": "string"},
+                            "priority": {"type": "number"},
+                            "tags": {"type": "array", "items": {"type": "string"}},
+                            "added_by": {"type": "string"},
+                            "source_id": {"type": "string"},
+                            "source_label": {"type": "string"},
+                        },
+                        "required": ["url"],
+                        "additionalProperties": False,
+                    },
+                    "ScoutInboxMarkRequest": {
+                        "type": "object",
+                        "properties": {
+                            "inbox_id": {"type": "string"},
+                            "status": {"type": "string"},
+                            "project_id": {"type": "string"},
+                            "selection_notes": {"type": "string"},
+                        },
+                        "required": ["inbox_id", "status"],
+                        "additionalProperties": False,
                     },
                     "AiCandidatesResponse": {
                         "type": "object",
@@ -1882,6 +1945,71 @@ def create_actions_router(
                                 "description": "Ranked URL candidates",
                                 "content": {
                                     "application/json": {"schema": {"$ref": "#/components/schemas/ScoutCandidatesResponse"}}
+                                },
+                            }
+                        },
+                    }
+                },
+                "/api/actions/scout/inbox": {
+                    "get": {
+                        "summary": "List manual scout inbox entries",
+                        "operationId": "vp_actions_scout_inbox_list",
+                        "x-openai-isConsequential": False,
+                        "parameters": [
+                            {"name": "status", "in": "query", "required": False, "schema": {"type": "string"}},
+                            {"name": "limit", "in": "query", "required": False, "schema": {"type": "integer"}},
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "Manual scout inbox entries",
+                                "content": {
+                                    "application/json": {"schema": {"$ref": "#/components/schemas/ScoutInboxResponse"}}
+                                },
+                            }
+                        },
+                    }
+                },
+                "/api/actions/scout/inbox/add": {
+                    "post": {
+                        "summary": "Add a URL to the manual scout inbox",
+                        "operationId": "vp_actions_scout_inbox_add",
+                        "x-openai-isConsequential": False,
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ScoutInboxAddRequest"},
+                                }
+                            },
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "Added or deduplicated inbox entry",
+                                "content": {
+                                    "application/json": {"schema": {"$ref": "#/components/schemas/ScoutInboxResponse"}}
+                                },
+                            }
+                        },
+                    }
+                },
+                "/api/actions/scout/inbox/mark": {
+                    "post": {
+                        "summary": "Mark a manual scout inbox entry as selected or dismissed",
+                        "operationId": "vp_actions_scout_inbox_mark",
+                        "x-openai-isConsequential": False,
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ScoutInboxMarkRequest"},
+                                }
+                            },
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "Updated inbox entry",
+                                "content": {
+                                    "application/json": {"schema": {"$ref": "#/components/schemas/ScoutInboxResponse"}}
                                 },
                             }
                         },
@@ -3142,6 +3270,60 @@ def create_actions_router(
             raise HTTPException(status_code=400, detail=str(exc))
         report["diagnostics"] = _source_scout_diagnostics()
         return JSONResponse(report)
+
+    @router.get("/scout/inbox", openapi_extra={"x-openai-isConsequential": False})
+    def scout_inbox(request: Request, status: str = "pending", limit: int = 50):
+        _rate_limit(request)
+        limit = _clamp_int(limit, default=50, min_v=1, max_v=200)
+        status_value = str(status or "").strip().lower() or None
+        return JSONResponse(_build_source_inbox_payload(status=status_value, limit=limit))
+
+    @router.post("/scout/inbox/add", openapi_extra={"x-openai-isConsequential": False})
+    def scout_inbox_add(request: Request, body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        _rate_limit(request)
+        url = _validate_ingest_url(str(body.get("url") or ""), allow_domains=allow_domains)
+        tags = body.get("tags") or []
+        if tags and not isinstance(tags, list):
+            raise HTTPException(status_code=400, detail="invalid_tags")
+        try:
+            inbox_path, entry, created = source_inbox_mod.add_source_inbox_entry(
+                url=url,
+                title=body.get("title"),
+                notes=body.get("notes"),
+                priority=body.get("priority"),
+                tags=[str(item).strip() for item in tags if str(item).strip()],
+                added_by=body.get("added_by"),
+                source_id=body.get("source_id"),
+                source_label=body.get("source_label"),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return JSONResponse(
+            {
+                "meta": {"inbox_path": str(inbox_path), "created": bool(created)},
+                "entry": entry,
+            }
+        )
+
+    @router.post("/scout/inbox/mark", openapi_extra={"x-openai-isConsequential": False})
+    def scout_inbox_mark(request: Request, body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
+        _rate_limit(request)
+        inbox_id = str(body.get("inbox_id") or "").strip()
+        status = str(body.get("status") or "").strip().lower()
+        if status not in {"pending", "selected", "dismissed", "processed"}:
+            raise HTTPException(status_code=400, detail="invalid_inbox_status")
+        try:
+            inbox_path, entry = source_inbox_mod.update_source_inbox_entry(
+                inbox_id,
+                status=status,
+                project_id=body.get("project_id"),
+                selection_notes=body.get("selection_notes"),
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="inbox_entry_not_found")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return JSONResponse({"meta": {"inbox_path": str(inbox_path)}, "entry": entry})
 
     @router.get("/publish/accounts", openapi_extra={"x-openai-isConsequential": False})
     def publish_accounts(request: Request):
