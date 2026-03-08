@@ -194,6 +194,14 @@ analysis:
     assert data["profile"]["diarization"]["speech_enabled"] is True
     assert data["profile"]["diarization"]["requires_hf_token"] is False
     assert data["profile"]["readiness"]["ok"] is False
+    assert data["llm"]["supported_modes"] == ["local", "external", "external_strict"]
+    assert data["llm"]["aliases"]["gondull"] == "external_strict"
+    assert data["llm"]["preferred_mode"] == "external_strict"
+    assert data["llm"]["profile_external_ai_requirements"] == {
+        "semantic": True,
+        "chapters": True,
+        "director": True,
+    }
     assert any("speech:" in issue for issue in data["profile"]["readiness"]["issues"])
     assert any("audio_events:" in issue for issue in data["profile"]["readiness"]["issues"])
 
@@ -473,7 +481,8 @@ def test_actions_job_wait_returns_done_true_for_completed_job(tmp_path, monkeypa
     assert data["status"] == "succeeded"
 
 
-def test_actions_analyze_full_external_llm_skips_local_llm(tmp_path, monkeypatch):
+@pytest.mark.parametrize("llm_mode", ["external", "external_strict"])
+def test_actions_analyze_full_external_llm_skips_local_llm(tmp_path, monkeypatch, llm_mode):
     client = _make_client(tmp_path, monkeypatch, token="secret")
     hdr = {"Authorization": "Bearer secret"}
 
@@ -517,7 +526,7 @@ def test_actions_analyze_full_external_llm_skips_local_llm(tmp_path, monkeypatch
     r = client.post(
         "/api/actions/analyze_full",
         headers=hdr,
-        json={"project_id": pid, "llm_mode": "external", "client_request_id": "analyze-ext-1"},
+        json={"project_id": pid, "llm_mode": llm_mode, "client_request_id": f"analyze-{llm_mode}-1"},
     )
     assert r.status_code == 200
     job_id = r.json()["job_id"]
@@ -526,6 +535,77 @@ def test_actions_analyze_full_external_llm_skips_local_llm(tmp_path, monkeypatch
     assert job is not None
     assert job.status == "succeeded"
     assert called["n"] == 0
+
+
+def test_actions_ai_bundle_reports_external_status(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    pid = hashlib.sha256("twitch_bundle".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "video").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "video" / "video.mp4").write_bytes(b"")
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(proj_dir / "video" / "video.mp4"), "duration_seconds": 90.0},
+        "analysis": {
+            "highlights": {
+                "candidates": [
+                    {"rank": 1, "candidate_id": "cid1", "score": 1.0, "start_s": 10.0, "end_s": 20.0, "peak_time_s": 15.0},
+                ]
+            }
+        },
+        "layout": {},
+        "selections": [],
+        "exports": [],
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+    (proj_dir / "analysis" / "variants.json").write_text(
+        json.dumps(
+            {
+                "created_at": "now",
+                "candidates": [
+                    {
+                        "candidate_rank": 1,
+                        "candidate_id": "cid1",
+                        "candidate_peak_time_s": 15.0,
+                        "variants": [
+                            {"variant_id": "medium", "start_s": 10.0, "end_s": 28.0, "duration_s": 18.0},
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (proj_dir / "analysis" / "chapters.json").write_text(
+        json.dumps(
+            {
+                "generated_at": "now",
+                "chapter_count": 1,
+                "chapters": [{"id": 0, "start_s": 0.0, "end_s": 90.0, "title": "Chapter 1", "summary": "", "keywords": []}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    r = client.get(
+        f"/api/actions/ai/bundle?project_id={pid}&top_n=1&chat_top_n=0&chapter_limit=10",
+        headers=hdr,
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["workflow"]["preferred_llm_mode"] == "external_strict"
+    assert data["workflow"]["external_ai_status"]["required"]["semantic"] is True
+    assert data["workflow"]["external_ai_status"]["completed"]["semantic"] is False
+    assert data["workflow"]["external_ai_status"]["completed"]["director"] is False
+    assert data["workflow"]["chapters_available"] is True
+    assert len(data["candidates"]) == 1
+    assert len(data["variants"]) == 1
+    assert len(data["chapters"]) == 1
 
 
 def test_actions_ai_candidates_returns_transcript_excerpt(tmp_path, monkeypatch):
@@ -850,6 +930,52 @@ def test_actions_ai_apply_semantic_updates_project(tmp_path, monkeypatch):
     assert c2["ai"]["semantic_score"] == 0.8
 
 
+def test_actions_ai_apply_semantic_persists_provenance(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    pid = hashlib.sha256("twitch_sem_prov".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    proj_dir.mkdir(parents=True, exist_ok=True)
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(proj_dir / "video" / "video.mp4"), "duration_seconds": 60.0},
+        "analysis": {"highlights": {"candidates": [{"rank": 1, "candidate_id": "c1", "score": 1.0, "start_s": 10.0, "end_s": 20.0}]}},
+        "layout": {},
+        "selections": [],
+        "exports": [],
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+
+    r = client.post(
+        "/api/actions/ai/apply_semantic",
+        headers=hdr,
+        json={
+            "project_id": pid,
+            "client_request_id": "apply-sem-prov-1",
+            "provenance": {
+                "agent": "gondull",
+                "provider": "openai",
+                "model": "gpt-5.3-xhigh",
+                "prompt_version": "semantic-v1",
+            },
+            "items": [{"candidate_id": "c1", "semantic_score": 0.91, "reason": "clear payoff"}],
+        },
+    )
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["provenance"]["agent"] == "gondull"
+    assert payload["provenance"]["model"] == "gpt-5.3-xhigh"
+
+    updated = json.loads((proj_dir / "project.json").read_text(encoding="utf-8"))
+    cand = updated["analysis"]["highlights"]["candidates"][0]
+    assert cand["ai"]["semantic_source"] == "chatgpt_actions"
+    assert cand["ai"]["semantic_provenance"]["agent"] == "gondull"
+    assert updated["analysis"]["actions"]["semantic_provenance"]["prompt_version"] == "semantic-v1"
+
+
 def test_actions_ai_apply_director_picks_writes_director_json(tmp_path, monkeypatch):
     client = _make_client(tmp_path, monkeypatch, token="secret")
     hdr = {"Authorization": "Bearer secret"}
@@ -1101,6 +1227,165 @@ def test_actions_export_director_picks_creates_job(tmp_path, monkeypatch):
     job_id = r.json()["job_id"]
 
     job = _wait_for_terminal_job_state(job_id)
+    assert job is not None
+    assert job.status == "succeeded"
+
+
+@pytest.mark.parametrize("path", ["/api/actions/run_full_export_top", "/api/actions/run_full_export_top_unattended"])
+def test_actions_run_full_export_top_external_strict_requires_checkpoint(tmp_path, monkeypatch, path):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    r = client.post(
+        path,
+        headers=hdr,
+        json={
+            "url": "https://www.twitch.tv/videos/123456789",
+            "top": 1,
+            "llm_mode": "external_strict",
+            "client_request_id": f"strict-checkpoint-{path.rsplit('/', 1)[-1]}",
+        },
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"] == "external_strict_requires_ai_checkpoint"
+
+
+def test_actions_export_director_picks_external_strict_requires_external_ai(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    pid = hashlib.sha256("twitch_export_strict_gate".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "video").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "exports").mkdir(parents=True, exist_ok=True)
+    video_path = proj_dir / "video" / "video.mp4"
+    video_path.write_bytes(b"")
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(video_path), "duration_seconds": 60.0},
+        "analysis": {"highlights": {"candidates": [{"rank": 1, "candidate_id": "cid1", "score": 1.0, "start_s": 10.0, "end_s": 20.0}]}},
+        "layout": {},
+        "selections": [],
+        "exports": [],
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+    (proj_dir / "analysis" / "director.json").write_text(
+        json.dumps(
+            {
+                "created_at": "now",
+                "pick_count": 1,
+                "picks": [{"rank": 1, "candidate_rank": 1, "variant_id": "medium", "start_s": 10.0, "end_s": 30.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    r = client.post(
+        "/api/actions/export_director_picks",
+        headers=hdr,
+        json={"project_id": pid, "limit": 1, "llm_mode": "external_strict", "client_request_id": "export-dir-strict-1"},
+    )
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "external_ai_incomplete"
+    assert any("semantic" in issue for issue in detail["issues"])
+
+
+def test_actions_export_director_picks_external_strict_succeeds_with_external_provenance(tmp_path, monkeypatch):
+    profile_path = tmp_path / "strict_external.yaml"
+    profile_path.write_text(
+        """
+analysis:
+  highlights:
+    llm_semantic_enabled: false
+    llm_filter_enabled: false
+  chapters:
+    enabled: false
+    llm_labeling: false
+ai:
+  director:
+    enabled: true
+""".strip(),
+        encoding="utf-8",
+    )
+    client = _make_client(tmp_path, monkeypatch, token="secret", profile_path=profile_path)
+    hdr = {"Authorization": "Bearer secret"}
+
+    from videopipeline.studio.jobs import JOB_MANAGER
+
+    pid = hashlib.sha256("twitch_export_strict_ok".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "video").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "exports").mkdir(parents=True, exist_ok=True)
+    video_path = proj_dir / "video" / "video.mp4"
+    video_path.write_bytes(b"")
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(video_path), "duration_seconds": 60.0},
+        "analysis": {
+            "highlights": {
+                "candidates": [
+                    {"rank": 1, "candidate_id": "cid1", "score": 1.0, "start_s": 10.0, "end_s": 20.0, "peak_time_s": 15.0},
+                ]
+            }
+        },
+        "layout": {},
+        "selections": [],
+        "exports": [],
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+    (proj_dir / "analysis" / "variants.json").write_text(
+        json.dumps(
+            {
+                "created_at": "now",
+                "candidates": [
+                    {
+                        "candidate_rank": 1,
+                        "candidate_id": "cid1",
+                        "candidate_peak_time_s": 15.0,
+                        "variants": [{"variant_id": "medium", "start_s": 10.0, "end_s": 30.0, "duration_s": 20.0}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    apply_r = client.post(
+        "/api/actions/ai/apply_director_picks",
+        headers=hdr,
+        json={
+            "project_id": pid,
+            "client_request_id": "apply-dir-prov-1",
+            "provenance": {"agent": "gondull", "provider": "openai", "model": "gpt-5.3-xhigh"},
+            "picks": [{"candidate_id": "cid1", "variant_id": "medium", "title": "t", "hook": "h", "description": "d"}],
+        },
+    )
+    assert apply_r.status_code == 200
+    director = json.loads((proj_dir / "analysis" / "director.json").read_text(encoding="utf-8"))
+    assert director["provenance"]["agent"] == "gondull"
+    assert director["config"]["source"] == "chatgpt_actions"
+
+    def fake_start_export(*, proj, selection, export_dir, **kwargs):
+        job = JOB_MANAGER.create("export")
+        JOB_MANAGER._set(job, status="succeeded", progress=1.0, message="done", result={"output": str(export_dir / "dummy.mp4")})
+        return job
+
+    monkeypatch.setattr(JOB_MANAGER, "start_export", fake_start_export)
+
+    export_r = client.post(
+        "/api/actions/export_director_picks",
+        headers=hdr,
+        json={"project_id": pid, "limit": 1, "llm_mode": "external_strict", "client_request_id": "export-dir-prov-1"},
+    )
+    assert export_r.status_code == 200
+    job = _wait_for_terminal_job_state(export_r.json()["job_id"])
     assert job is not None
     assert job.status == "succeeded"
 

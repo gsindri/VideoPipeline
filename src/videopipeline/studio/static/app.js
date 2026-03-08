@@ -39,7 +39,16 @@ function setCandidateSourceFilter(mode) {
 
 function normalizeLlmMode(mode) {
   const m = String(mode || '').trim().toLowerCase();
-  return (m === 'local' || m === 'external') ? m : 'external';
+  if (m === 'gondull') return 'external_strict';
+  return (m === 'local' || m === 'external' || m === 'external_strict') ? m : 'external';
+}
+
+function isExternalLlmMode(mode) {
+  return normalizeLlmMode(mode) !== 'local';
+}
+
+function isStrictExternalLlmMode(mode) {
+  return normalizeLlmMode(mode) === 'external_strict';
 }
 
 function getLlmModeStorageKey() {
@@ -2261,8 +2270,8 @@ function renderPipelineStatus() {
           const timeStr = d.elapsed_seconds != null ? ` • ${fmtDuration(d.elapsed_seconds)}` : '';
           return { state: 'done', detail: `${count} clips analyzed • ${llm}${timeStr}` };
         }
-        if (getLlmMode() === 'external') {
-          return { state: 'skipped', detail: 'Actions-only mode (in-app AI disabled)' };
+        if (isExternalLlmMode(getLlmMode())) {
+          return { state: 'skipped', detail: 'External AI mode (in-app AI disabled)' };
         }
         // Check if AI is disabled
         const aiEnabled = profile?.ai?.director?.enabled !== false;
@@ -2369,7 +2378,7 @@ function renderPipelineStatus() {
   const hasHighlights = highlights?.candidates?.length > 0;
   const llmScoringUsed = highlights?.signals_used?.llm_semantic;
   const llmFilterUsed = highlights?.signals_used?.llm_filter;
-  const showAISection = hasHighlights && getLlmMode() !== 'external' && (!llmScoringUsed || !llmFilterUsed);
+  const showAISection = hasHighlights && !isExternalLlmMode(getLlmMode()) && (!llmScoringUsed || !llmFilterUsed);
   
   if (showAISection) {
     html += `
@@ -2630,7 +2639,7 @@ async function showTaskDetailsModal(taskId) {
     }
     
     // Add "Apply LLM Scoring" button for highlights task when llm_semantic is not true
-    const showLlmScoringBtn = getLlmMode() !== 'external' && taskId === 'highlights' && 
+    const showLlmScoringBtn = !isExternalLlmMode(getLlmMode()) && taskId === 'highlights' &&
       data.summary?.signals_used && 
       !data.summary.signals_used.llm_semantic;
     
@@ -2651,7 +2660,7 @@ async function showTaskDetailsModal(taskId) {
     }
     
     // Add "Apply LLM Filter" button when llm_filter is not true (more aggressive than scoring)
-    const showLlmFilterBtn = getLlmMode() !== 'external' && taskId === 'highlights' && 
+    const showLlmFilterBtn = !isExternalLlmMode(getLlmMode()) && taskId === 'highlights' &&
       data.summary?.signals_used && 
       !data.summary.signals_used.llm_filter;
     
@@ -4400,14 +4409,14 @@ function setupFacecamCanvas() {
 
 async function startAnalyzeJob() {
   const llmMode = getLlmMode();
-  $('#analysisStatus').textContent = llmMode === 'external' ? 'Starting analysis (actions-only mode)...' : 'Starting analysis (in-app AI mode)...';
+  $('#analysisStatus').textContent = isExternalLlmMode(llmMode) ? 'Starting analysis (external AI mode)...' : 'Starting analysis (in-app AI mode)...';
   const contentType = $('#contentType')?.value || 'gaming';
   const body = {
     highlights: {
       content_type: contentType
     }
   };
-  if (llmMode === 'external') {
+  if (isExternalLlmMode(llmMode)) {
     // Ensure we don't attempt any in-app AI calls in this run.
     body.highlights.llm_semantic_enabled = false;
     body.highlights.llm_filter_enabled = false;
@@ -4437,7 +4446,7 @@ async function startAnalyzeAudioEventsJob() {
 
 async function startAnalyzeFullJob() {
   const llmMode = getLlmMode();
-  $('#analysisStatus').textContent = llmMode === 'external' ? 'Starting full analysis (actions-only mode)...' : 'Starting full parallel analysis (in-app AI)...';
+  $('#analysisStatus').textContent = isExternalLlmMode(llmMode) ? 'Starting full analysis (external AI mode)...' : 'Starting full parallel analysis (in-app AI)...';
   const motionMode = $('#motionWeightMode')?.value || 'low';
   const contentType = $('#contentType')?.value || 'gaming';
   const whisperBackend = $('#whisperBackend')?.value || 'auto';
@@ -4467,7 +4476,7 @@ async function startAnalyzeFullJob() {
       trace_tf_imports: traceTfImports
     }
   };
-  if (llmMode === 'external') {
+  if (isExternalLlmMode(llmMode)) {
     // Actions-only mode means: local compute runs, but we intentionally avoid in-app AI steps.
     // ChatGPT (via Actions) can later fetch bounded inputs and write decisions back.
     body.highlights.llm_semantic_enabled = false;
@@ -4510,9 +4519,11 @@ async function startAnalyzeSpeechJob() {
 
 async function startAnalyzeContextJob() {
   const llmMode = getLlmMode();
-  if (llmMode === 'external') {
-    $('#analysisStatus').textContent = 'Actions-only mode: use ChatGPT Actions for packaging/picks.';
-    alert('Actions-only mode is enabled.\n\nIn-app AI steps are disabled for this run.\n\nUse ChatGPT (via Actions) to do packaging/picks:\n- GET /api/actions/ai/candidates (default mix: top 30 + 15 chat-spike)\n- GET /api/actions/ai/variants\n- POST /api/actions/ai/apply_director_picks\n- POST /api/actions/export_director_picks\n\nTip: open the Actions Helper to copy the OpenAPI import URL.');
+  if (isExternalLlmMode(llmMode)) {
+    $('#analysisStatus').textContent = isStrictExternalLlmMode(llmMode)
+      ? 'Strict external AI mode: use Gondull/Actions for semantic scoring, chapter labels, and director picks before export.'
+      : 'Actions-only mode: use ChatGPT Actions for packaging/picks.';
+    alert('External AI mode is enabled.\n\nIn-app AI steps are disabled for this run.\n\nRecommended workflow:\n- GET /api/actions/ai/bundle\n- POST /api/actions/ai/apply_semantic\n- POST /api/actions/ai/apply_chapter_labels\n- POST /api/actions/ai/apply_director_picks\n- POST /api/actions/export_director_picks\n\nTip: open the Actions Helper to copy the OpenAPI import URL.');
     openActionsHelperModal();
     return;
   }
@@ -6285,8 +6296,8 @@ function wireRelearnButton() {
   if (!btn) return;
   
   btn.onclick = async () => {
-    if (getLlmMode() === 'external') {
-      alert('Actions-only mode is enabled.\n\nIn-app chat emote learning is disabled in this mode. Switch Brain to "In-app AI" to use Re-learn.');
+    if (isExternalLlmMode(getLlmMode())) {
+      alert('External AI mode is enabled.\n\nIn-app chat emote learning is disabled in this mode. Switch Brain to "In-app AI" to use Re-learn.');
       return;
     }
     if (!confirm('This will clear the cached emote data and require re-analysis with Analyze (Full) to learn channel-specific emotes using AI.\n\nContinue?')) {

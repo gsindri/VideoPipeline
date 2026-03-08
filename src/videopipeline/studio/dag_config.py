@@ -6,9 +6,26 @@ from typing import Any, Dict, Mapping, Optional
 def normalize_llm_mode(value: Any) -> str:
     """Normalize llm_mode and validate allowed values."""
     mode = str(value or "local").strip().lower()
-    if mode not in {"local", "external"}:
+    if mode == "gondull":
+        mode = "external_strict"
+    if mode not in {"local", "external", "external_strict"}:
         raise ValueError("invalid_llm_mode")
     return mode
+
+
+def llm_mode_uses_local(value: Any) -> bool:
+    """Return True when the selected mode is allowed to invoke in-app LLMs."""
+    return normalize_llm_mode(value) == "local"
+
+
+def llm_mode_is_external(value: Any) -> bool:
+    """Return True when AI decisions are expected to happen outside Studio."""
+    return not llm_mode_uses_local(value)
+
+
+def llm_mode_is_strict_external(value: Any) -> bool:
+    """Return True when external AI completion is required before export."""
+    return normalize_llm_mode(value) == "external_strict"
 
 
 def build_dag_config(
@@ -61,7 +78,7 @@ def apply_llm_mode_to_dag_config(
         if isinstance(value, dict):
             cfg[key] = dict(value)
 
-    if mode != "external":
+    if mode == "local":
         return cfg
 
     highlights_cfg = dict(cfg.get("highlights", {}) or {})

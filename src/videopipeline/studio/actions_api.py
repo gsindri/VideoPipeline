@@ -34,6 +34,8 @@ from .dag_config import (
     apply_llm_mode_to_dag_config,
     build_dag_config,
     dag_config_needs_llm,
+    llm_mode_is_strict_external,
+    llm_mode_uses_local,
     normalize_llm_mode as _normalize_llm_mode_raw,
 )
 from .jobs import JOB_MANAGER, with_prevent_sleep
@@ -455,6 +457,200 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
         except ValueError:
             raise HTTPException(status_code=400, detail="invalid_llm_mode")
 
+    _LLM_MODE_ENUM = ["local", "external", "external_strict"]
+    _EXTERNAL_AI_SOURCES = {"chatgpt_actions", "external_ai", "gondull"}
+
+    def _extract_ai_provenance(
+        body: Dict[str, Any],
+        *,
+        client_request_id: str,
+        default_source: str = "chatgpt_actions",
+    ) -> Dict[str, Any]:
+        raw = body.get("provenance") or {}
+        if not isinstance(raw, dict):
+            raw = {}
+
+        merged = dict(raw)
+        for key in (
+            "agent",
+            "provider",
+            "model",
+            "model_family",
+            "prompt_id",
+            "prompt_version",
+            "request_id",
+            "run_id",
+            "notes",
+            "source",
+        ):
+            if key not in merged and body.get(key) is not None:
+                merged[key] = body.get(key)
+
+        out: Dict[str, Any] = {"source": str(merged.get("source") or default_source).strip() or default_source}
+        for key in (
+            "agent",
+            "provider",
+            "model",
+            "model_family",
+            "prompt_id",
+            "prompt_version",
+            "request_id",
+            "run_id",
+            "notes",
+        ):
+            val = merged.get(key)
+            if val is None:
+                continue
+            text = str(val).strip()
+            if text:
+                out[key] = text
+        if client_request_id:
+            out["client_request_id"] = client_request_id
+        return out
+
+    def _profile_external_ai_requirements() -> Dict[str, bool]:
+        analysis_cfg = profile.get("analysis", {}) or {}
+        highlights_cfg = analysis_cfg.get("highlights", {}) or {}
+        chapters_cfg = analysis_cfg.get("chapters", {}) or {}
+        ai_cfg = (profile.get("ai", {}) or {}).get("director", {}) or {}
+        director_cfg = analysis_cfg.get("director", {}) or {}
+        director_enabled = bool(director_cfg.get("enabled", ai_cfg.get("enabled", True)))
+        return {
+            "semantic": bool(highlights_cfg.get("llm_semantic_enabled", True) or highlights_cfg.get("llm_filter_enabled", False)),
+            "chapters": bool(chapters_cfg.get("enabled", True) and chapters_cfg.get("llm_labeling", True)),
+            "director": director_enabled,
+        }
+
+    def _external_ai_status(*, proj: Project, proj_data: Dict[str, Any]) -> Dict[str, Any]:
+        requirements = _profile_external_ai_requirements()
+        analysis_meta = proj_data.get("analysis", {}) or {}
+        actions_meta = analysis_meta.get("actions", {}) or {}
+        chapters_meta = analysis_meta.get("chapters", {}) or {}
+        director_meta = analysis_meta.get("director", {}) or {}
+        highlights_meta = analysis_meta.get("highlights", {}) or {}
+        candidates = [c for c in (highlights_meta.get("candidates") or []) if isinstance(c, dict)]
+
+        semantic_count = 0
+        for cand in candidates:
+            ai = cand.get("ai")
+            if not isinstance(ai, dict):
+                continue
+            source = str(ai.get("semantic_source") or "").strip()
+            if source in _EXTERNAL_AI_SOURCES:
+                semantic_count += 1
+
+        chapters_path = proj.analysis_dir / "chapters.json"
+        chapter_count = 0
+        labeled_chapter_count = 0
+        if chapters_path.exists():
+            try:
+                chapters_payload = json.loads(chapters_path.read_text(encoding="utf-8"))
+                chapters_items = [c for c in (chapters_payload.get("chapters") or []) if isinstance(c, dict)]
+                chapter_count = len(chapters_items)
+                labeled_chapter_count = sum(
+                    1
+                    for ch in chapters_items
+                    if str(ch.get("labels_source") or "").strip() in _EXTERNAL_AI_SOURCES
+                )
+            except Exception:
+                chapter_count = 0
+                labeled_chapter_count = 0
+
+        director_path = proj.analysis_dir / "director.json"
+        director_pick_count = 0
+        director_source = str(director_meta.get("source") or "").strip()
+        director_provenance = director_meta.get("provenance")
+        if not isinstance(director_provenance, dict):
+            director_provenance = None
+        if director_path.exists():
+            try:
+                director_payload = json.loads(director_path.read_text(encoding="utf-8"))
+                director_pick_count = int(director_payload.get("pick_count") or 0)
+                director_source = str(
+                    director_source
+                    or ((director_payload.get("config") or {}).get("source") or director_payload.get("source") or "")
+                ).strip()
+                payload_provenance = director_payload.get("provenance")
+                if isinstance(payload_provenance, dict):
+                    director_provenance = payload_provenance
+            except Exception:
+                director_pick_count = 0
+
+        semantic_done = (not requirements["semantic"]) or (
+            bool(actions_meta.get("semantic_applied_at"))
+            and (len(candidates) == 0 or semantic_count >= len(candidates))
+        )
+        chapters_done = (not requirements["chapters"]) or (
+            bool(chapters_meta.get("labels_updated_at"))
+            and chapter_count > 0
+            and labeled_chapter_count >= chapter_count
+        )
+        director_done = (not requirements["director"]) or (
+            director_pick_count > 0
+            and (
+                director_source in _EXTERNAL_AI_SOURCES
+                or str(((director_provenance or {}).get("source")) or "").strip() in _EXTERNAL_AI_SOURCES
+            )
+        )
+
+        issues: list[str] = []
+        if requirements["semantic"] and not semantic_done:
+            if candidates:
+                issues.append(f"semantic decisions incomplete ({semantic_count}/{len(candidates)})")
+            else:
+                issues.append("semantic decisions have not been applied")
+        if requirements["chapters"] and not chapters_done:
+            if chapter_count <= 0:
+                issues.append("chapter labels are required but chapters are not available yet")
+            else:
+                issues.append(f"chapter labels incomplete ({labeled_chapter_count}/{chapter_count})")
+        if requirements["director"] and not director_done:
+            issues.append("director picks with external provenance are required before export")
+
+        return {
+            "required": requirements,
+            "completed": {
+                "semantic": semantic_done,
+                "chapters": chapters_done,
+                "director": director_done,
+            },
+            "details": {
+                "semantic": {
+                    "applied_at": actions_meta.get("semantic_applied_at"),
+                    "candidate_count": len(candidates),
+                    "externally_scored_candidates": semantic_count,
+                },
+                "chapters": {
+                    "labels_updated_at": chapters_meta.get("labels_updated_at"),
+                    "chapter_count": chapter_count,
+                    "externally_labeled_chapters": labeled_chapter_count,
+                },
+                "director": {
+                    "pick_count": director_pick_count,
+                    "source": director_source or None,
+                    "provenance": director_provenance,
+                },
+            },
+            "strict_export_ready": not issues,
+            "issues": issues,
+        }
+
+    def _require_external_ai_ready_for_export(*, project_id: str, proj: Project, proj_data: Dict[str, Any], llm_mode: str) -> None:
+        if not llm_mode_is_strict_external(llm_mode):
+            return
+        status = _external_ai_status(proj=proj, proj_data=proj_data)
+        if status["strict_export_ready"]:
+            return
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "external_ai_incomplete",
+                "project_id": project_id,
+                "issues": status["issues"],
+                "status": status,
+            },
+        )
+
     def _rate_limit(request: Request) -> str:
         actor_key = _request_actor_key(request)
         ok, retry_after_s = limiter.allow(actor_key)
@@ -532,9 +728,9 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                             "overrides": {"type": "object", "additionalProperties": True},
                             "llm_mode": {
                                 "type": "string",
-                                "enum": ["local", "external"],
+                                "enum": list(_LLM_MODE_ENUM),
                                 "default": "local",
-                                "description": "LLM mode for analysis: local uses configured local LLM, external skips local LLM and expects ChatGPT-in-the-loop via Actions.",
+                                "description": "LLM mode for analysis: local uses in-app AI, external skips in-app AI, external_strict skips in-app AI and requires external AI completion before export.",
                             },
                             "client_request_id": {"type": "string"},
                         },
@@ -583,8 +779,9 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                             "analyze_overrides": {"type": "object", "additionalProperties": True},
                             "llm_mode": {
                                 "type": "string",
-                                "enum": ["local", "external"],
+                                "enum": list(_LLM_MODE_ENUM),
                                 "default": "local",
+                                "description": "LLM mode for analysis: local uses in-app AI, external skips in-app AI, external_strict skips in-app AI and requires the external AI checkpoint before export.",
                             },
                             "client_request_id": {"type": "string"},
                         },
@@ -613,8 +810,9 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                             "analyze_overrides": {"type": "object", "additionalProperties": True},
                             "llm_mode": {
                                 "type": "string",
-                                "enum": ["local", "external"],
+                                "enum": list(_LLM_MODE_ENUM),
                                 "default": "local",
+                                "description": "LLM mode for unattended runs: local uses in-app AI, external skips in-app AI, external_strict rejects unattended export so external AI must checkpoint first.",
                             },
                             "client_request_id": {"type": "string"},
                         },
@@ -740,6 +938,11 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                         "properties": {},
                         "additionalProperties": True,
                     },
+                    "AiBundleResponse": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": True,
+                    },
                     "AiVariantsResponse": {
                         "type": "object",
                         "properties": {},
@@ -754,6 +957,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                         "type": "object",
                         "properties": {
                             "project_id": {"type": "string"},
+                            "provenance": {"type": "object", "additionalProperties": True},
                             "items": {
                                 "type": "array",
                                 "items": {
@@ -791,6 +995,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                         "type": "object",
                         "properties": {
                             "project_id": {"type": "string"},
+                            "provenance": {"type": "object", "additionalProperties": True},
                             "items": {
                                 "type": "array",
                                 "items": {
@@ -826,6 +1031,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                         "type": "object",
                         "properties": {
                             "project_id": {"type": "string"},
+                            "provenance": {"type": "object", "additionalProperties": True},
                             "picks": {
                                 "type": "array",
                                 "items": {
@@ -864,6 +1070,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                         "properties": {
                             "project_id": {"type": "string"},
                             "limit": {"type": "integer"},
+                            "llm_mode": {"type": "string", "enum": list(_LLM_MODE_ENUM), "default": "local"},
                             "export": {"type": "object", "additionalProperties": True},
                             "captions": {"type": "object", "additionalProperties": True},
                             "hook_text": {"type": "object", "additionalProperties": True},
@@ -1298,6 +1505,32 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                                 "description": "Candidates bundle",
                                 "content": {
                                     "application/json": {"schema": {"$ref": "#/components/schemas/AiCandidatesResponse"}}
+                                },
+                            }
+                        },
+                    }
+                },
+                "/api/actions/ai/bundle": {
+                    "get": {
+                        "summary": "Fetch a single external-AI work bundle",
+                        "operationId": "vp_actions_ai_bundle",
+                        "x-openai-isConsequential": False,
+                        "parameters": [
+                            {"name": "project_id", "in": "query", "required": True, "schema": {"type": "string"}},
+                            {"name": "top_n", "in": "query", "required": False, "schema": {"type": "integer"}},
+                            {"name": "chat_top_n", "in": "query", "required": False, "schema": {"type": "integer"}},
+                            {"name": "window_s", "in": "query", "required": False, "schema": {"type": "number"}},
+                            {"name": "max_chars", "in": "query", "required": False, "schema": {"type": "integer"}},
+                            {"name": "chat_lines", "in": "query", "required": False, "schema": {"type": "integer"}},
+                            {"name": "max_variants", "in": "query", "required": False, "schema": {"type": "integer"}},
+                            {"name": "chapter_limit", "in": "query", "required": False, "schema": {"type": "integer"}},
+                            {"name": "chapter_max_chars", "in": "query", "required": False, "schema": {"type": "integer"}},
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "AI work bundle",
+                                "content": {
+                                    "application/json": {"schema": {"$ref": "#/components/schemas/AiBundleResponse"}}
                                 },
                             }
                         },
@@ -1809,7 +2042,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
             dag_config = apply_llm_mode_to_dag_config(dag_config, llm_mode=llm_mode)
 
             llm_complete_fn = None
-            if llm_mode != "external":
+            if llm_mode_uses_local(llm_mode):
                 try:
                     ai_cfg = profile.get("ai", {}).get("director", {}) or {}
                     llm_needed = dag_config_needs_llm(dag_config)
@@ -2064,6 +2297,11 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
         pip_cfg: Optional[Dict[str, Any]] = None,
     ) -> Any:
         llm_mode = _normalize_llm_mode(llm_mode)
+        if export_top is not None and llm_mode_is_strict_external(llm_mode):
+            raise HTTPException(
+                status_code=409,
+                detail="external_strict_requires_ai_checkpoint",
+            )
         run_job = JOB_MANAGER.create("run")
 
         steps: Dict[str, Any] = {}
@@ -2661,7 +2899,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                 dag_config = apply_llm_mode_to_dag_config(dag_config, llm_mode=llm_mode)
 
                 llm_complete_fn = None
-                if llm_mode != "external":
+                if llm_mode_uses_local(llm_mode):
                     try:
                         ai_cfg = profile.get("ai", {}).get("director", {}) or {}
                         llm_needed = dag_config_needs_llm(dag_config)
@@ -3186,9 +3424,8 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
 
         return []
 
-    @router.get("/ai/candidates", openapi_extra={"x-openai-isConsequential": False})
-    def ai_candidates(
-        request: Request,
+    def _build_ai_candidates_payload(
+        *,
         project_id: str,
         top_n: Optional[int] = None,
         chat_top_n: Optional[int] = None,
@@ -3196,16 +3433,8 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
         window_s: float = 4.0,
         max_chars: int = 800,
         chat_lines: int = 8,
-    ):
-        """Fetch AI-ready highlight candidates with bounded transcript/chat context.
-
-        Default strategy (when top_n/chat_top_n/chat_top omitted):
-          - top 30 by fused multi-signal score
-          - plus 15 chat-spike outliers (deduped)
-        """
-        _rate_limit(request)
+    ) -> Dict[str, Any]:
         pid = _validate_project_id(project_id)
-
         top_n_provided = top_n is not None
         # `chat_top` is a compatibility alias for macro prompts.
         chat_top_n_effective = chat_top_n if chat_top_n is not None else chat_top
@@ -3329,65 +3558,89 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
         director_cfg = _director_config_from_profile()
         director_template_default = _director_default_template(director_cfg)
 
+        return {
+            "meta": meta,
+            "limits": {
+                "top_n": top_n,
+                "chat_top_n": chat_top_n_i,
+                "window_s": window_s,
+                "max_chars": max_chars,
+                "chat_lines": chat_lines,
+            },
+            "strategy": {
+                "mode": "hybrid_top_plus_chat" if chat_top_n_i > 0 else "top_only",
+                "multi_signal_count": len([1 for _, src in selected if src == "multi_signal"]),
+                "chat_spike_count": chat_spike_count,
+                "total_selected": len(selected),
+                "total_candidates_available": len(all_candidates),
+            },
+            "ai_guidance": {
+                "semantic_scoring": {
+                    "content_type": content_type,
+                    "description": guide.get("description", ""),
+                    "high_value": list(guide.get("high_value", []) or []),
+                    "low_value": list(guide.get("low_value", []) or []),
+                    "instruction": (
+                        "Use transcript/chat context and signal data together; keep high-signal moments high unless "
+                        "content is clearly weak."
+                    ),
+                },
+                "director_constraints": {
+                    "top_n": int(director_cfg.top_n),
+                    "min_gap_s": float(director_cfg.min_gap_s),
+                    "max_overlap_ratio": float(director_cfg.max_overlap_ratio),
+                    "max_overlap_s": float(director_cfg.max_overlap_s),
+                    "title_max_chars": int(director_cfg.title_max_chars),
+                    "hook_max_chars": int(director_cfg.hook_max_chars),
+                    "description_max_chars": int(director_cfg.description_max_chars),
+                    "allowed_templates": list(director_cfg.allowed_templates or []),
+                    "default_template": director_template_default,
+                    "chapter_diversity_max_per_chapter": 2,
+                },
+            },
+            "candidates": out,
+            "total_candidates": len(all_candidates),
+        }
+
+    @router.get("/ai/candidates", openapi_extra={"x-openai-isConsequential": False})
+    def ai_candidates(
+        request: Request,
+        project_id: str,
+        top_n: Optional[int] = None,
+        chat_top_n: Optional[int] = None,
+        chat_top: Optional[int] = None,
+        window_s: float = 4.0,
+        max_chars: int = 800,
+        chat_lines: int = 8,
+    ):
+        """Fetch AI-ready highlight candidates with bounded transcript/chat context.
+
+        Default strategy (when top_n/chat_top_n/chat_top omitted):
+          - top 30 by fused multi-signal score
+          - plus 15 chat-spike outliers (deduped)
+        """
+        _rate_limit(request)
         return JSONResponse(
-            {
-                "meta": meta,
-                "limits": {
-                    "top_n": top_n,
-                    "chat_top_n": chat_top_n_i,
-                    "window_s": window_s,
-                    "max_chars": max_chars,
-                    "chat_lines": chat_lines,
-                },
-                "strategy": {
-                    "mode": "hybrid_top_plus_chat" if chat_top_n_i > 0 else "top_only",
-                    "multi_signal_count": len([1 for _, src in selected if src == "multi_signal"]),
-                    "chat_spike_count": chat_spike_count,
-                    "total_selected": len(selected),
-                    "total_candidates_available": len(all_candidates),
-                },
-                "ai_guidance": {
-                    "semantic_scoring": {
-                        "content_type": content_type,
-                        "description": guide.get("description", ""),
-                        "high_value": list(guide.get("high_value", []) or []),
-                        "low_value": list(guide.get("low_value", []) or []),
-                        "instruction": (
-                            "Use transcript/chat context and signal data together; keep high-signal moments high unless "
-                            "content is clearly weak."
-                        ),
-                    },
-                    "director_constraints": {
-                        "top_n": int(director_cfg.top_n),
-                        "min_gap_s": float(director_cfg.min_gap_s),
-                        "max_overlap_ratio": float(director_cfg.max_overlap_ratio),
-                        "max_overlap_s": float(director_cfg.max_overlap_s),
-                        "title_max_chars": int(director_cfg.title_max_chars),
-                        "hook_max_chars": int(director_cfg.hook_max_chars),
-                        "description_max_chars": int(director_cfg.description_max_chars),
-                        "allowed_templates": list(director_cfg.allowed_templates or []),
-                        "default_template": director_template_default,
-                        "chapter_diversity_max_per_chapter": 2,
-                    },
-                },
-                "candidates": out,
-                "total_candidates": len(all_candidates),
-            }
+            _build_ai_candidates_payload(
+                project_id=project_id,
+                top_n=top_n,
+                chat_top_n=chat_top_n,
+                chat_top=chat_top,
+                window_s=window_s,
+                max_chars=max_chars,
+                chat_lines=chat_lines,
+            )
         )
 
-    @router.get("/ai/variants", openapi_extra={"x-openai-isConsequential": False})
-    def ai_variants(
-        request: Request,
+    def _build_ai_variants_payload(
+        *,
         project_id: str,
         top_n: int = 12,
         candidate_ranks: str = "",
         candidate_ids: str = "",
         max_variants: int = 8,
-    ):
-        """Fetch clip variants (variants.json) for AI selection."""
-        _rate_limit(request)
+    ) -> Dict[str, Any]:
         pid = _validate_project_id(project_id)
-
         top_n = _clamp_int(top_n, default=12, min_v=1, max_v=30)
         max_variants = _clamp_int(max_variants, default=8, min_v=1, max_v=30)
 
@@ -3484,35 +3737,50 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                 }
             )
 
+        return {
+            "meta": {
+                "project_id": pid,
+                "variant_file": "variants.json",
+                "candidate_count": len(out_candidates),
+            },
+            "limits": {
+                "top_n": top_n,
+                "candidate_ranks": ranks,
+                "candidate_ids": ids,
+                "max_variants": max_variants,
+            },
+            "candidates": out_candidates,
+        }
+
+    @router.get("/ai/variants", openapi_extra={"x-openai-isConsequential": False})
+    def ai_variants(
+        request: Request,
+        project_id: str,
+        top_n: int = 12,
+        candidate_ranks: str = "",
+        candidate_ids: str = "",
+        max_variants: int = 8,
+    ):
+        """Fetch clip variants (variants.json) for AI selection."""
+        _rate_limit(request)
         return JSONResponse(
-            {
-                "meta": {
-                    "project_id": pid,
-                    "variant_file": "variants.json",
-                    "candidate_count": len(out_candidates),
-                },
-                "limits": {
-                    "top_n": top_n,
-                    "candidate_ranks": ranks,
-                    "candidate_ids": ids,
-                    "max_variants": max_variants,
-                },
-                "candidates": out_candidates,
-            }
+            _build_ai_variants_payload(
+                project_id=project_id,
+                top_n=top_n,
+                candidate_ranks=candidate_ranks,
+                candidate_ids=candidate_ids,
+                max_variants=max_variants,
+            )
         )
 
-    @router.get("/ai/chapters", openapi_extra={"x-openai-isConsequential": False})
-    def ai_chapters(
-        request: Request,
+    def _build_ai_chapters_payload(
+        *,
         project_id: str,
         offset: int = 0,
         limit: int = 10,
         max_chars: int = 1200,
-    ):
-        """Fetch chapters (chapters.json) with bounded transcript context for labeling."""
-        _rate_limit(request)
+    ) -> Dict[str, Any]:
         pid = _validate_project_id(project_id)
-
         offset = _clamp_int(offset, default=0, min_v=0, max_v=10_000)
         limit = _clamp_int(limit, default=10, min_v=1, max_v=50)
         max_chars = _clamp_int(max_chars, default=1200, min_v=200, max_v=8000)
@@ -3559,15 +3827,120 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                 }
             )
 
+        return {
+            "meta": {
+                "project_id": pid,
+                "chapter_count": len(chapters),
+                "generated_at": data.get("generated_at"),
+            },
+            "limits": {"offset": offset, "limit": limit, "max_chars": max_chars},
+            "chapters": out_ch,
+        }
+
+    @router.get("/ai/chapters", openapi_extra={"x-openai-isConsequential": False})
+    def ai_chapters(
+        request: Request,
+        project_id: str,
+        offset: int = 0,
+        limit: int = 10,
+        max_chars: int = 1200,
+    ):
+        """Fetch chapters (chapters.json) with bounded transcript context for labeling."""
+        _rate_limit(request)
+        return JSONResponse(
+            _build_ai_chapters_payload(
+                project_id=project_id,
+                offset=offset,
+                limit=limit,
+                max_chars=max_chars,
+            )
+        )
+
+    @router.get("/ai/bundle", openapi_extra={"x-openai-isConsequential": False})
+    def ai_bundle(
+        request: Request,
+        project_id: str,
+        top_n: Optional[int] = None,
+        chat_top_n: Optional[int] = None,
+        window_s: float = 4.0,
+        max_chars: int = 800,
+        chat_lines: int = 8,
+        max_variants: int = 8,
+        chapter_limit: int = 50,
+        chapter_max_chars: int = 1200,
+    ):
+        """Fetch a single external-AI work bundle for Gondull/Actions workflows."""
+        _rate_limit(request)
+        pid = _validate_project_id(project_id)
+        proj, proj_data = _load_project(pid)
+
+        candidates_payload = _build_ai_candidates_payload(
+            project_id=pid,
+            top_n=top_n,
+            chat_top_n=chat_top_n,
+            window_s=window_s,
+            max_chars=max_chars,
+            chat_lines=chat_lines,
+        )
+        candidate_ids = [
+            str(c.get("candidate_id") or "").strip()
+            for c in (candidates_payload.get("candidates") or [])
+            if isinstance(c, dict) and str(c.get("candidate_id") or "").strip()
+        ]
+        variants_payload = _build_ai_variants_payload(
+            project_id=pid,
+            candidate_ids=",".join(candidate_ids),
+            max_variants=max_variants,
+        )
+
+        try:
+            chapters_payload = _build_ai_chapters_payload(
+                project_id=pid,
+                offset=0,
+                limit=chapter_limit,
+                max_chars=chapter_max_chars,
+            )
+            chapters_available = True
+            chapters_reason = None
+        except HTTPException as exc:
+            if exc.status_code == 404 and exc.detail == "no_chapters":
+                chapters_payload = {
+                    "meta": {"project_id": pid, "chapter_count": 0, "generated_at": None},
+                    "limits": {"offset": 0, "limit": chapter_limit, "max_chars": chapter_max_chars},
+                    "chapters": [],
+                }
+                chapters_available = False
+                chapters_reason = "no_chapters"
+            else:
+                raise
+
+        external_status = _external_ai_status(proj=proj, proj_data=proj_data)
         return JSONResponse(
             {
-                "meta": {
-                    "project_id": pid,
-                    "chapter_count": len(chapters),
-                    "generated_at": data.get("generated_at"),
+                "meta": candidates_payload.get("meta") or {"project_id": pid},
+                "workflow": {
+                    "preferred_llm_mode": "external_strict",
+                    "supported_llm_modes": list(_LLM_MODE_ENUM),
+                    "external_ai_status": external_status,
+                    "chapters_available": chapters_available,
+                    "chapters_reason": chapters_reason,
+                    "next_actions": {
+                        "semantic": "POST /api/actions/ai/apply_semantic",
+                        "chapters": "POST /api/actions/ai/apply_chapter_labels",
+                        "director": "POST /api/actions/ai/apply_director_picks",
+                        "export": "POST /api/actions/export_director_picks",
+                    },
                 },
-                "limits": {"offset": offset, "limit": limit, "max_chars": max_chars},
-                "chapters": out_ch,
+                "guidance": candidates_payload.get("ai_guidance") or {},
+                "limits": {
+                    "candidates": candidates_payload.get("limits") or {},
+                    "variants": variants_payload.get("limits") or {},
+                    "chapters": chapters_payload.get("limits") or {},
+                },
+                "strategy": candidates_payload.get("strategy") or {},
+                "candidates": candidates_payload.get("candidates") or [],
+                "variants": variants_payload.get("candidates") or [],
+                "chapters": chapters_payload.get("chapters") or [],
             }
         )
 
@@ -3582,6 +3955,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
             return JSONResponse(existing)
 
         project_id = _validate_project_id(str(body.get("project_id") or ""))
+        provenance = _extract_ai_provenance(body, client_request_id=client_request_id)
         items = body.get("items") or []
         if not isinstance(items, list):
             raise HTTPException(status_code=400, detail="invalid_items")
@@ -3628,6 +4002,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
         from ..project import update_project, utc_now_iso
 
         now = utc_now_iso()
+        semantic_provenance = {**provenance, "recorded_at": now}
         missing_ranks: list[int] = []
         missing_candidate_ids: list[str] = []
         updated_keys: set[str] = set()
@@ -3656,8 +4031,9 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
             ai["semantic_reason"] = upd.get("reason") or ""
             ai["semantic_best_quote"] = upd.get("best_quote") or ""
             ai["semantic_keep"] = bool(upd.get("keep", True))
-            ai["semantic_source"] = "chatgpt_actions"
+            ai["semantic_source"] = semantic_provenance["source"]
             ai["semantic_updated_at"] = now
+            ai["semantic_provenance"] = dict(semantic_provenance)
 
             # Compatibility fields used by local-LLM semantic scoring.
             c["score_semantic"] = upd["semantic_score"]
@@ -3710,6 +4086,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
             d.setdefault("analysis", {})
             d["analysis"].setdefault("actions", {})
             d["analysis"]["actions"]["semantic_applied_at"] = now
+            d["analysis"]["actions"]["semantic_provenance"] = dict(semantic_provenance)
 
         update_project(proj, _upd_project)
 
@@ -3740,6 +4117,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
             "updated_count": len(updated_keys) if updated_keys else 0,
             "missing_ranks": sorted(set(missing_ranks)),
             "missing_candidate_ids": sorted(set(missing_candidate_ids)),
+            "provenance": semantic_provenance,
         }
         idem.set(actor_key, client_request_id, payload)
         return JSONResponse(payload)
@@ -3755,6 +4133,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
             return JSONResponse(existing)
 
         project_id = _validate_project_id(str(body.get("project_id") or ""))
+        provenance = _extract_ai_provenance(body, client_request_id=client_request_id)
         items = body.get("items") or []
         if not isinstance(items, list):
             raise HTTPException(status_code=400, detail="invalid_items")
@@ -3788,6 +4167,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
         from ..project import update_project, utc_now_iso
 
         now = utc_now_iso()
+        label_provenance = {**provenance, "recorded_at": now}
         data = json.loads(chapters_path.read_text(encoding="utf-8"))
         chapters = data.get("chapters") or []
         if not isinstance(chapters, list):
@@ -3811,21 +4191,30 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                     ch["keywords"] = [str(x) for x in kws if str(x).strip()]
             if patch.get("type") is not None:
                 ch["type"] = str(patch.get("type") or "content")
-            ch["labels_source"] = "chatgpt_actions"
+            ch["labels_source"] = label_provenance["source"]
             ch["labels_updated_at"] = now
+            ch["labels_provenance"] = dict(label_provenance)
             updated += 1
 
         data["labels_updated_at"] = now
+        data["labels_provenance"] = dict(label_provenance)
         save_json(chapters_path, data)
 
         def _upd(d: Dict[str, Any]) -> None:
             d.setdefault("analysis", {})
             d["analysis"].setdefault("chapters", {})
             d["analysis"]["chapters"]["labels_updated_at"] = now
+            d["analysis"]["chapters"]["labels_provenance"] = dict(label_provenance)
 
         update_project(proj, _upd)
 
-        payload = {"ok": True, "project_id": project_id, "updated_count": updated, "missing_ids": sorted(set(missing_ids))}
+        payload = {
+            "ok": True,
+            "project_id": project_id,
+            "updated_count": updated,
+            "missing_ids": sorted(set(missing_ids)),
+            "provenance": label_provenance,
+        }
         idem.set(actor_key, client_request_id, payload)
         return JSONResponse(payload)
 
@@ -3840,6 +4229,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
             return JSONResponse(existing)
 
         project_id = _validate_project_id(str(body.get("project_id") or ""))
+        provenance = _extract_ai_provenance(body, client_request_id=client_request_id)
         picks_in = body.get("picks") or body.get("items") or []
         if not isinstance(picks_in, list):
             raise HTTPException(status_code=400, detail="invalid_picks")
@@ -3874,6 +4264,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                 rank_by_cid[cid] = r
 
         now = utc_now_iso()
+        packaging_provenance = {**provenance, "recorded_at": now}
         picks: list[Dict[str, Any]] = []
         missing: list[Dict[str, Any]] = []
         director_cfg = _director_config_from_profile()
@@ -4032,12 +4423,13 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                 "description": description,
                 "hashtags": tags,
                 "template": template,
-                "packaging_source": "chatgpt_actions",
+                "packaging_source": packaging_provenance["source"],
                 "packaging_error": None,
                 "confidence": confidence,
                 "reasons": reasons_out,
                 "chapter_index": ch_idx,
                 "signals": cand.get("meta", {}),
+                "provenance": dict(packaging_provenance),
             }
             picks.append(pick)
             used_intervals.append((start_s, end_s, peak_time))
@@ -4049,8 +4441,9 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
 
         payload = {
             "created_at": now,
+            "provenance": dict(packaging_provenance),
             "config": {
-                "source": "chatgpt_actions",
+                "source": packaging_provenance["source"],
                 "top_n": int(director_cfg.top_n),
                 "min_gap_s": float(director_cfg.min_gap_s),
                 "max_overlap_ratio": float(director_cfg.max_overlap_ratio),
@@ -4059,7 +4452,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                 "allowed_templates": list(director_cfg.allowed_templates or []),
             },
             "pick_count": len(picks),
-            "packaging_counts": {"chatgpt_actions": len(picks)},
+            "packaging_counts": {packaging_provenance["source"]: len(picks)},
             "picks": picks,
         }
         director_path = proj.analysis_dir / "director.json"
@@ -4071,7 +4464,8 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                 "created_at": now,
                 "pick_count": len(picks),
                 "director_json": str(director_path.relative_to(proj.project_dir)),
-                "source": "chatgpt_actions",
+                "source": packaging_provenance["source"],
+                "provenance": dict(packaging_provenance),
             }
 
             # Best-effort: mirror packaging fields into candidates (like ai/director.py does).
@@ -4097,7 +4491,8 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                             "tags": pk.get("hashtags") or [],
                             "confidence": pk.get("confidence"),
                             "used_fallback": False,
-                            "packaging_source": "chatgpt_actions",
+                            "packaging_source": packaging_provenance["source"],
+                            "packaging_provenance": dict(packaging_provenance),
                         }
                     )
 
@@ -4109,6 +4504,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
             "director_path": str(director_path),
             "pick_count": len(picks),
             "missing": missing,
+            "provenance": packaging_provenance,
         }
         idem.set(actor_key, client_request_id, resp)
         return JSONResponse(resp)
@@ -4152,6 +4548,7 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
 
         project_id = _validate_project_id(str(body.get("project_id") or ""))
         limit = _clamp_int(body.get("limit"), default=5, min_v=1, max_v=30)
+        llm_mode = _normalize_llm_mode(body.get("llm_mode"))
 
         proj, proj_data = _load_project(project_id)
         if not Path(proj.video_path).exists():
@@ -4166,6 +4563,13 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
         if not picks:
             raise HTTPException(status_code=404, detail="no_picks")
         picks = picks[:limit]
+
+        _require_external_ai_ready_for_export(
+            project_id=project_id,
+            proj=proj,
+            proj_data=proj_data,
+            llm_mode=llm_mode,
+        )
 
         export_cfg = {**(profile.get("export", {}) or {}), **(body.get("export") or {})}
         cap_cfg = {**(profile.get("captions", {}) or {}), **(body.get("captions") or {})}
@@ -4378,7 +4782,12 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
 
         threading.Thread(target=runner, daemon=True).start()
 
-        payload = {"job_id": job.id, "project_id": project_id, "created_selection_ids": created_ids}
+        payload = {
+            "job_id": job.id,
+            "project_id": project_id,
+            "created_selection_ids": created_ids,
+            "llm_mode": llm_mode,
+        }
         idem.set(actor_key, client_request_id, payload)
         return JSONResponse(payload)
 
@@ -4569,6 +4978,12 @@ def create_actions_router(*, profile: Dict[str, Any], profile_path: Optional[Pat
                     "available": bool(is_chat_download_available()),
                     "platforms": get_supported_platforms(),
                     "twitch_downloader": get_twitch_downloader_info(include_version=False),
+                },
+                "llm": {
+                    "supported_modes": list(_LLM_MODE_ENUM),
+                    "aliases": {"gondull": "external_strict"},
+                    "preferred_mode": "external_strict",
+                    "profile_external_ai_requirements": _profile_external_ai_requirements(),
                 },
                 "profile": _profile_readiness(profile, profile_path=profile_path, backends=backends),
                 "paths": {

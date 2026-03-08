@@ -50,7 +50,14 @@ from .jobs import JOB_MANAGER, with_prevent_sleep
 from .range import ranged_file_response
 from .home import list_recent_projects, windows_open_video_dialog, check_video_exists
 from .publisher_api import create_publisher_router
-from .dag_config import apply_llm_mode_to_dag_config, build_dag_config, dag_config_needs_llm
+from .dag_config import (
+    apply_llm_mode_to_dag_config,
+    build_dag_config,
+    dag_config_needs_llm,
+    llm_mode_is_external,
+    llm_mode_uses_local,
+    normalize_llm_mode,
+)
 from ..ingest import (
     IngestRequest,
     IngestResult,
@@ -1653,7 +1660,7 @@ def create_app(
                 speed_mode: str - One of: auto, conservative, balanced, fast, aggressive
                 quality_cap: str - One of: source, 1080, 720, 480
                 verbose_logs: bool (default False) - Enable detailed internal logs (chat/emotes)
-            llm_mode: str - One of: local, external (default local)
+            llm_mode: str - One of: local, external, external_strict (default local)
             auto_open: bool - Automatically open as project when done (default True)
         
         Returns job_id for tracking progress.
@@ -1671,7 +1678,9 @@ def create_app(
         auto_open = bool(body.get("auto_open", True))
         llm_mode_raw = str(body.get("llm_mode") or "").strip().lower()
         llm_mode = "local" if llm_mode_raw == "" else llm_mode_raw
-        if llm_mode not in {"local", "external"}:
+        try:
+            llm_mode = normalize_llm_mode(llm_mode)
+        except ValueError:
             raise HTTPException(status_code=400, detail="invalid_llm_mode")
 
         # Parse speed mode
@@ -2284,7 +2293,7 @@ def create_app(
 
                     # Optional LLM support (semantic filtering/reranking + chat emote learning).
                     llm_complete_fn_pre = None
-                    if llm_mode != "external":
+                    if llm_mode_uses_local(llm_mode):
                         try:
                             llm_needed_pre = dag_config_needs_llm(dag_config)
                             ai_cfg_pre = ctx.profile.get("ai", {}).get("director", {}) or {}
@@ -2603,7 +2612,7 @@ def create_app(
                                             dag_config = apply_llm_mode_to_dag_config(dag_config, llm_mode=llm_mode)
 
                                             llm_complete_fn_chat = None
-                                            if llm_mode != "external":
+                                            if llm_mode_uses_local(llm_mode):
                                                 try:
                                                     ai_cfg = ctx.profile.get("ai", {}).get("director", {}) or {}
                                                     if ai_cfg.get("enabled", True) and dag_config_needs_llm(dag_config):
@@ -2683,7 +2692,7 @@ def create_app(
                                             dag_config = apply_llm_mode_to_dag_config(dag_config, llm_mode=llm_mode)
 
                                             llm_complete_fn_chat = None
-                                            if llm_mode != "external":
+                                            if llm_mode_uses_local(llm_mode):
                                                 try:
                                                     ai_cfg = ctx.profile.get("ai", {}).get("director", {}) or {}
                                                     if ai_cfg.get("enabled", True) and dag_config_needs_llm(dag_config):
@@ -3037,7 +3046,7 @@ def create_app(
                             if recompute_reason is None:
                                 log.debug("[CHAT] Chat features already exist (chat_features.npz); skipping recompute")
                             else:
-                                mode_uses_local_llm = (llm_mode != "external")
+                                mode_uses_local_llm = llm_mode_uses_local(llm_mode)
                                 status_msg = (
                                     "Learning chat emotes with AI..."
                                     if mode_uses_local_llm
@@ -3197,7 +3206,7 @@ def create_app(
 
                             # Optional LLM support (semantic filtering/reranking + chat emotes).
                             llm_complete_fn = None
-                            if llm_mode != "external":
+                            if llm_mode_uses_local(llm_mode):
                                 try:
                                     llm_needed = dag_config_needs_llm(dag_config)
                                     if ai_cfg.get("enabled", True) and llm_needed:
@@ -6060,7 +6069,7 @@ def create_app(
         
         Body:
             source_url: str - Optional URL override. If not provided, uses project's source URL.
-            llm_mode: str - One of: local, external (default local)
+            llm_mode: str - One of: local, external, external_strict (default local)
         
         Returns job_id for tracking progress.
         """
@@ -6073,7 +6082,9 @@ def create_app(
         source_url = str(body.get("source_url") or "").strip()
         llm_mode_raw = str(body.get("llm_mode") or "").strip().lower()
         llm_mode = "local" if llm_mode_raw == "" else llm_mode_raw
-        if llm_mode not in {"local", "external"}:
+        try:
+            llm_mode = normalize_llm_mode(llm_mode)
+        except ValueError:
             raise HTTPException(status_code=400, detail="invalid_llm_mode")
         if not source_url:
             source_url = get_source_url(proj) or ""
@@ -6146,11 +6157,11 @@ def create_app(
                 hop_s = float(ctx.profile.get("analysis", {}).get("audio", {}).get("hop_seconds", 0.5))
                 smooth_s = float(ctx.profile.get("analysis", {}).get("highlights", {}).get("chat_smooth_seconds", 3.0))
                 chat_llm_strict = bool((ctx.profile.get("analysis", {}).get("chat", {}) or {}).get("llm_strict", False))
-                chat_llm_strict = bool(chat_llm_strict and llm_mode != "external")
+                chat_llm_strict = bool(chat_llm_strict and llm_mode_uses_local(llm_mode))
                 
                 # Get LLM config for laugh emote learning (with auto-start)
                 llm_complete_fn = None
-                if llm_mode == "external":
+                if llm_mode_is_external(llm_mode):
                     JOB_MANAGER._set(job, message="External mode enabled; skipping local-LLM emote learning")
                 else:
                     # Local LLM config for laugh emote learning (with auto-start)
@@ -6226,7 +6237,7 @@ def create_app(
                         dag_config = apply_llm_mode_to_dag_config(dag_config, llm_mode=llm_mode)
 
                         llm_complete_fn = None
-                        if llm_mode != "external":
+                        if llm_mode_uses_local(llm_mode):
                             try:
                                 if ai_cfg.get("enabled", True) and dag_config_needs_llm(dag_config):
                                     llm_complete_fn = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
@@ -6243,7 +6254,7 @@ def create_app(
                             # Only run packaging tasks if transcript exists (avoids surprising long Whisper runs).
                             if proj.transcript_path.exists():
                                 targets.update({"variants"})
-                                if llm_mode != "external" and bool(director_cfg_for_dag.get("enabled", False)):
+                                if llm_mode_uses_local(llm_mode) and bool(director_cfg_for_dag.get("enabled", False)):
                                     targets.update({"director"})
 
                             dag_result = run_analysis(
