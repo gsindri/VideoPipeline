@@ -4606,6 +4606,117 @@ def create_actions_router(
             )
         )
 
+    def _channel_format_playbook() -> Dict[str, Any]:
+        return {
+            "channel_positioning": {
+                "rule": "Treat streamer clips as raw evidence for an editorial/commentary channel, not as the finished product.",
+                "audience_promise": "Every upload should add a clear host viewpoint, verdict, or framing that still makes sense if the source clip is shortened.",
+            },
+            "must_have_contribution": [
+                "Original commentary, narration, or written editorial framing",
+                "A clear thesis, verdict, ranking, or explanation for why the clip matters",
+                "Substantive structure beyond the source moment itself",
+                "Packaging that matches the actual point of the clip instead of generic clip-dump titling",
+            ],
+            "not_enough_on_their_own": [
+                "Vertical crop only",
+                "Captions only",
+                "Light meme edits or transitions only",
+                "Speed or pitch changes without new commentary",
+                "Long uninterrupted source playback",
+            ],
+            "formats": [
+                {
+                    "format_id": "commentary_breakdown",
+                    "label": "Commentary Breakdown",
+                    "best_for": "One strong clip with a clear payoff that benefits from host framing and a verdict.",
+                    "structure": [
+                        "Setup: tell the viewer what to watch for",
+                        "Short source moment",
+                        "Pause, replay, or annotate the key beat",
+                        "Host explanation, punchline, or criticism",
+                        "Final verdict or takeaway",
+                    ],
+                },
+                {
+                    "format_id": "ranked_roundup",
+                    "label": "Ranked Roundup",
+                    "best_for": "Two or more shortlisted clips where comparison is part of the entertainment.",
+                    "structure": [
+                        "Ranking premise or theme",
+                        "Clip A with brief verdict",
+                        "Clip B with brief verdict",
+                        "Comparison or scorecard",
+                        "Final ranking and winner",
+                    ],
+                },
+                {
+                    "format_id": "theme_compilation",
+                    "label": "Theme Compilation",
+                    "best_for": "Several clips tied together by one pattern, running joke, or repeated failure mode.",
+                    "structure": [
+                        "Theme intro",
+                        "Evidence clip",
+                        "Host explanation or connective tissue",
+                        "Next example",
+                        "Closing takeaway",
+                    ],
+                },
+            ],
+            "upload_guardrails": [
+                "Private or unlisted by default unless public release is explicitly approved",
+                "Prefer short, purposeful source excerpts over uninterrupted reposting",
+                "Use original voice, on-screen analysis, or host-written framing so the upload is recognizably yours",
+            ],
+        }
+
+    def _clip_format_recommendations(
+        *,
+        candidate: Dict[str, Any],
+        primary_variant: Optional[Dict[str, Any]],
+        shortlist_count: int,
+        chapter_context: Dict[str, Any],
+        has_export: bool,
+    ) -> list[Dict[str, Any]]:
+        duration_s = _safe_float(
+            (primary_variant or {}).get("duration_s"),
+            _safe_float(candidate.get("end_s"), 0.0) - _safe_float(candidate.get("start_s"), 0.0),
+        )
+        chapter_title = str(((chapter_context.get("current") or {}).get("title") or "")).strip()
+        recommendations: list[Dict[str, Any]] = [
+            {
+                "format_id": "commentary_breakdown",
+                "priority": "primary",
+                "reason": (
+                    "This shortlist item should be framed as a host-led breakdown so the commentary, not the borrowed clip alone, carries the upload."
+                ),
+            }
+        ]
+        if shortlist_count >= 2:
+            recommendations.append(
+                {
+                    "format_id": "ranked_roundup",
+                    "priority": "secondary",
+                    "reason": f"There are {shortlist_count} shortlisted clips available, so comparison/ranking is a viable editorial hook.",
+                }
+            )
+        if shortlist_count >= 3 or (chapter_title and duration_s >= 20.0):
+            reason = "This clip looks strong enough to support a recurring theme or pattern with connective host commentary."
+            if chapter_title:
+                reason = f'The surrounding chapter "{chapter_title}" provides a reusable theme for a multi-clip format.'
+            recommendations.append(
+                {
+                    "format_id": "theme_compilation",
+                    "priority": "secondary",
+                    "reason": reason,
+                }
+            )
+        if has_export and recommendations:
+            recommendations[0]["export_note"] = (
+                "An exported MP4 already exists, so verify pacing and whether the host framing still needs to be strengthened before upload."
+            )
+        return recommendations
+
     def _build_ai_clip_review_payload(
         *,
         project_id: str,
@@ -4985,6 +5096,13 @@ def create_actions_router(
                     "director_pick": director_pick_out,
                     "selections": matching_selections,
                     "exports": matching_exports,
+                    "format_recommendations": _clip_format_recommendations(
+                        candidate=candidate,
+                        primary_variant=primary_variant,
+                        shortlist_count=len(candidate_items),
+                        chapter_context=chapter_context,
+                        has_export=bool(matching_exports),
+                    ),
                     "status": {
                         "has_transcript_excerpt": bool(candidate.get("transcript_excerpt")),
                         "has_chat_excerpt": bool(candidate.get("chat_excerpt")),
@@ -5023,6 +5141,7 @@ def create_actions_router(
                 "variants": variants_payload.get("limits") or {},
                 "chapters": chapters_payload.get("limits") or {},
             },
+            "channel_format_spec": _channel_format_playbook(),
             "review_rubric": {
                 "goal": "Choose which shortlisted clips deserve export/upload and finalize the variant plus packaging.",
                 "criteria": [
@@ -5034,7 +5153,7 @@ def create_actions_router(
                 ],
                 "preferred_outputs": {
                     "semantic": "keep/reject + semantic_score + concise reason",
-                    "director": "variant_id + title + hook + description + hashtags + confidence",
+                    "director": "variant_id + format_id + title + hook + description + hashtags + confidence",
                 },
             },
             "clips": clips,

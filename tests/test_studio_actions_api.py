@@ -1183,7 +1183,15 @@ def test_actions_ai_bundle_reports_external_status(tmp_path, monkeypatch):
     assert len(data["variants"]) == 1
     assert len(data["chapters"]) == 1
     assert data["clip_review"]["meta"]["clip_count"] == 1
+    assert data["clip_review"]["channel_format_spec"]["channel_positioning"]["rule"].startswith(
+        "Treat streamer clips as raw evidence"
+    )
+    assert (
+        data["clip_review"]["review_rubric"]["preferred_outputs"]["director"]
+        == "variant_id + format_id + title + hook + description + hashtags + confidence"
+    )
     assert data["clip_review"]["clips"][0]["candidate"]["candidate_id"] == "cid1"
+    assert data["clip_review"]["clips"][0]["format_recommendations"][0]["format_id"] == "commentary_breakdown"
 
 
 def test_actions_ai_clip_review_joins_director_exports_and_chapters(tmp_path, monkeypatch):
@@ -1360,6 +1368,9 @@ def test_actions_ai_clip_review_joins_director_exports_and_chapters(tmp_path, mo
     assert clip["exports"][0]["privacy"] == "unlisted"
     assert clip["exports"][0]["selection_id"] == "sel1"
     assert clip["status"]["has_export"] is True
+    assert data["channel_format_spec"]["formats"][0]["format_id"] == "commentary_breakdown"
+    assert clip["format_recommendations"][0]["format_id"] == "commentary_breakdown"
+    assert "export_note" in clip["format_recommendations"][0]
 
 
 def test_actions_ai_candidates_returns_transcript_excerpt(tmp_path, monkeypatch):
