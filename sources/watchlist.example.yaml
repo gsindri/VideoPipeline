@@ -1,9 +1,13 @@
 shadow_mode: true
 sources:
-  - id: rebbi-twitch
-    label: Rebbi Twitch VODs
-    url: https://www.twitch.tv/rebbi/videos
+  # Twitch Helix-backed source discovery.
+  # Requires TWITCH_CLIENT_ID plus TWITCH_CLIENT_SECRET or TWITCH_APP_ACCESS_TOKEN.
+  - id: streamer-twitch
+    label: Streamer Twitch VODs
+    provider: twitch_helix
     platform: twitch
+    channel_login: streamer_name
+    url: https://www.twitch.tv/streamer_name/videos
     enabled: true
     priority: 4
     recent_hours: 72
@@ -21,11 +25,12 @@ sources:
       - archive
     tags:
       - gaming
-      - rebbi
+      - twitch
 
-  - id: rebbi-youtube
-    label: Rebbi YouTube uploads
-    url: https://www.youtube.com/@rebbi/videos
+  # Generic watchlist source via yt-dlp flat extraction.
+  - id: streamer-youtube
+    label: Streamer YouTube uploads
+    url: https://www.youtube.com/@streamer/videos
     platform: youtube
     enabled: true
     priority: 3

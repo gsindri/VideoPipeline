@@ -914,16 +914,25 @@ def create_actions_router(
         ]
         inbox_path, pending_entries = source_inbox_mod.list_source_inbox_entries(status="pending")
         issues: list[str] = []
+        fetch_ready_sources = 0
+        for item in enabled_sources:
+            provider_issue = source_scout_mod.source_preflight_issue(item)
+            if provider_issue:
+                label = str(item.get("label") or item.get("id") or item.get("url") or "source").strip()
+                issues.append(f"{label}: {provider_issue}")
+            else:
+                fetch_ready_sources += 1
         if watchlist_path is None:
             issues.append("source watchlist not found")
-        if not enabled_sources and not pending_entries:
+        if not fetch_ready_sources and not pending_entries:
             issues.append("no enabled scout sources or pending manual inbox entries")
         return {
             "configured": watchlist_path is not None,
-            "ready": bool((watchlist_path is not None and enabled_sources) or pending_entries),
+            "ready": bool((watchlist_path is not None and fetch_ready_sources) or pending_entries),
             "watchlist_path": str(watchlist_path) if watchlist_path is not None else None,
             "shadow_mode": bool(watchlist.get("shadow_mode", True)),
             "enabled_sources": len(enabled_sources),
+            "fetch_ready_sources": fetch_ready_sources,
             "inbox_path": str(inbox_path) if inbox_path is not None else None,
             "inbox_pending": len(pending_entries),
             "issues": issues,

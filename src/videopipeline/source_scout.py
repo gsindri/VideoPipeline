@@ -4,11 +4,13 @@ import json
 import os
 import re
 import time
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlsplit
 
+import requests
 import yaml
 
 from .project import default_projects_root
@@ -17,6 +19,16 @@ from .source_inbox import list_source_inbox_entries
 
 _YOUTUBE_ID_RE = re.compile(r"(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]+)")
 _TWITCH_VOD_ID_RE = re.compile(r"twitch\.tv/videos/(\d+)")
+_TWITCH_DURATION_RE = re.compile(
+    r"^(?:(?P<days>\d+)d)?(?:(?P<hours>\d+)h)?(?:(?P<minutes>\d+)m)?(?:(?P<seconds>\d+)s)?$"
+)
+
+_TWITCH_OAUTH_URL = "https://id.twitch.tv/oauth2/token"
+_TWITCH_HELIX_URL = "https://api.twitch.tv/helix"
+_TWITCH_HTTP_TIMEOUT_S = 10.0
+_TWITCH_TOKEN_LOCK = threading.Lock()
+_TWITCH_TOKEN_CACHE: dict[str, Any] = {"access_token": "", "expires_at": 0.0}
+_TWITCH_USER_CACHE: dict[str, dict[str, str]] = {}
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -159,7 +171,268 @@ def _match_any(text: str, words: list[str]) -> list[str]:
     return matches
 
 
+def _twitch_client_id() -> str:
+    return str(
+        os.environ.get("TWITCH_CLIENT_ID")
+        or os.environ.get("TWITCH_API_CLIENT_ID")
+        or ""
+    ).strip()
+
+
+def _twitch_client_secret() -> str:
+    return str(
+        os.environ.get("TWITCH_CLIENT_SECRET")
+        or os.environ.get("TWITCH_API_CLIENT_SECRET")
+        or ""
+    ).strip()
+
+
+def _twitch_static_access_token() -> str:
+    return str(
+        os.environ.get("TWITCH_APP_ACCESS_TOKEN")
+        or os.environ.get("TWITCH_ACCESS_TOKEN")
+        or ""
+    ).strip()
+
+
+def twitch_api_configured() -> bool:
+    client_id = _twitch_client_id()
+    if not client_id:
+        return False
+    return bool(_twitch_static_access_token() or _twitch_client_secret())
+
+
+def _twitch_source_login(source: Dict[str, Any]) -> str:
+    return str(
+        source.get("channel_login")
+        or source.get("twitch_login")
+        or source.get("login")
+        or ""
+    ).strip().lower()
+
+
+def _twitch_source_user_id(source: Dict[str, Any]) -> str:
+    return str(
+        source.get("channel_id")
+        or source.get("user_id")
+        or source.get("twitch_user_id")
+        or ""
+    ).strip()
+
+
+def source_preflight_issue(source: Dict[str, Any]) -> Optional[str]:
+    provider = str(source.get("provider") or "").strip().lower()
+    if provider not in {"twitch_helix", "twitch_api"}:
+        return None
+    if not twitch_api_configured():
+        return "TWITCH_CLIENT_ID plus TWITCH_CLIENT_SECRET or TWITCH_APP_ACCESS_TOKEN is required"
+    if not (_twitch_source_user_id(source) or _twitch_source_login(source)):
+        return "channel_login or user_id is required for twitch_helix sources"
+    return None
+
+
+def _parse_twitch_duration_seconds(value: Any) -> Optional[float]:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    match = _TWITCH_DURATION_RE.match(raw)
+    if not match:
+        return None
+    days = int(match.group("days") or 0)
+    hours = int(match.group("hours") or 0)
+    minutes = int(match.group("minutes") or 0)
+    seconds = int(match.group("seconds") or 0)
+    total = (days * 86400) + (hours * 3600) + (minutes * 60) + seconds
+    return float(total or 0)
+
+
+def _twitch_get_access_token(force_refresh: bool = False) -> tuple[str, str]:
+    client_id = _twitch_client_id()
+    if not client_id:
+        raise RuntimeError("TWITCH_CLIENT_ID is not set")
+
+    static_token = _twitch_static_access_token()
+    if static_token:
+        return client_id, static_token
+
+    client_secret = _twitch_client_secret()
+    if not client_secret:
+        raise RuntimeError("TWITCH_CLIENT_SECRET is not set")
+
+    now = time.time()
+    with _TWITCH_TOKEN_LOCK:
+        cached_token = str(_TWITCH_TOKEN_CACHE.get("access_token") or "").strip()
+        expires_at = float(_TWITCH_TOKEN_CACHE.get("expires_at") or 0.0)
+        if not force_refresh and cached_token and expires_at > now + 60.0:
+            return client_id, cached_token
+
+        resp = requests.post(
+            _TWITCH_OAUTH_URL,
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "grant_type": "client_credentials",
+            },
+            timeout=_TWITCH_HTTP_TIMEOUT_S,
+        )
+        detail = ""
+        if not resp.ok:
+            try:
+                payload = resp.json()
+                detail = str(
+                    payload.get("message")
+                    or payload.get("error_description")
+                    or payload.get("error")
+                    or ""
+                ).strip()
+            except Exception:
+                detail = resp.text.strip()
+            raise RuntimeError(
+                f"Twitch token request failed ({resp.status_code})"
+                + (f": {detail}" if detail else "")
+            )
+
+        payload = resp.json()
+        access_token = str(payload.get("access_token") or "").strip()
+        if not access_token:
+            raise RuntimeError("Twitch token response did not include access_token")
+        expires_in = max(0, _safe_int(payload.get("expires_in"), 0))
+        _TWITCH_TOKEN_CACHE["access_token"] = access_token
+        _TWITCH_TOKEN_CACHE["expires_at"] = now + float(expires_in)
+        return client_id, access_token
+
+
+def _twitch_api_get(
+    path: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
+    client_id, access_token = _twitch_get_access_token(force_refresh=force_refresh)
+    resp = requests.get(
+        f"{_TWITCH_HELIX_URL}/{path.lstrip('/')}",
+        headers={
+            "Client-ID": client_id,
+            "Authorization": f"Bearer {access_token}",
+        },
+        params=params,
+        timeout=_TWITCH_HTTP_TIMEOUT_S,
+    )
+    if resp.status_code == 401 and not force_refresh and not _twitch_static_access_token():
+        with _TWITCH_TOKEN_LOCK:
+            _TWITCH_TOKEN_CACHE["access_token"] = ""
+            _TWITCH_TOKEN_CACHE["expires_at"] = 0.0
+        return _twitch_api_get(path, params=params, force_refresh=True)
+    if not resp.ok:
+        detail = ""
+        try:
+            payload = resp.json()
+            detail = str(payload.get("message") or payload.get("error") or "").strip()
+        except Exception:
+            detail = resp.text.strip()
+        raise RuntimeError(
+            f"Twitch API {path} failed ({resp.status_code})"
+            + (f": {detail}" if detail else "")
+        )
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Twitch API {path} returned a non-object response")
+    return payload
+
+
+def _resolve_twitch_user(source: Dict[str, Any]) -> dict[str, str]:
+    user_id = _twitch_source_user_id(source)
+    if user_id:
+        login = _twitch_source_login(source)
+        return {
+            "id": user_id,
+            "login": login,
+            "display_name": str(source.get("label") or login or user_id).strip(),
+        }
+
+    login = _twitch_source_login(source)
+    if not login:
+        raise RuntimeError("channel_login or user_id is required for twitch_helix sources")
+    cached = _TWITCH_USER_CACHE.get(login)
+    if cached:
+        return cached
+
+    payload = _twitch_api_get("users", params={"login": login})
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError(f"Twitch user not found: {login}")
+    row = rows[0] if isinstance(rows[0], dict) else {}
+    resolved = {
+        "id": str(row.get("id") or "").strip(),
+        "login": str(row.get("login") or login).strip().lower(),
+        "display_name": str(row.get("display_name") or login).strip(),
+    }
+    if not resolved["id"]:
+        raise RuntimeError(f"Twitch user lookup returned no id for: {login}")
+    _TWITCH_USER_CACHE[login] = resolved
+    return resolved
+
+
+def _fetch_twitch_helix_entries(source: Dict[str, Any], *, limit: int) -> list[Dict[str, Any]]:
+    preflight_issue = source_preflight_issue(source)
+    if preflight_issue:
+        raise RuntimeError(preflight_issue)
+
+    user = _resolve_twitch_user(source)
+    video_type = str(source.get("video_type") or "archive").strip().lower() or "archive"
+    payload = _twitch_api_get(
+        "videos",
+        params={
+            "user_id": user["id"],
+            "type": video_type,
+            "first": max(1, min(int(limit), 100)),
+        },
+    )
+
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return []
+
+    out: list[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        video_id = str(row.get("id") or "").strip()
+        candidate_url = str(row.get("url") or "").strip()
+        if not candidate_url and video_id.isdigit():
+            candidate_url = f"https://www.twitch.tv/videos/{video_id}"
+        if not candidate_url.startswith("http"):
+            continue
+        duration_s = _parse_twitch_duration_seconds(row.get("duration"))
+        published_at = str(
+            row.get("published_at") or row.get("created_at") or ""
+        ).strip() or None
+        out.append(
+            {
+                "url": candidate_url,
+                "title": str(row.get("title") or "").strip(),
+                "duration_seconds": duration_s or 0.0,
+                "published_at": published_at,
+                "view_count": _safe_int(row.get("view_count"), 0),
+                "channel_id": user["id"],
+                "channel_name": str(
+                    row.get("user_name") or user.get("display_name") or user.get("login") or ""
+                ).strip(),
+                "video_id": video_id or None,
+                "is_live": False,
+                "platform": "twitch",
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
 def fetch_source_entries(source: Dict[str, Any], *, limit: int) -> list[Dict[str, Any]]:
+    provider = str(source.get("provider") or "").strip().lower()
+    if provider in {"twitch_helix", "twitch_api"}:
+        return _fetch_twitch_helix_entries(source, limit=limit)
+
     try:
         from yt_dlp import YoutubeDL
     except ImportError as exc:

@@ -253,6 +253,44 @@ sources:
     assert data["source_scout"]["inbox_pending"] == 0
 
 
+def test_actions_diagnostics_reports_twitch_provider_blockers(tmp_path, monkeypatch):
+    watchlist_dir = tmp_path / "sources"
+    watchlist_dir.mkdir(parents=True, exist_ok=True)
+    watchlist_path = watchlist_dir / "watchlist.yaml"
+    watchlist_path.write_text(
+        """
+shadow_mode: true
+sources:
+  - id: ludwig-twitch
+    label: Ludwig Twitch
+    provider: twitch_helix
+    platform: twitch
+    channel_login: ludwig
+    enabled: true
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VP_SOURCE_WATCHLIST", str(watchlist_path))
+    monkeypatch.delenv("TWITCH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("TWITCH_API_CLIENT_ID", raising=False)
+    monkeypatch.delenv("TWITCH_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("TWITCH_API_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("TWITCH_APP_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("TWITCH_ACCESS_TOKEN", raising=False)
+
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    r = client.get("/api/actions/diagnostics", headers=hdr)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["source_scout"]["configured"] is True
+    assert data["source_scout"]["ready"] is False
+    assert data["source_scout"]["enabled_sources"] == 1
+    assert data["source_scout"]["fetch_ready_sources"] == 0
+    assert any("TWITCH_CLIENT_ID" in issue for issue in data["source_scout"]["issues"])
+
+
 def test_actions_scout_inbox_add_and_list(tmp_path, monkeypatch):
     client = _make_client(tmp_path, monkeypatch, token="secret")
     hdr = {"Authorization": "Bearer secret"}
