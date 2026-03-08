@@ -15,18 +15,19 @@ import logging
 import os
 import subprocess
 import sys
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Callable, List, Optional
 
+from ..utils import subprocess_flags
 from .base import (
-    BaseTranscriber,
     BackendNotAvailableError,
+    BaseTranscriber,
     TranscriberConfig,
     TranscriptResult,
     TranscriptSegment,
     TranscriptWord,
 )
-from ..utils import subprocess_flags
 
 logger = logging.getLogger(__name__)
 
@@ -78,11 +79,7 @@ def _maybe_add_windows_cuda_dll_dirs() -> None:
 def is_available() -> bool:
     """Check if faster-whisper is installed."""
     _maybe_add_windows_cuda_dll_dirs()
-    try:
-        from faster_whisper import WhisperModel
-        return True
-    except ImportError:
-        return False
+    return find_spec("faster_whisper") is not None
 
 
 def check_gpu_available() -> bool:
@@ -90,7 +87,7 @@ def check_gpu_available() -> bool:
     _maybe_add_windows_cuda_dll_dirs()
     if not is_available():
         return False
-    
+
     try:
         import ctranslate2
         return ctranslate2.get_cuda_device_count() > 0
@@ -100,24 +97,24 @@ def check_gpu_available() -> bool:
 
 class FasterWhisperTranscriber(BaseTranscriber):
     """Transcriber using faster-whisper (CTranslate2)."""
-    
+
     def __init__(self, config: TranscriberConfig):
         super().__init__(config)
         self._gpu_used = False
-        
+
         if not is_available():
             raise BackendNotAvailableError(
                 "faster-whisper is not installed. Install with: pip install faster-whisper"
             )
-    
+
     @property
     def backend_name(self) -> str:
         return "faster_whisper"
-    
+
     @property
     def gpu_available(self) -> bool:
         return check_gpu_available()
-    
+
     def _get_device_and_compute_type(self) -> tuple[str, str]:
         """Determine device and compute type based on config and availability."""
         if self.config.use_gpu and self.gpu_available:
@@ -126,7 +123,7 @@ class FasterWhisperTranscriber(BaseTranscriber):
         else:
             self._gpu_used = False
             return "cpu", self.config.compute_type
-    
+
     def _get_audio_duration(self, audio_path: Path) -> float:
         """Get audio duration in seconds, supporting multiple formats."""
         # Try ffprobe first (handles all formats)
@@ -148,7 +145,7 @@ class FasterWhisperTranscriber(BaseTranscriber):
                 return duration
         except Exception as e:
             logger.debug(f"ffprobe failed: {e}")
-        
+
         # Fallback: try wave module for WAV files
         if audio_path.suffix.lower() == ".wav":
             try:
@@ -161,7 +158,7 @@ class FasterWhisperTranscriber(BaseTranscriber):
                     return duration
             except Exception:
                 pass
-        
+
         # Final fallback: estimate from file size
         # Typical audio: ~128kbps = 16KB/s
         try:
@@ -175,32 +172,32 @@ class FasterWhisperTranscriber(BaseTranscriber):
     def _load_model(self) -> Any:
         """Load the faster-whisper model."""
         from faster_whisper import WhisperModel
-        
+
         device, compute_type = self._get_device_and_compute_type()
-        
+
         model_name = self.config.model
         if self.config.model_path:
             model_name = self.config.model_path
-        
+
         # Thread count: 0 means use all cores
         cpu_threads = self.config.threads
         if cpu_threads <= 0:
             cpu_threads = os.cpu_count() or 4
-        
+
         logger.info(
             f"Loading faster-whisper model: {model_name} on {device} "
             f"({compute_type}, {cpu_threads} threads)"
         )
-        
+
         model = WhisperModel(
             model_name,
             device=device,
             compute_type=compute_type,
             cpu_threads=cpu_threads,
         )
-        
+
         return model
-    
+
     def transcribe(
         self,
         audio_path: Path,
@@ -211,26 +208,26 @@ class FasterWhisperTranscriber(BaseTranscriber):
         audio_path = Path(audio_path)
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        
+
         if on_progress:
             on_progress(0.05)
-        
+
         # Get audio duration for accurate progress tracking
         # Use ffprobe or fallback to estimate - faster-whisper handles all formats internally
         audio_duration_s = self._get_audio_duration(audio_path)
-        
+
         model = self.ensure_model_loaded()
-        
+
         if on_progress:
             on_progress(0.1)
-        
+
         # Build transcription options
         transcribe_opts = {
             "language": self.config.language,
             "vad_filter": self.config.vad_filter,
             "word_timestamps": self.config.word_timestamps,
         }
-        
+
         # Log transcription settings
         lang_str = self.config.language or "auto-detect"
         vad_str = "enabled" if self.config.vad_filter else "disabled"
@@ -238,21 +235,21 @@ class FasterWhisperTranscriber(BaseTranscriber):
             f"Transcribing: {audio_path} "
             f"(lang={lang_str}, VAD={vad_str}, word_timestamps={self.config.word_timestamps})"
         )
-        
+
         # Run transcription
         segments_iter, info = model.transcribe(str(audio_path), **transcribe_opts)
-        
+
         # Process segments
         segments: List[TranscriptSegment] = []
         max_end_time = 0.0
-        
+
         for seg in segments_iter:
             text = (seg.text or "").strip()
             if not text:
                 continue
-            
+
             max_end_time = max(max_end_time, float(seg.end))
-            
+
             # Word-level timestamps if requested and available
             words = None
             if self.config.word_timestamps and hasattr(seg, "words") and seg.words:
@@ -266,24 +263,24 @@ class FasterWhisperTranscriber(BaseTranscriber):
                     for w in seg.words
                     if w.word.strip()
                 ]
-            
+
             segments.append(TranscriptSegment(
                 start=float(seg.start),
                 end=float(seg.end),
                 text=text,
                 words=words,
             ))
-            
+
             # Update progress based on actual audio duration
             if on_progress and audio_duration_s > 0:
                 # Map 0.1-0.9 for transcription progress
                 internal_progress = min(0.95, seg.end / audio_duration_s)
                 prog = 0.1 + 0.8 * internal_progress
                 on_progress(prog)
-        
+
         if on_progress:
             on_progress(1.0)
-        
+
         return TranscriptResult(
             segments=segments,
             language=info.language if hasattr(info, "language") else self.config.language,

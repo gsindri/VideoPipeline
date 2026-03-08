@@ -5,7 +5,6 @@ import pytest
 
 from videopipeline.peaks import moving_average, robust_z
 
-
 # ============================================================================
 # Test smoothing and z-scoring utilities
 # ============================================================================
@@ -32,7 +31,7 @@ def test_robust_z_basic():
     # Standard normal-ish distribution
     x = np.array([0.0, 1.0, 2.0, 3.0, 100.0])  # With outlier
     z = robust_z(x)
-    
+
     # Outlier should have high z-score
     assert z[-1] > 3.0
     # Median value should have z-score near 0
@@ -56,7 +55,7 @@ def test_robust_z_constant():
 def test_audio_events_config_from_dict():
     """Test config parsing from dict."""
     from videopipeline.analysis_audio_events import AudioEventsConfig
-    
+
     cfg = AudioEventsConfig.from_dict({
         "enabled": True,
         "hop_seconds": 0.25,
@@ -67,7 +66,7 @@ def test_audio_events_config_from_dict():
             "cheering": 0.5,
         }
     })
-    
+
     assert cfg.enabled is True
     assert cfg.hop_seconds == 0.25
     assert cfg.smooth_seconds == 1.5
@@ -79,9 +78,9 @@ def test_audio_events_config_from_dict():
 def test_audio_events_config_defaults():
     """Test config with default values."""
     from videopipeline.analysis_audio_events import AudioEventsConfig
-    
+
     cfg = AudioEventsConfig.from_dict({})
-    
+
     assert cfg.enabled is True
     assert cfg.hop_seconds == 0.5
     assert cfg.smooth_seconds == 2.0
@@ -138,15 +137,15 @@ def test_assemblyai_audio_events_availability_requires_key(monkeypatch: pytest.M
 def test_classifier_heuristic_basic():
     """Test heuristic classifier with synthetic audio."""
     from videopipeline.analysis_audio_events import AudioEventClassifier
-    
+
     classifier = AudioEventClassifier(sample_rate=16000, backend="heuristic")
-    
+
     # Create a simple sine wave (should be low on all events)
     t = np.linspace(0, 0.5, 8000)
     audio = (np.sin(2 * np.pi * 440 * t) * 0.5).astype(np.float32)
-    
+
     probs = classifier.classify_chunk(audio)
-    
+
     assert "laughter" in probs
     assert "cheering" in probs
     assert "screaming" in probs
@@ -156,15 +155,15 @@ def test_classifier_heuristic_basic():
 def test_classifier_heuristic_noise():
     """Test heuristic classifier with white noise (should detect some crowd-like signal)."""
     from videopipeline.analysis_audio_events import AudioEventClassifier
-    
+
     classifier = AudioEventClassifier(sample_rate=16000, backend="heuristic")
-    
+
     # White noise
     np.random.seed(42)
     audio = np.random.randn(8000).astype(np.float32) * 0.3
-    
+
     probs = classifier.classify_chunk(audio)
-    
+
     # Noise should register some applause/crowd (high flatness)
     assert probs["applause"] > 0 or probs["crowd"] > 0
 
@@ -172,14 +171,14 @@ def test_classifier_heuristic_noise():
 def test_classifier_heuristic_empty():
     """Test heuristic classifier with very short audio."""
     from videopipeline.analysis_audio_events import AudioEventClassifier
-    
+
     classifier = AudioEventClassifier(sample_rate=16000, backend="heuristic")
-    
+
     # Very short audio
     audio = np.zeros(100, dtype=np.float32)
-    
+
     probs = classifier.classify_chunk(audio)
-    
+
     # Should return zeros for all events
     assert all(v == 0.0 for v in probs.values())
 
@@ -252,10 +251,10 @@ def test_classifier_auto_non_strict_falls_back_to_heuristic(monkeypatch: pytest.
 def test_resample_series_for_audio_events():
     """Test that audio events can be resampled to highlight grid."""
     from videopipeline.analysis_highlights import resample_series
-    
+
     # Audio events at 0.5s hop
     audio_events_z = np.array([0.0, 1.0, 2.0, 3.0, 2.0, 1.0], dtype=np.float64)
-    
+
     # Resample to 0.25s hop (doubling resolution)
     resampled = resample_series(
         audio_events_z,
@@ -263,7 +262,7 @@ def test_resample_series_for_audio_events():
         target_hop_s=0.25,
         target_len=12
     )
-    
+
     assert len(resampled) == 12
     # Peak should be preserved (around index 6-7)
     assert np.argmax(resampled) in [6, 7]
@@ -276,9 +275,9 @@ def test_highlight_weights_with_audio_events():
     w_motion = 0.30
     w_chat = 0.20
     w_audio_events = 0.15
-    
+
     w_total = w_audio + w_motion + w_chat + w_audio_events
-    
+
     # Should already sum to 1.0
     assert abs(w_total - 1.0) < 0.001
 
@@ -289,14 +288,14 @@ def test_highlight_weights_without_chat_events():
     w_motion = 0.30
     w_chat = 0.0  # Not available
     w_audio_events = 0.0  # Not available
-    
+
     w_total = w_audio + w_motion + w_chat + w_audio_events
-    
+
     # Should be 0.65, needs normalization to 1.0
     if w_total > 0 and abs(w_total - 1.0) > 0.001:
         w_audio = w_audio / w_total
         w_motion = w_motion / w_total
-    
+
     assert abs(w_audio + w_motion - 1.0) < 0.001
     assert np.isclose(w_audio, 0.35 / 0.65)
     assert np.isclose(w_motion, 0.30 / 0.65)
@@ -313,20 +312,20 @@ def test_combined_score_with_audio_events():
     motion_scores = np.array([1.0, 1.5, 2.0, 1.5, 1.0])
     chat_scores = np.zeros(5)
     audio_events_scores = np.array([0.0, 0.5, 5.0, 0.5, 0.0])  # Big spike at index 2
-    
+
     # Weights
     w_audio = 0.4
     w_motion = 0.3
     w_chat = 0.0
     w_audio_events = 0.3
-    
+
     combined = (
         w_audio * audio_scores +
         w_motion * motion_scores +
         w_chat * chat_scores +
         w_audio_events * audio_events_scores
     )
-    
+
     # Peak should be at index 2 due to audio_events spike
     assert np.argmax(combined) == 2
     # The peak value should be higher than pure audio+motion
@@ -346,7 +345,7 @@ def test_candidate_breakdown_includes_audio_events():
         "chat": 0.0,
         "audio_events": 3.2,
     }
-    
+
     assert "audio_events" in breakdown
     assert breakdown["audio_events"] == 3.2
 
@@ -358,9 +357,9 @@ def test_candidate_breakdown_includes_audio_events():
 def test_default_profile_has_audio_events():
     """Test that default profile includes audio_events section."""
     from videopipeline.profile import default_profile
-    
+
     profile = default_profile()
-    
+
     # Check analysis.audio_events exists
     assert "audio_events" in profile["analysis"]
     events_cfg = profile["analysis"]["audio_events"]
@@ -368,7 +367,7 @@ def test_default_profile_has_audio_events():
     assert "hop_seconds" in events_cfg
     assert "events" in events_cfg
     assert "laughter" in events_cfg["events"]
-    
+
     # Check highlights weights includes audio_events
     weights = profile["analysis"]["highlights"]["weights"]
     assert "audio_events" in weights

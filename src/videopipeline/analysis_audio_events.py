@@ -31,7 +31,7 @@ if sys.platform == "win32":
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
     # Suppress ONNX Runtime console output
     os.environ.setdefault("ORT_DISABLE_ALL_LOGS", "1")
-    
+
     # Use ctypes to set the default process creation flags to hide console windows
     # This affects any subprocess spawned by child libraries (torch, etc.)
     try:
@@ -50,7 +50,7 @@ if sys.platform == "win32":
 # Force upb (C++) implementation to avoid the deprecated Python MessageFactory API
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "upb")
 
-from .ffmpeg import ffprobe_duration_seconds, AudioStreamParams, stream_audio_blocks_f32le
+from .ffmpeg import AudioStreamParams, ffprobe_duration_seconds, stream_audio_blocks_f32le
 from .peaks import moving_average, pick_top_peaks, robust_z
 from .project import Project, save_npz, update_project
 
@@ -90,7 +90,7 @@ class AudioEventsConfig:
     assemblyai_timeout_s: float = 7200.0
     assemblyai_auto_highlights: bool = True
     assemblyai_sentiment_analysis: bool = True
-    
+
     # Candidate extraction parameters (matching audio RMS)
     top: int = 20
     min_gap_seconds: float = 30.0
@@ -99,7 +99,7 @@ class AudioEventsConfig:
     skip_start_seconds: float = 60.0
     min_score_z: float = 1.0
     min_clip_seconds: float = 3.0
-    
+
     # Event weights for combined score
     events: Dict[str, float] = field(default_factory=lambda: {
         "laughter": 1.0,
@@ -476,14 +476,14 @@ def _compute_assemblyai_event_series(
 
 def _suppress_protobuf_warnings():
     """Context manager to suppress protobuf 6.x MessageFactory warnings during TensorFlow import.
-    
+
     TensorFlow 2.19.x with protobuf 6.x shows 'MessageFactory.GetPrototype' AttributeError
     warnings, but these are non-fatal and TensorFlow still works correctly.
     """
     import contextlib
     import io
     import sys
-    
+
     @contextlib.contextmanager
     def suppress():
         old_stderr = sys.stderr
@@ -516,28 +516,27 @@ def _try_load_yamnet():
 
 def _try_load_pytorch_classifier():
     """Try to load PyTorch audio classifier (uses torchaudio's pretrained models).
-    
+
     Returns (model, device, sample_rate, None) on success or (None, None, None, error_msg) on failure.
     """
     try:
         import torch
-        import torchaudio
         from torchaudio.pipelines import WAV2VEC2_BASE
-        
+
         # Check for GPU (ROCm for AMD, CUDA for NVIDIA)
         if torch.cuda.is_available():
             device = torch.device("cuda")
         else:
             device = torch.device("cpu")
-        
+
         # Load Wav2Vec2 model - produces embeddings useful for audio analysis
         bundle = WAV2VEC2_BASE
         model = bundle.get_model().to(device)
         model.eval()
-        
+
         # Wav2Vec2 expects specific sample rate
         model_sample_rate = bundle.sample_rate
-        
+
         return model, device, model_sample_rate, None
     except ImportError as e:
         return None, None, None, f"torch/torchaudio not installed: {e}"
@@ -547,7 +546,7 @@ def _try_load_pytorch_classifier():
 
 def _try_load_onnx_directml():
     """Try to load YAMNet ONNX model with DirectML (AMD/Intel GPU on Windows).
-    
+
     Returns (session, None) on success or (None, error_msg) on failure.
     """
     try:
@@ -556,7 +555,7 @@ def _try_load_onnx_directml():
         available_providers = ort.get_available_providers()
         if 'DmlExecutionProvider' not in available_providers:
             return None, "DirectML provider not available (need onnxruntime-directml)"
-        
+
         # Look for local ONNX model
         model_paths = [
             Path(__file__).parent / "models" / "yamnet.onnx",
@@ -565,7 +564,7 @@ def _try_load_onnx_directml():
         for mp in model_paths:
             if mp.exists():
                 session = ort.InferenceSession(
-                    str(mp), 
+                    str(mp),
                     providers=['DmlExecutionProvider', 'CPUExecutionProvider']
                 )
                 return session, None
@@ -598,18 +597,18 @@ def _try_load_yamnet_onnx():
 
 class AudioEventClassifier:
     """Lightweight audio event classifier using YAMNet or ONNX fallback.
-    
+
     Backend priority (auto mode):
     1. PyTorch (GPU via ROCm/CUDA, or CPU)
     2. ONNX DirectML (GPU on Windows AMD/Intel)
-    3. ONNX CPU 
+    3. ONNX CPU
     4. TensorFlow Hub
     5. Heuristic (always works)
     """
-    
+
     def __init__(self, sample_rate: int = 16000, backend: str = "auto", strict: bool = False):
         """Initialize classifier.
-        
+
         Args:
             sample_rate: Audio sample rate (16kHz recommended)
             backend: One of "auto", "pytorch", "onnx_directml", "onnx_cpu", "tensorflow", "heuristic"
@@ -625,7 +624,7 @@ class AudioEventClassifier:
         self._pytorch_sample_rate = None  # Model's expected sample rate
         self._backend = "none"
         self._backend_errors: Dict[str, str] = {}
-        
+
         if backend == "auto":
             self._init_auto()
         elif backend == "pytorch":
@@ -657,11 +656,11 @@ class AudioEventClassifier:
                     "audio_events strict mode: requested backend "
                     f"'{self._requested_backend}' unavailable ({details})"
                 )
-    
+
     def _init_auto(self):
         """Auto-select best available backend."""
         # Priority: PyTorch (GPU) > ONNX DirectML > PyTorch (CPU) > ONNX CPU > TensorFlow > Heuristic
-        
+
         # Try PyTorch first (best option if ROCm/CUDA available)
         model, device, model_sr, err = _try_load_pytorch_classifier()
         if model is not None:
@@ -671,7 +670,7 @@ class AudioEventClassifier:
             self._backend = "pytorch"
             return
         self._backend_errors["pytorch"] = err or "unknown error"
-        
+
         # Try ONNX CPU
         session, err = _try_load_yamnet_onnx()
         if session is not None:
@@ -679,7 +678,7 @@ class AudioEventClassifier:
             self._backend = "onnx_cpu"
             return
         self._backend_errors["onnx_cpu"] = err or "unknown error"
-        
+
         # Try TensorFlow Hub (often slow to load)
         model, err = _try_load_yamnet()
         if model is not None:
@@ -687,10 +686,10 @@ class AudioEventClassifier:
             self._backend = "tensorflow"
             return
         self._backend_errors["tensorflow"] = err or "unknown error"
-        
+
         # Fall back to heuristic
         self._backend = "heuristic"
-    
+
     def _init_onnx_directml(self):
         session, err = _try_load_onnx_directml()
         if session is not None:
@@ -699,7 +698,7 @@ class AudioEventClassifier:
         else:
             self._backend_errors["onnx_directml"] = err or "unknown error"
             self._backend = "heuristic"
-    
+
     def _init_onnx_cpu(self):
         session, err = _try_load_yamnet_onnx()
         if session is not None:
@@ -708,7 +707,7 @@ class AudioEventClassifier:
         else:
             self._backend_errors["onnx_cpu"] = err or "unknown error"
             self._backend = "heuristic"
-    
+
     def _init_tensorflow(self):
         model, err = _try_load_yamnet()
         if model is not None:
@@ -717,7 +716,7 @@ class AudioEventClassifier:
         else:
             self._backend_errors["tensorflow"] = err or "unknown error"
             self._backend = "heuristic"
-    
+
     def _init_pytorch(self):
         model, device, model_sr, err = _try_load_pytorch_classifier()
         if model is not None:
@@ -728,17 +727,17 @@ class AudioEventClassifier:
         else:
             self._backend_errors["pytorch"] = err or "unknown error"
             self._backend = "heuristic"
-    
+
     @property
     def is_ml_available(self) -> bool:
         return self._backend in ("tensorflow", "onnx_cpu", "onnx_directml", "pytorch")
-    
+
     def classify_chunk(self, audio_f32: np.ndarray) -> Dict[str, float]:
         """Classify a chunk of audio and return event probabilities.
-        
+
         Args:
             audio_f32: Audio samples as float32, mono, at self.sample_rate
-            
+
         Returns:
             Dict mapping event names to probabilities [0, 1]
         """
@@ -750,49 +749,49 @@ class AudioEventClassifier:
             return self._classify_onnx(audio_f32)
         else:
             return self._classify_heuristic(audio_f32)
-    
+
     def _classify_tensorflow(self, audio_f32: np.ndarray) -> Dict[str, float]:
         """Classify using TensorFlow Hub YAMNet."""
         import tensorflow as tf
-        
+
         # YAMNet expects float32 waveform
         waveform = tf.convert_to_tensor(audio_f32.astype(np.float32))
-        
+
         # Run inference
         scores, embeddings, spectrogram = self._model(waveform)
         scores = scores.numpy()
-        
+
         # Average scores across frames
         if len(scores.shape) > 1:
             avg_scores = np.mean(scores, axis=0)
         else:
             avg_scores = scores
-        
+
         # Extract probabilities for events of interest
         results = {}
         for event_name, class_indices in YAMNET_CLASSES.items():
             if event_name in ("laughter", "cheering", "applause", "screaming", "shouting", "crowd"):
                 prob = float(np.max([avg_scores[i] for i in class_indices if i < len(avg_scores)]))
                 results[event_name] = min(1.0, max(0.0, prob))
-        
+
         return results
-    
+
     def _classify_onnx(self, audio_f32: np.ndarray) -> Dict[str, float]:
         """Classify using ONNX YAMNet."""
         # Prepare input
         input_name = self._onnx_session.get_inputs()[0].name
         waveform = audio_f32.astype(np.float32).reshape(1, -1)
-        
+
         # Run inference
         outputs = self._onnx_session.run(None, {input_name: waveform})
         scores = np.asarray(outputs[0])
-        
+
         # Handle various output shapes:
         # - (classes,): single frame output
         # - (frames, classes): multiple frames, no batch dim
         # - (1, frames, classes): batch dim present
         scores = np.squeeze(scores)  # Remove batch dim if present: (1, F, C) -> (F, C)
-        
+
         if scores.ndim == 2:
             # (frames, classes) -> average over frames to get (classes,)
             avg_scores = np.mean(scores, axis=0)
@@ -802,19 +801,19 @@ class AudioEventClassifier:
         else:
             # Unexpected shape, flatten and hope for the best
             avg_scores = scores.flatten()
-        
+
         # Extract probabilities for events of interest
         results = {}
         for event_name, class_indices in YAMNET_CLASSES.items():
             if event_name in ("laughter", "cheering", "applause", "screaming", "shouting", "crowd"):
                 prob = float(np.max([avg_scores[i] for i in class_indices if i < len(avg_scores)]))
                 results[event_name] = min(1.0, max(0.0, prob))
-        
+
         return results
-    
+
     def _classify_heuristic(self, audio_f32: np.ndarray) -> Dict[str, float]:
         """Fallback heuristic classification using acoustic features.
-        
+
         This uses spectral characteristics to approximate event detection:
         - Laughter: High spectral flux + specific frequency patterns
         - Cheering/Crowd: High energy in mid frequencies + broadband noise
@@ -823,7 +822,7 @@ class AudioEventClassifier:
         # Compute basic acoustic features
         audio = audio_f32.astype(np.float64)
         n = len(audio)
-        
+
         if n < 256:
             return {
                 "laughter": 0.0,
@@ -833,55 +832,49 @@ class AudioEventClassifier:
                 "shouting": 0.0,
                 "crowd": 0.0,
             }
-        
+
         # RMS energy
         rms = float(np.sqrt(np.mean(audio ** 2)))
-        
+
         # Spectral features using FFT
         fft = np.fft.rfft(audio * np.hanning(n))
         mag = np.abs(fft)
         freqs = np.fft.rfftfreq(n, 1.0 / self.sample_rate)
-        
+
         # Frequency band energies
         low_mask = (freqs >= 100) & (freqs < 500)
         mid_mask = (freqs >= 500) & (freqs < 2000)
         high_mask = (freqs >= 2000) & (freqs < 4000)
-        
+
         total_energy = np.sum(mag ** 2) + 1e-10
         low_energy = np.sum(mag[low_mask] ** 2) / total_energy
         mid_energy = np.sum(mag[mid_mask] ** 2) / total_energy
         high_energy = np.sum(mag[high_mask] ** 2) / total_energy
-        
-        # Spectral centroid (higher = brighter sound)
-        centroid = np.sum(freqs * mag) / (np.sum(mag) + 1e-10)
-        
+
         # Spectral flatness (higher = more noise-like)
         geo_mean = np.exp(np.mean(np.log(mag + 1e-10)))
         arith_mean = np.mean(mag)
         flatness = geo_mean / (arith_mean + 1e-10)
-        
-        # Zero crossing rate (higher = more noisy/speech-like)
-        zcr = float(np.sum(np.abs(np.diff(np.sign(audio)))) / (2 * n))
-        
+
         # Heuristic scores (rough approximations)
         # Laughter: mid-frequency emphasis, moderate energy, variable amplitude
         laughter_score = min(1.0, mid_energy * 2.0 * min(1.0, rms * 5))
-        
+
         # Cheering: broadband noise, high energy
         cheering_score = min(1.0, flatness * 2.0 * min(1.0, rms * 3))
-        
+
         # Applause: very high flatness (noise-like), broadband
         applause_score = min(1.0, flatness * 3.0 * (1.0 - abs(mid_energy - 0.4)))
-        
+
         # Screaming: high frequency emphasis, high energy
         screaming_score = min(1.0, high_energy * 3.0 * min(1.0, rms * 4))
-        
+
         # Shouting: high energy, speech-like frequencies
         shouting_score = min(1.0, (mid_energy + low_energy) * min(1.0, rms * 5))
-        
+
         # Crowd: moderate flatness, broadband mid-frequencies
         crowd_score = min(1.0, flatness * mid_energy * 4.0)
-        
+
         return {
             "laughter": float(laughter_score),
             "cheering": float(cheering_score),
@@ -890,10 +883,10 @@ class AudioEventClassifier:
             "shouting": float(shouting_score),
             "crowd": float(crowd_score),
         }
-    
+
     def _classify_pytorch(self, audio_f32: np.ndarray) -> Dict[str, float]:
         """Classify using PyTorch Wav2Vec2 model.
-        
+
         Wav2Vec2 produces embeddings. We use embedding statistics combined
         with spectral features to estimate audio event probabilities.
         """
@@ -911,65 +904,63 @@ class AudioEventClassifier:
 
         import torch
         import torchaudio.functional as F
-        
+
         # Resample if needed (Wav2Vec2 expects 16kHz)
         waveform = torch.from_numpy(audio_f32.astype(np.float32)).unsqueeze(0)
-        
+
         if self._pytorch_sample_rate and self._pytorch_sample_rate != self.sample_rate:
             waveform = F.resample(waveform, self.sample_rate, self._pytorch_sample_rate)
-        
+
         waveform = waveform.to(self._pytorch_device)
-        
+
         with torch.no_grad():
             # Wav2Vec2 outputs features of shape (batch, frames, hidden_size)
             # We extract features, not transcriptions
             features, _ = self._pytorch_model.extract_features(waveform)
-            
+
             # Get last layer features
             if isinstance(features, list):
                 embeddings = features[-1]  # Last layer
             else:
                 embeddings = features
-            
+
             # Average over frames to get (batch, hidden_size)
             embeddings = embeddings.mean(dim=1)
             embeddings = embeddings.squeeze().cpu().numpy()
-        
+
         # Use embedding statistics as features for heuristic classification
-        emb_mean = float(np.mean(embeddings))
         emb_std = float(np.std(embeddings))
-        emb_energy = float(np.sum(embeddings ** 2) / len(embeddings))
-        
+
         # Normalize embedding stats
         emb_complexity = min(1.0, emb_std / 2.0)  # Adjusted for Wav2Vec2 scale
-        
+
         # Also compute spectral features from raw audio for better estimates
         rms = float(np.sqrt(np.mean(audio ** 2)))
         fft = np.fft.rfft(audio * np.hanning(n))
         mag = np.abs(fft)
         freqs = np.fft.rfftfreq(n, 1.0 / self.sample_rate)
-        
+
         mid_mask = (freqs >= 500) & (freqs < 2000)
         high_mask = (freqs >= 2000) & (freqs < 4000)
         total_energy = np.sum(mag ** 2) + 1e-10
         mid_energy = np.sum(mag[mid_mask] ** 2) / total_energy
         high_energy = np.sum(mag[high_mask] ** 2) / total_energy
-        
+
         geo_mean = np.exp(np.mean(np.log(mag + 1e-10)))
         arith_mean = np.mean(mag)
         flatness = geo_mean / (arith_mean + 1e-10)
-        
+
         # Heuristic scores boosted by embedding complexity
         # Higher complexity suggests more interesting audio content
         boost = 1.0 + emb_complexity * 0.5
-        
+
         laughter_score = min(1.0, mid_energy * 2.0 * min(1.0, rms * 5) * boost)
         cheering_score = min(1.0, flatness * 2.0 * min(1.0, rms * 3) * boost)
         applause_score = min(1.0, flatness * 3.0 * (1.0 - abs(mid_energy - 0.4)) * boost)
         screaming_score = min(1.0, high_energy * 3.0 * min(1.0, rms * 4) * boost)
         shouting_score = min(1.0, mid_energy * min(1.0, rms * 5) * boost)
         crowd_score = min(1.0, flatness * mid_energy * 4.0 * boost)
-        
+
         return {
             "laughter": float(laughter_score),
             "cheering": float(cheering_score),
@@ -991,37 +982,37 @@ def compute_audio_events_from_file(
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Compute audio events from an audio file (no Project required).
-    
+
     This is used during URL download to run audio event detection in parallel
     with video download and transcription.
-    
+
     Args:
         audio_path: Path to audio file (WAV, MP3, M4A, etc.)
         cfg: AudioEventsConfig with detection parameters
         on_progress: Optional progress callback
-        
+
     Returns:
         Dict with event timelines and metadata
         Can be saved to a project later using save_audio_events_to_project()
     """
     if not cfg.enabled:
         return {"enabled": False, "skipped": True}
-    
+
     start_time = _time.time()
     audio_path = Path(audio_path)
-    
+
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
-    
+
     duration_s = ffprobe_duration_seconds(audio_path)
-    
+
     hop_samples = int(cfg.sample_rate * cfg.hop_seconds)
     window_samples = int(cfg.sample_rate * cfg.window_seconds)
     if hop_samples <= 0:
         raise ValueError("hop_seconds too small")
     if window_samples <= 0:
         raise ValueError("window_seconds too small")
-    
+
     backend_used = str(cfg.backend)
     ml_available = False
     backend_errors: Dict[str, str] = {}
@@ -1170,12 +1161,12 @@ def compute_audio_events_from_file(
         screaming = np.array(screaming_probs, dtype=np.float64)
         shouting = np.array(shouting_probs, dtype=np.float64)
         crowd = np.array(crowd_probs, dtype=np.float64)
-    
+
     # Compute weighted combined score
     event_weights = cfg.events
     event_combo = np.zeros_like(laughter)
     weight_sum = 0.0
-    
+
     event_arrays = {
         "laughter": laughter,
         "cheering": cheering,
@@ -1184,17 +1175,17 @@ def compute_audio_events_from_file(
         "shouting": shouting,
         "crowd": crowd,
     }
-    
+
     for event_name, weight in event_weights.items():
         if weight <= 0:
             continue
         if event_name in event_arrays:
             event_combo += weight * event_arrays[event_name]
             weight_sum += weight
-    
+
     if weight_sum > 0:
         event_combo /= weight_sum
-    
+
     # Smooth and compute z-scores
     smooth_frames = max(1, int(round(cfg.smooth_seconds / cfg.hop_seconds)))
     event_combo_smoothed = moving_average(event_combo, smooth_frames)
@@ -1202,15 +1193,15 @@ def compute_audio_events_from_file(
     laughter_z = robust_z(moving_average(laughter, smooth_frames))
     cheering_z = robust_z(moving_average(cheering, smooth_frames))
     screaming_z = robust_z(moving_average(screaming, smooth_frames))
-    
+
     if on_progress:
         try:
             on_progress(0.95, "Building results")
         except TypeError:
             on_progress(0.95)
-    
+
     elapsed_seconds = _time.time() - start_time
-    
+
     result = {
         "times": times_arr.tolist(),
         "times_center": times_center_arr.tolist(),
@@ -1249,10 +1240,10 @@ def compute_audio_events_from_file(
         "elapsed_seconds": elapsed_seconds,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
-    
+
     if on_progress:
         on_progress(1.0)
-    
+
     return result
 
 
@@ -1261,14 +1252,14 @@ def save_audio_events_to_project(
     events_data: Dict[str, Any],
 ) -> None:
     """Save pre-computed audio events analysis to a project.
-    
+
     Args:
         proj: Project instance
         events_data: Audio events data from compute_audio_events_from_file()
     """
     if events_data.get("skipped"):
         return
-    
+
     # Convert lists back to numpy arrays
     times = np.array(events_data["times"], dtype=np.float64)
     times_center = np.array(events_data["times_center"], dtype=np.float64)
@@ -1284,7 +1275,7 @@ def save_audio_events_to_project(
     laughter_z = np.array(events_data["laughter_z"], dtype=np.float64)
     cheering_z = np.array(events_data["cheering_z"], dtype=np.float64)
     screaming_z = np.array(events_data["screaming_z"], dtype=np.float64)
-    
+
     audio_events_path = proj.audio_events_features_path
     save_npz(
         audio_events_path,
@@ -1306,7 +1297,7 @@ def save_audio_events_to_project(
         screaming_z=screaming_z,
         hop_seconds=np.array([events_data["hop_seconds"]], dtype=np.float64),
     )
-    
+
     def _upd(d: Dict[str, Any]) -> None:
         d.setdefault("analysis", {})
         d["analysis"]["audio_events"] = {
@@ -1322,7 +1313,7 @@ def save_audio_events_to_project(
             "elapsed_seconds": events_data["elapsed_seconds"],
             "generated_at": events_data["generated_at"],
         }
-    
+
     update_project(proj, _upd)
 
 
@@ -1338,16 +1329,16 @@ def compute_audio_events_analysis(
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Compute audio event detection timeline.
-    
+
     Persists:
       - analysis/audio_events_features.npz (times, event probs, combo scores)
       - project.json -> analysis.audio_events section
-      
+
     Args:
         proj: Project instance
         cfg: AudioEventsConfig with detection parameters
         on_progress: Optional progress callback
-        
+
     Returns:
         Analysis result dict with config and metadata
     """
@@ -1382,7 +1373,7 @@ def compute_audio_events_analysis(
         if desired > 0 and (end - start) > desired + 1e-6:
             end = min(duration_s, start + desired)
         return start, end
-    
+
     hop_samples = int(cfg.sample_rate * cfg.hop_seconds)
     window_samples = int(cfg.sample_rate * cfg.window_seconds)
     if hop_samples <= 0:
@@ -1567,12 +1558,12 @@ def compute_audio_events_analysis(
         screaming = np.array(screaming_probs, dtype=np.float64)
         shouting = np.array(shouting_probs, dtype=np.float64)
         crowd = np.array(crowd_probs, dtype=np.float64)
-    
+
     # Compute weighted combined score
     event_weights = cfg.events
     event_combo = np.zeros_like(laughter)
     weight_sum = 0.0
-    
+
     # Map of known event names to their arrays
     event_arrays = {
         "laughter": laughter,
@@ -1582,7 +1573,7 @@ def compute_audio_events_analysis(
         "shouting": shouting,
         "crowd": crowd,
     }
-    
+
     for event_name, weight in event_weights.items():
         if weight <= 0:
             continue
@@ -1590,15 +1581,15 @@ def compute_audio_events_analysis(
             event_combo += weight * event_arrays[event_name]
             weight_sum += weight
         # Unknown event names are now silently ignored (no weight_sum increment)
-    
+
     if weight_sum > 0:
         event_combo /= weight_sum
-    
+
     # Smooth and compute z-scores
     smooth_frames = max(1, int(round(cfg.smooth_seconds / cfg.hop_seconds)))
     event_combo_smoothed = moving_average(event_combo, smooth_frames)
     event_combo_z = robust_z(event_combo_smoothed)
-    
+
     # Also compute individual z-scores for breakdown
     laughter_z = robust_z(moving_average(laughter, smooth_frames))
     cheering_z = robust_z(moving_average(cheering, smooth_frames))
@@ -1640,9 +1631,9 @@ def compute_audio_events_analysis(
                 "screaming_z": float(screaming_z[idx]) if idx < len(screaming_z) else 0.0,
             }
         )
-    
+
     _report(0.95, "Saving audio_events_features.npz")
-    
+
     # Save features
     audio_events_path = proj.audio_events_features_path
     save_npz(
@@ -1665,7 +1656,7 @@ def compute_audio_events_analysis(
         screaming_z=screaming_z,
         hop_seconds=np.array([cfg.hop_seconds], dtype=np.float64),
     )
-    
+
     # Compute peak events for metadata
     peak_laughter_idx = int(np.argmax(laughter_z)) if len(laughter_z) > 0 else 0
     peak_cheering_idx = int(np.argmax(cheering_z)) if len(cheering_z) > 0 else 0
@@ -1675,7 +1666,7 @@ def compute_audio_events_analysis(
         if idx < len(times_center_arr):
             return float(times_center_arr[idx])
         return float(idx * cfg.hop_seconds)
-    
+
     payload = {
         "video": str(video_path),
         "duration_seconds": duration_s,
@@ -1715,19 +1706,19 @@ def compute_audio_events_analysis(
         "elapsed_seconds": _time.time() - start_time,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
-    
+
     def _upd(d: Dict[str, Any]) -> None:
         d.setdefault("analysis", {})
         d["analysis"]["audio_events"] = {
             **payload,
             "features_npz": str(audio_events_path.relative_to(proj.project_dir)),
         }
-    
+
     _report(0.98, "Updating project metadata")
     update_project(proj, _upd)
-    
+
     _report(1.0, "Done")
-    
+
     return payload
 
 

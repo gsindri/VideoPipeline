@@ -1,12 +1,11 @@
 """Tests for AI director module."""
 
 import json
-import pytest
 
 from videopipeline.ai.director import (
+    DIRECTOR_SYSTEM_PROMPT,
     DirectorConfig,
     DirectorResult,
-    DIRECTOR_SYSTEM_PROMPT,
     _build_director_prompt,
     _parse_director_response,
 )
@@ -63,7 +62,7 @@ class TestDirectorResult:
             hashtags=["gaming", "clutch"],
             confidence=0.85,
         )
-        
+
         assert result.candidate_rank == 1
         assert result.best_variant_id == "short_A"
         assert result.title == "Epic Gaming Moment"
@@ -83,7 +82,7 @@ class TestDirectorResult:
             confidence=0.9,
         )
         d = result.to_dict()
-        
+
         assert d["candidate_rank"] == 1
         assert d["best_variant_id"] == "short_A"
         assert d["title"] == "Test Title"
@@ -103,11 +102,11 @@ class TestDirectorResult:
             hashtags=[],
             confidence=0.5,
         )
-        
+
         assert result.title == ""
         assert result.hook == ""
         assert result.used_fallback is False
-        
+
         d = result.to_dict()
         assert d["title"] == ""
         assert d["hook"] == ""
@@ -124,13 +123,13 @@ class TestDirectorSystemPrompt:
     def test_prompt_contains_key_instructions(self):
         """Test that prompt contains key instructions."""
         prompt = DIRECTOR_SYSTEM_PROMPT.lower()
-        
+
         # Should mention JSON output
         assert "json" in prompt
-        
+
         # Should mention variant
         assert "variant" in prompt
-        
+
         # Should mention title/hook
         assert "title" in prompt
         assert "hook" in prompt
@@ -159,14 +158,14 @@ class TestJSONExtraction:
 ```
 
 Hope that helps!'''
-        
+
         # Extract JSON using same logic as director
         import re
         json_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", response)
         if json_match:
             json_str = json_match.group(1).strip()
             data = json.loads(json_str)
-            
+
             assert data["best_variant_id"] == "short_A"
             assert data["title"] == "Insane Clutch Play"
             assert data["hook"] == "Watch this!"
@@ -174,23 +173,23 @@ Hope that helps!'''
     def test_extract_raw_json(self):
         """Test extracting raw JSON without markdown."""
         response = '''{"best_variant_id": "medium_B", "title": "Amazing Play", "hook": "Must see!", "reason": "Good timing"}'''
-        
+
         data = json.loads(response.strip())
         assert data["best_variant_id"] == "medium_B"
 
     def test_extract_json_with_whitespace(self):
         """Test extracting JSON with extra whitespace."""
         response = '''
-        
+
         {
             "best_variant_id": "long_C",
             "title": "Full Context Highlight",
             "hook": "The whole story",
             "reason": "Needs setup and payoff"
         }
-        
+
         '''
-        
+
         data = json.loads(response.strip())
         assert data["best_variant_id"] == "long_C"
 
@@ -206,18 +205,18 @@ class TestFallbackMetadata:
             "score": 0.95,
             "breakdown": {"audio": 0.9, "chat": 0.8, "motion": 0.7},
         }
-        
+
         # Fallback logic should pick dominant signal
         breakdown = candidate["breakdown"]
         dominant = max(breakdown.items(), key=lambda x: x[1])
-        
+
         if dominant[0] == "audio":
             expected_prefix = "Audio Peak"
         elif dominant[0] == "chat":
             expected_prefix = "Chat Explosion"
         else:
             expected_prefix = "Action Highlight"
-        
+
         assert dominant[0] == "audio"  # In this case audio is highest
         assert expected_prefix == "Audio Peak"
 
@@ -228,14 +227,14 @@ class TestFallbackMetadata:
             {"variant_id": "medium_B", "duration_s": 32},
             {"variant_id": "long_C", "duration_s": 55},
         ]
-        
+
         # Fallback: prefer medium length if available
         medium = next((v for v in variants if "medium" in v["variant_id"]), None)
         if medium:
             chosen = medium["variant_id"]
         else:
             chosen = variants[0]["variant_id"]
-        
+
         assert chosen == "medium_B"
 
 

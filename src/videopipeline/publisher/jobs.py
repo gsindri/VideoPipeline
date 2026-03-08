@@ -8,8 +8,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from .state import publisher_db_path
 from ..utils import utc_iso as _utc_iso
+from .state import publisher_db_path
 
 _UNSET = object()
 

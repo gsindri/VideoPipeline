@@ -32,7 +32,7 @@ def compute_motion_analysis(
 
     total_frames = max(1, int(duration_s * sample_fps))
     processed = 0
-    
+
     # Helper for progress reporting with optional message
     def _report(frac: float, msg: str = "") -> None:
         if on_progress:

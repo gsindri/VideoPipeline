@@ -43,9 +43,9 @@ def compute_scene_analysis(
                 on_progress(frac, msg)
             except TypeError:
                 on_progress(frac)
-    
+
     _report(0.1, "Loading motion features")
-    
+
     motion_path = proj.motion_features_path
     if not motion_path.exists():
         raise FileNotFoundError("motion_features.npz not found; run motion analysis first")
@@ -56,7 +56,7 @@ def compute_scene_analysis(
         raise ValueError("motion_features.npz missing scores")
     fps_arr = data.get("fps")
     fps = float(fps_arr[0]) if fps_arr is not None and len(fps_arr) > 0 else 1.0
-    
+
     _report(0.3, "Detecting scene cuts")
 
     cuts = detect_scene_cuts(
@@ -65,7 +65,7 @@ def compute_scene_analysis(
         threshold_z=threshold_z,
         min_scene_len_seconds=min_scene_len_seconds,
     )
-    
+
     _report(0.7, f"Found {len(cuts)} scene cuts")
 
     payload = {
@@ -78,7 +78,7 @@ def compute_scene_analysis(
         "cuts_seconds": cuts,
         "generated_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
     }
-    
+
     _report(0.9, "Saving scenes.json")
 
     save_json(proj.scenes_path, payload)

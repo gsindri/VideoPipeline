@@ -17,7 +17,7 @@ Usage:
     config = TranscriberConfig(backend="openai_whisper", model="small", use_gpu=True)
     transcriber = get_transcriber(config)
     segments = transcriber.transcribe(audio_path)
-    
+
     # With speaker diarization:
     config = TranscriberConfig(backend="openai_whisper", diarize=True)
     transcriber = get_transcriber(config)
@@ -26,29 +26,29 @@ Usage:
 """
 
 from .base import (
+    BackendNotAvailableError,
+    Transcriber,
     TranscriberConfig,
+    TranscriberError,
+    TranscriptResult,
     TranscriptSegment,
     TranscriptWord,
-    TranscriptResult,
-    Transcriber,
-    TranscriberError,
-    BackendNotAvailableError,
 )
-from .factory import get_transcriber, get_available_backends
+from .factory import get_available_backends, get_transcriber
 
 # Diarization is optional - import conditionally
 try:
-    from .diarization import (
-        is_diarization_available,
-        diarize_audio,
-        merge_diarization_with_transcript,
-        DiarizationResult,
-        DiarizationSegment,
-    )
+    from . import diarization as _diarization
+
+    DiarizationResult = _diarization.DiarizationResult
+    DiarizationSegment = _diarization.DiarizationSegment
+    diarize_audio = _diarization.diarize_audio
+    is_diarization_available = _diarization.is_diarization_available
+    merge_diarization_with_transcript = _diarization.merge_diarization_with_transcript
     _HAS_DIARIZATION = True
 except ImportError:
     _HAS_DIARIZATION = False
-    
+
     def is_diarization_available() -> bool:
         return False
 

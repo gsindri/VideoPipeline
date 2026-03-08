@@ -1,12 +1,11 @@
 """Tests for clip_variants module."""
 
-import pytest
 
 from videopipeline.clip_variants import (
-    VariantGeneratorConfig,
-    VariantDurationConfig,
-    ClipVariant,
     CandidateVariants,
+    ClipVariant,
+    VariantDurationConfig,
+    VariantGeneratorConfig,
 )
 
 
@@ -54,7 +53,7 @@ class TestClipVariant:
             duration_s=15.0,
             description="Short clip variant",
         )
-        
+
         assert variant.variant_id == "short_A"
         assert variant.start_s == 10.0
         assert variant.end_s == 25.0
@@ -72,7 +71,7 @@ class TestClipVariant:
             payoff_text="Big moment",
         )
         d = variant.to_dict()
-        
+
         assert d["variant_id"] == "short_A"
         assert d["start_s"] == 10.0
         assert d["end_s"] == 25.0
@@ -91,7 +90,7 @@ class TestClipVariant:
             "description": "Medium clip",
         }
         variant = ClipVariant.from_dict(d)
-        
+
         assert variant.variant_id == "medium_B"
         assert variant.start_s == 20.0
         assert variant.duration_s == 30.0
@@ -115,7 +114,7 @@ class TestCandidateVariants:
             ],
         )
         d = variants.to_dict()
-        
+
         assert d["candidate_rank"] == 1
         assert d["candidate_peak_time_s"] == 120.0
         assert len(d["variants"]) == 1

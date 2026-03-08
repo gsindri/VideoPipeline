@@ -52,7 +52,7 @@ def build_metadata(
     ai_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build export metadata dictionary.
-    
+
     Args:
         selection: Candidate/selection data dict
         output_path: Path to the exported video file
@@ -66,7 +66,7 @@ def build_metadata(
     title = None
     caption = None
     hashtags = ["#gaming", "#clips", "#shorts"]
-    
+
     if ai_metadata:
         hook = ai_metadata.get("hook")
         title = ai_metadata.get("title")
@@ -74,14 +74,14 @@ def build_metadata(
         ai_tags = ai_metadata.get("tags") or ai_metadata.get("hashtags") or []
         if ai_tags:
             hashtags = [f"#{t}" if not t.startswith("#") else t for t in ai_tags]
-    
+
     if not hook:
         hook = derive_hook_text(selection, segments)
     if not title:
         title = selection.get("title") or hook
     if not caption:
         caption = hook
-        
+
     if template.startswith("vertical"):
         if "#vertical" not in hashtags:
             hashtags.append("#vertical")

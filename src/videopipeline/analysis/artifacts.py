@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Artifact:
     """Definition of an analysis artifact.
-    
+
     Attributes:
         name: Unique identifier (e.g. "transcript", "highlights_scores")
         path_template: Path relative to analysis_dir (e.g. "transcript_full.json")
@@ -39,11 +39,11 @@ class Artifact:
     path_template: str
     description: str = ""
     legacy_paths: list = field(default_factory=list)
-    
+
     def get_path(self, analysis_dir: Path) -> Path:
         """Get the full path to this artifact."""
         return analysis_dir / self.path_template
-    
+
     def exists(self, analysis_dir: Path) -> bool:
         """Check if the artifact exists (including legacy paths)."""
         if self.get_path(analysis_dir).exists():
@@ -58,7 +58,7 @@ class Artifact:
 @dataclass
 class ArtifactState:
     """State of a computed artifact.
-    
+
     Attributes:
         exists: Whether the artifact file exists
         fresh: Whether the artifact is up-to-date with current config/inputs
@@ -75,7 +75,7 @@ class ArtifactState:
     computed_at: Optional[str] = None
     signals_used: Dict[str, bool] = field(default_factory=dict)
     sources_present: Set[str] = field(default_factory=set)
-    
+
     @property
     def upgradeable(self) -> bool:
         """True if artifact exists but could be improved with new inputs."""
@@ -95,15 +95,15 @@ ARTIFACTS: Dict[str, Artifact] = {}
 
 
 def register_artifact(
-    name: str, 
-    path_template: str, 
+    name: str,
+    path_template: str,
     description: str = "",
     legacy_paths: Optional[List[str]] = None,
 ) -> Artifact:
     """Register an artifact definition."""
     artifact = Artifact(
-        name=name, 
-        path_template=path_template, 
+        name=name,
+        path_template=path_template,
         description=description,
         legacy_paths=legacy_paths or [],
     )
@@ -146,8 +146,8 @@ register_artifact("scenes", "scenes.json", "Visual scene cut boundaries")
 
 # --- Unified boundaries ---
 register_artifact(
-    "boundary_graph", 
-    "boundary_graph.json", 
+    "boundary_graph",
+    "boundary_graph.json",
     "Merged boundary graph for clip shaping",
     legacy_paths=["boundaries.json"],  # Old format location
 )
@@ -194,22 +194,22 @@ def get_artifact_state(
     input_signature: Optional[str] = None,
 ) -> ArtifactState:
     """Get the current state of an artifact.
-    
+
     Args:
         artifact_name: Name of the artifact to check
         analysis_dir: Project analysis directory
         config: Current config for this artifact's task (for freshness check)
         task_version: Current version of the task (for freshness check)
-        
+
     Returns:
         ArtifactState with existence and freshness info
     """
     artifact = ARTIFACTS.get(artifact_name)
     if artifact is None:
         return ArtifactState(exists=False, fresh=False)
-    
+
     path = artifact.get_path(analysis_dir)
-    
+
     # Special handling for "file" artifacts (video_file, audio_file, chat_file)
     if artifact_name in ("video_file", "audio_file", "chat_file"):
         # These are inputs, check parent directory
@@ -224,7 +224,7 @@ def get_artifact_state(
             chat_db = analysis_dir / "chat.sqlite"
             exists = chat_path.exists() or chat_db.exists()
             return ArtifactState(exists=exists, fresh=True, path=chat_path if chat_path.exists() else chat_db)
-    
+
     # Check if canonical path exists; if not, search legacy paths
     actual_path = path
     if not path.exists() and artifact.legacy_paths:
@@ -233,14 +233,14 @@ def get_artifact_state(
             if legacy_path.exists():
                 actual_path = legacy_path
                 break
-    
+
     if not actual_path.exists():
         return ArtifactState(exists=False, fresh=False, path=path)
-    
+
     # Load metadata from state file or embedded in artifact
     # Use actual_path (which may be a legacy path) for the state
     state = ArtifactState(exists=True, path=actual_path)
-    
+
     # Try to load metadata
     state_file = analysis_dir / "analysis_state.json"
     if state_file.exists():
@@ -253,7 +253,7 @@ def get_artifact_state(
             state.sources_present = set(artifact_meta.get("sources_present", []))
         except Exception:
             pass
-    
+
     # Check freshness
     if config is not None:
         current_hash = _hash_config(config)
@@ -265,7 +265,7 @@ def get_artifact_state(
         if stored_hash != current_hash:
             state.fresh = False
             return state
-    
+
     if task_version is not None:
         stored_version = state.metadata.get("task_version")
         # Missing version means we cannot prove freshness (legacy/missing state).
@@ -285,7 +285,7 @@ def get_artifact_state(
         if stored_signature != input_signature:
             state.fresh = False
             return state
-    
+
     state.fresh = True
     return state
 
@@ -311,11 +311,11 @@ def save_artifact_state(
     extra_metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Save metadata about a computed artifact.
-    
+
     This should be called after a task successfully computes its output.
     """
     state_file = analysis_dir / "analysis_state.json"
-    
+
     # Load existing state
     all_state: Dict[str, Any] = {"artifacts": {}}
     if state_file.exists():
@@ -323,32 +323,32 @@ def save_artifact_state(
             all_state = json.loads(state_file.read_text(encoding="utf-8"))
         except Exception:
             pass
-    
+
     if "artifacts" not in all_state:
         all_state["artifacts"] = {}
-    
+
     # Build metadata for this artifact
     metadata: Dict[str, Any] = {
         "computed_at": datetime.now(timezone.utc).isoformat(),
     }
-    
+
     if config is not None:
         metadata["config_hash"] = _hash_config(config)
-    
+
     if task_version is not None:
         metadata["task_version"] = task_version
-    
+
     if signals_used is not None:
         metadata["signals_used"] = signals_used
-    
+
     if sources_present is not None:
         metadata["sources_present"] = sorted(sources_present)
-    
+
     if extra_metadata:
         metadata.update(extra_metadata)
-    
+
     all_state["artifacts"][artifact_name] = metadata
     all_state["updated_at"] = datetime.now(timezone.utc).isoformat()
-    
+
     # Write atomically
     state_file.write_text(json.dumps(all_state, indent=2), encoding="utf-8")

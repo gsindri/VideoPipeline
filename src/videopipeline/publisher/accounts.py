@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from .state import accounts_path
 from ..utils import utc_iso as _utc_iso
+from .state import accounts_path
 
 
 @dataclass

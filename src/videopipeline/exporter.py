@@ -7,7 +7,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 from .ffmpeg import _require_cmd, ffprobe_video_stream_info
 from .layouts import RectNorm
@@ -79,12 +79,12 @@ def measure_loudness(
     on_progress: Optional[Callable[[float, str], None]] = None,
 ) -> Optional[dict[str, float]]:
     """Measure audio loudness using ffmpeg loudnorm filter (first pass).
-    
+
     Returns dict with measured values for second pass, or None on failure.
     """
     _require_cmd("ffmpeg")
     duration = end_s - start_s
-    
+
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -96,10 +96,10 @@ def measure_loudness(
         "-f", "null",
         "-",
     ]
-    
+
     if on_progress:
         on_progress(0.0, "measuring loudness")
-    
+
     try:
         result = subprocess.run(
             cmd,
@@ -113,19 +113,19 @@ def measure_loudness(
             return None
         # loudnorm outputs JSON to stderr
         stderr = result.stderr
-        
+
         # Find JSON block in output (it's embedded in other ffmpeg output)
         json_match = re.search(r'\{[^{}]*"input_i"[^{}]*\}', stderr, re.DOTALL)
         if not json_match:
             logger.warning("ffmpeg loudnorm (pass 1) did not emit parseable JSON. stderr: %s", (stderr or "")[:800])
             return None
-        
+
         try:
             data = json.loads(json_match.group())
         except json.JSONDecodeError as exc:
             logger.warning("Failed to parse loudnorm JSON: %s", exc)
             return None
-        
+
         # Extract the values we need for second pass
         measured = {
             "input_i": float(data.get("input_i", -24)),
@@ -134,10 +134,10 @@ def measure_loudness(
             "input_thresh": float(data.get("input_thresh", -34)),
             "target_offset": float(data.get("target_offset", 0)),
         }
-        
+
         if on_progress:
             on_progress(1.0, "loudness measured")
-        
+
         return measured
     except Exception as exc:
         logger.warning("Loudness measurement failed, falling back to single-pass loudnorm: %s", exc, exc_info=True)
@@ -458,7 +458,7 @@ def run_ffmpeg_export(
     two_pass_loudnorm: bool = True,
 ) -> None:
     """Run ffmpeg export, optionally reporting progress (0..1).
-    
+
     Args:
         spec: Export specification
         on_progress: Callback for progress updates (fraction, status)
@@ -470,18 +470,18 @@ def run_ffmpeg_export(
     if on_progress:
         on_progress(0.0, "validating filter graph")
     _preflight_filtergraph(spec)
-    
+
     # Two-pass loudness normalization: measure first, then encode with measured values
     if spec.normalize_audio and two_pass_loudnorm:
         if on_progress:
             on_progress(0.0, "measuring loudness (pass 1/2)")
-        
+
         measured = measure_loudness(
             spec.video_path,
             spec.start_s,
             spec.end_s,
         )
-        
+
         if measured:
             # Attach measured values to spec for build_ffmpeg_command
             # Using object.__setattr__ since ExportSpec is frozen
@@ -490,7 +490,7 @@ def run_ffmpeg_export(
             logger.warning(
                 "Two-pass loudnorm requested but pass 1 failed; using single-pass loudnorm for this export."
             )
-    
+
     cmd = build_ffmpeg_command(spec)
 
     if on_progress:

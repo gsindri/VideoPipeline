@@ -9,10 +9,10 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 if TYPE_CHECKING:
-    from ..project import Project
+    pass
 
 log = logging.getLogger("videopipeline.ai")
 
@@ -23,23 +23,23 @@ def get_llm_complete_fn(
     on_status: Optional[Callable[[str], None]] = None,
 ) -> Optional[Callable[[str], str]]:
     """Get an LLM completion function with auto-start support.
-    
+
     This is the unified way to set up LLM access across the codebase.
     It handles:
     - Checking if AI is enabled
     - Auto-starting local llama.cpp server if configured
     - Creating the client and checking availability
     - Returning a simple completion function or None
-    
+
     Args:
         ai_cfg: The AI director config dict (from profile.get("ai", {}).get("director", {}))
         cache_dir: Optional directory for response caching (e.g., proj.analysis_dir)
         on_status: Optional callback for status messages during server startup
-    
+
     Returns:
         A function that takes a prompt string and returns JSON response string,
         or None if LLM is not available.
-    
+
     Example:
         ai_cfg = ctx.profile.get("ai", {}).get("director", {})
         llm_complete = get_llm_complete_fn(ai_cfg, proj.analysis_dir)
@@ -49,16 +49,16 @@ def get_llm_complete_fn(
     if not ai_cfg.get("enabled", True):
         log.debug("[llm] AI disabled in config")
         return None
-    
+
     try:
         from .llm_client import create_llm_client
-        
+
         engine = str(ai_cfg.get("engine", "llama_cpp_server")).strip().lower()
         endpoint = str(ai_cfg.get("endpoint", "http://127.0.0.1:11435"))
         api_key = ai_cfg.get("api_key")
         if isinstance(api_key, str):
             api_key = api_key.strip() or None
-        
+
         # Auto-start only applies to local llama.cpp server.
         if engine == "llama_cpp_server" and ai_cfg.get("auto_start", False):
             from .llm_server import ensure_llm_server
@@ -85,7 +85,7 @@ def get_llm_complete_fn(
                 log.info(f"[llm] Server started at {endpoint}")
             else:
                 log.warning(f"[llm] Server failed to start within {startup_timeout_s}s")
-        
+
         # Create client
         # Default max_tokens is 2048 to handle highlight scoring (15 candidates × ~100 tokens)
         llm_client = create_llm_client(
@@ -97,22 +97,22 @@ def get_llm_complete_fn(
             max_tokens=int(ai_cfg.get("max_tokens", 2048)),
             temperature=float(ai_cfg.get("temperature", 0.2)),
         )
-        
+
         if llm_client.is_available():
             log.info(f"[llm] Client available at {endpoint} (engine={engine})")
-            
+
             def complete_fn(prompt: str) -> str:
                 resp = llm_client.complete(prompt, json_mode=True)
                 # Convert response back to JSON string (handles dict, list, or str)
                 if isinstance(resp, (dict, list)):
                     return json.dumps(resp)
                 return str(resp)
-            
+
             return complete_fn
         else:
             log.warning(f"[llm] Client NOT available at {endpoint}")
             return None
-            
+
     except Exception as e:
         log.warning(f"[llm] Setup failed: {e}")
         return None

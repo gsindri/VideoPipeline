@@ -1,14 +1,13 @@
 """Tests for speech analysis and candidate enrichment."""
-import numpy as np
 import pytest
 
 from videopipeline.analysis_speech_features import (
     SpeechFeatureConfig,
-    compute_lexical_excitement,
     _count_exclamations_questions,
-    _uppercase_ratio,
-    _count_repeated_chars,
     _count_reaction_phrases,
+    _count_repeated_chars,
+    _uppercase_ratio,
+    compute_lexical_excitement,
 )
 from videopipeline.analysis_transcript import (
     FullTranscript,
@@ -18,12 +17,11 @@ from videopipeline.analysis_transcript import (
 from videopipeline.enrich_candidates import (
     EnrichConfig,
     RerankConfig,  # Legacy alias
+    _has_payoff_word,
+    _is_punchy,
     extract_hook_text,
     extract_quote_text,
-    _is_punchy,
-    _has_payoff_word,
 )
-
 
 # ============================================================================
 # Transcript slicing tests
@@ -38,18 +36,18 @@ def test_transcript_get_text_in_range():
         TranscriptSegment(start=5.0, end=7.0, text="Another segment"),
     ]
     transcript = FullTranscript(segments=segments, duration_seconds=10.0)
-    
+
     # Get text spanning multiple segments
     text = transcript.get_text_in_range(1.0, 5.5)
     assert "Hello world" in text
     assert "This is a test" in text
     assert "Another segment" in text
-    
+
     # Get text from single segment
     text = transcript.get_text_in_range(0.5, 1.5)
     assert "Hello world" in text
     assert "This is a test" not in text
-    
+
     # No overlap
     text = transcript.get_text_in_range(8.0, 9.0)
     assert text == ""
@@ -63,13 +61,13 @@ def test_transcript_get_segments_in_range():
         TranscriptSegment(start=6.0, end=8.0, text="Third"),
     ]
     transcript = FullTranscript(segments=segments, duration_seconds=10.0)
-    
+
     # Get overlapping segments
     result = transcript.get_segments_in_range(1.5, 4.0)
     assert len(result) == 2
     assert result[0].text == "First"
     assert result[1].text == "Second"
-    
+
     # Single segment
     result = transcript.get_segments_in_range(6.5, 7.5)
     assert len(result) == 1
@@ -87,13 +85,13 @@ def test_transcript_get_words_in_range():
         TranscriptSegment(start=0.0, end=2.0, text="Hello world test", words=words),
     ]
     transcript = FullTranscript(segments=segments, duration_seconds=3.0)
-    
+
     # Get words in range
     result = transcript.get_words_in_range(0.0, 0.8)
     assert len(result) == 2
     assert result[0].word == "Hello"
     assert result[1].word == "world"
-    
+
     # Partial overlap
     result = transcript.get_words_in_range(1.0, 1.8)
     assert len(result) == 1
@@ -132,7 +130,7 @@ def test_count_repeated_chars():
 def test_count_reaction_phrases():
     """Test counting reaction phrases."""
     phrases = ["no way", "oh my god", "bro", "what"]
-    
+
     assert _count_reaction_phrases("no way that happened", phrases) == 1
     assert _count_reaction_phrases("bro what", phrases) == 2
     assert _count_reaction_phrases("oh my god bro no way", phrases) == 3
@@ -143,13 +141,13 @@ def test_compute_lexical_excitement():
     """Test computing lexical excitement score."""
     phrases = ["no way", "bro", "what"]
     cfg = SpeechFeatureConfig(reaction_phrases=phrases)
-    
+
     # High excitement text
     score_high = compute_lexical_excitement("NO WAY!!! WHAT?!", phrases, cfg)
-    
+
     # Low excitement text
     score_low = compute_lexical_excitement("hello world", phrases, cfg)
-    
+
     assert score_high > score_low
     assert score_high > 0
     assert score_low == 0
@@ -163,7 +161,7 @@ def test_compute_lexical_excitement():
 def test_is_punchy():
     """Test checking if text is punchy/hook-worthy."""
     phrases = ["no way", "bro", "what"]
-    
+
     assert _is_punchy("NO WAY!", phrases) is True
     assert _is_punchy("What?", phrases) is True
     assert _is_punchy("bro that was crazy", phrases) is True
@@ -183,7 +181,7 @@ def test_extract_hook_text():
         hook_window_seconds=4.0,
         reaction_phrases=["no way", "insane"],
     )
-    
+
     hook = extract_hook_text(transcript, 0.0, 5.0, cfg)
     assert hook is not None
     assert "NO WAY" in hook or "insane" in hook.lower()
@@ -200,7 +198,7 @@ def test_extract_hook_text_no_punchy():
         hook_window_seconds=4.0,
         reaction_phrases=["no way"],
     )
-    
+
     hook = extract_hook_text(transcript, 0.0, 4.0, cfg)
     # No fallback to non-punchy text - better to have no hook than a boring one
     assert hook is None
@@ -210,7 +208,7 @@ def test_extract_hook_text_empty():
     """Test hook extraction with no matching segments."""
     transcript = FullTranscript(segments=[], duration_seconds=5.0)
     cfg = RerankConfig()
-    
+
     hook = extract_hook_text(transcript, 0.0, 4.0, cfg)
     assert hook is None
 
@@ -240,7 +238,7 @@ def test_extract_quote_text():
         quote_max_chars=120,
         reaction_phrases=["insane", "clutch"],
     )
-    
+
     quote = extract_quote_text(transcript, 0.0, 8.0, cfg)
     assert quote is not None
     # Should pick the most exciting sentence
@@ -251,7 +249,7 @@ def test_extract_quote_text_empty():
     """Test quote extraction with no segments."""
     transcript = FullTranscript(segments=[], duration_seconds=5.0)
     cfg = RerankConfig()
-    
+
     quote = extract_quote_text(transcript, 0.0, 4.0, cfg)
     assert quote is None
 
@@ -264,7 +262,7 @@ def test_extract_quote_text_empty():
 def test_enrich_config_defaults():
     """Test EnrichConfig has sensible defaults."""
     cfg = EnrichConfig()
-    
+
     assert cfg.enabled is True
     assert cfg.hook_max_chars == 60
     assert cfg.hook_window_seconds == 4.0
@@ -291,10 +289,10 @@ def test_transcript_segment_roundtrip():
         TranscriptWord(word="world", start=0.6, end=1.0, probability=0.98),
     ]
     segment = TranscriptSegment(start=0.0, end=1.0, text="Hello world", words=words)
-    
+
     d = segment.to_dict()
     restored = TranscriptSegment.from_dict(d)
-    
+
     assert restored.start == segment.start
     assert restored.end == segment.end
     assert restored.text == segment.text
@@ -313,10 +311,10 @@ def test_full_transcript_roundtrip():
         language="en",
         duration_seconds=10.0,
     )
-    
+
     d = transcript.to_dict()
     restored = FullTranscript.from_dict(d)
-    
+
     assert restored.language == transcript.language
     assert restored.duration_seconds == transcript.duration_seconds
     assert len(restored.segments) == len(transcript.segments)

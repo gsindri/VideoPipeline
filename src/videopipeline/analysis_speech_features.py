@@ -8,15 +8,13 @@ import re
 import time as _time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
-from .analysis_transcript import FullTranscript, load_transcript
+from .analysis_transcript import load_transcript
 from .peaks import robust_z
 from .project import Project, save_npz, update_project
-
 
 # Default reaction phrases for gaming/streaming content
 DEFAULT_REACTION_PHRASES: List[str] = [
@@ -143,7 +141,7 @@ def compute_speech_features(
       - project.json -> analysis.speech section
     """
     start_time = _time.time()
-    
+
     transcript = load_transcript(proj)
     if transcript is None:
         raise ValueError("No transcript found. Run transcript analysis first.")
@@ -154,7 +152,7 @@ def compute_speech_features(
 
     hop_s = cfg.hop_seconds
     n_hops = int(np.ceil(duration_s / hop_s))
-    
+
     # Helper for progress reporting with optional message
     def _report(frac: float, msg: str = "") -> None:
         if on_progress:
@@ -169,19 +167,19 @@ def compute_speech_features(
     speech_presence = np.zeros(n_hops, dtype=np.float64)
     words_per_second = np.zeros(n_hops, dtype=np.float64)
     lexical_excitement = np.zeros(n_hops, dtype=np.float64)
-    
+
     # Check if we have word timestamps available
     has_word_timestamps = any(
-        seg.words and len(seg.words) > 0 
+        seg.words and len(seg.words) > 0
         for seg in transcript.segments
     )
-    
+
     if has_word_timestamps:
         # PATH A: Word timestamps available - bin words into hops once (O(n_words))
         # This is much faster and more accurate than per-hop scanning
         hop_word_counts = np.zeros(n_hops, dtype=np.int32)
         hop_tokens: List[List[str]] = [[] for _ in range(n_hops)]
-        
+
         for seg in transcript.segments:
             if seg.words:
                 for word in seg.words:
@@ -192,39 +190,39 @@ def compute_speech_features(
                         hop_word_counts[hop_idx] += 1
                         hop_tokens[hop_idx].append(word.word)
                         speech_presence[hop_idx] = 1.0
-        
+
         # Compute features from binned data
         words_per_second = hop_word_counts.astype(np.float64) / hop_s
-        
+
         for i in range(n_hops):
             if hop_tokens[i]:
                 text = " ".join(hop_tokens[i])
                 lexical_excitement[i] = compute_lexical_excitement(
                     text, cfg.reaction_phrases, cfg
                 )
-            
+
             if on_progress and i % 500 == 0:
                 _report(0.1 + 0.7 * (i / n_hops), f"Processing hop {i}/{n_hops}")
     else:
         # PATH B: No word timestamps - distribute segment-level stats into overlapping hops
         # This avoids the "whole segment text repeated per hop" inflation bug
         eps = 1e-9
-        
+
         for seg in transcript.segments:
             seg_duration = max(seg.end - seg.start, eps)
             seg_text = seg.text.strip()
             if not seg_text:
                 continue
-            
+
             # Compute segment-level metrics once
             seg_word_count = len(seg_text.split())
             seg_wps = seg_word_count / seg_duration
             seg_excitement = compute_lexical_excitement(seg_text, cfg.reaction_phrases, cfg)
-            
+
             # Distribute to all overlapping hops
             start_hop = int(seg.start / hop_s)
             end_hop = int(np.ceil(seg.end / hop_s))
-            
+
             for i in range(max(0, start_hop), min(n_hops, end_hop)):
                 speech_presence[i] = 1.0
                 words_per_second[i] = seg_wps

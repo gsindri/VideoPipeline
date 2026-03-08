@@ -8,7 +8,6 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .analysis_transcript import FullTranscript, TranscriptSegment, TranscriptWord, load_transcript
@@ -55,7 +54,7 @@ def _is_sentence_end(text: str, end_chars: str) -> bool:
 
 def _cleanup_punctuation_spacing(text: str) -> str:
     """Remove spaces before punctuation marks for cleaner display.
-    
+
     Converts "hello , world !" to "hello, world!"
     """
     # Remove space before common punctuation
@@ -178,7 +177,7 @@ def extract_sentences(
     cfg: SentenceConfig,
 ) -> List[Sentence]:
     """Extract sentences from transcript, handling mixed word/segment timestamps.
-    
+
     For segments with word timestamps: use word-based extraction (more accurate).
     For segments without word timestamps: use segment-based extraction (fallback).
     Results are merged and sorted by start time.
@@ -194,19 +193,19 @@ def extract_sentences(
             segments_without_words.append(segment)
 
     sentences: List[Sentence] = []
-    
+
     # Extract from word timestamps where available
     if all_words:
         sentences.extend(_extract_sentences_from_words(all_words, cfg))
-    
+
     # Also extract from segments that don't have word timestamps
     # This handles mixed transcripts where some segments have words and some don't
     if segments_without_words:
         sentences.extend(_extract_sentences_from_segments(segments_without_words, cfg))
-    
+
     # Sort by start time to interleave properly
     sentences.sort(key=lambda s: s.t0)
-    
+
     return sentences
 
 
@@ -217,7 +216,7 @@ def compute_sentences_analysis(
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Extract sentences from transcript and save to project.
-    
+
     Persists:
       - analysis/sentences.json
       - project.json -> analysis.sentences section
@@ -282,7 +281,7 @@ def load_sentences(proj: Project) -> Optional[List[Sentence]]:
 
 def get_sentence_boundaries(sentences: List[Sentence]) -> Dict[str, List[float]]:
     """Extract boundary timestamps from sentences.
-    
+
     Returns:
         Dict with:
           - sentence_starts: Times where sentences begin (good start points)

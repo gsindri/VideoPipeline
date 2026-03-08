@@ -13,8 +13,8 @@ Design goals:
 
 from __future__ import annotations
 
-import json
 import heapq
+import json
 import logging
 import re
 from collections import Counter
@@ -22,13 +22,12 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-from .store import ChatStore
-
-log = logging.getLogger(__name__)
 from ..peaks import moving_average, robust_z
 from ..project import Project, save_npz, update_project
 from ..utils import utc_iso as _utc_iso
+from .store import ChatStore
 
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Meta keys (stored in chat.sqlite meta table)
@@ -522,10 +521,10 @@ def compute_and_save_chat_features(
     If auto_learn_laugh_tokens=True and llm_complete is provided:
       - learns laughter tokens once (cached in chat sqlite meta)
       - then computes features using that lexicon
-    
+
     Learned emotes are also saved to a global database so they can be
     reused across videos from the same channel.
-    
+
     Args:
         on_status: Optional callback for status messages (e.g., "Learning laugh emotes...")
         force_relearn_laugh: If True, re-learn laugh tokens even if cached
@@ -549,23 +548,23 @@ def compute_and_save_chat_features(
     # Initialize global emote database for cross-project persistence
     global_emote_db = GlobalEmoteDB()
     global_emotes_loaded = set()
-    
+
     store = ChatStore(chat_db_path)
     llm_used = False
     llm_identified: Set[str] = set()
     newly_learned: Set[str] = set()  # Emotes that are truly NEW (not in global DB before)
-    
+
     try:
         # 1) Load cached laugh tokens from project (if any)
         laugh_tokens = load_laugh_tokens_from_store(store)
         if log.isEnabledFor(logging.DEBUG):
             log.debug("[EMOTE] Initial laugh_tokens from store: %s", _fmt_set_sample(laugh_tokens))
-        
+
         # Check if we should skip LLM learning (already learned with LLM previously)
         existing_source = store.get_meta(_META_LAUGH_TOKENS_SOURCE, "")
         already_llm_learned = existing_source.startswith("llm")
         log.debug("[EMOTE] existing_source=%r already_llm_learned=%s", existing_source, already_llm_learned)
-        
+
         # 1b) If we have a channel identifier, load from global emote DB FIRST
         log.debug("[EMOTE] channel key passed in: %r", channel_id)
         if channel_id:
@@ -583,7 +582,7 @@ def compute_and_save_chat_features(
                     llm_learned_from_global = global_emotes_loaded - _SEED_LAUGH_TOKENS
                     save_laugh_tokens_to_store(store, laugh_tokens, source="llm_global", llm_learned=llm_learned_from_global)
                     already_llm_learned = True
-        
+
         if laugh_tokens and not force_relearn_laugh:
             if on_status:
                 source_info = " (AI-learned)" if already_llm_learned else " (seeds only)"
@@ -603,7 +602,7 @@ def compute_and_save_chat_features(
             bool(laugh_tokens),
             force_relearn_laugh,
         )
-        
+
         if should_learn and need_learn:
             if on_status:
                 on_status("Learning channel-specific laugh emotes via LLM...")
@@ -625,9 +624,9 @@ def compute_and_save_chat_features(
             laugh_tokens = set(learned)
             save_laugh_tokens_to_store(store, laugh_tokens, source="llm", llm_learned=llm_identified)
             llm_used = True
-            
+
             log.info(f"[EMOTE PERSIST] channel_id={channel_id}, platform={platform}, llm_identified={llm_identified}")
-            
+
             # Save to global emote DB for cross-project persistence
             # merge_channel_emotes returns (total, new_count) - track truly new ones
             if channel_id and llm_identified:
@@ -640,7 +639,7 @@ def compute_and_save_chat_features(
                 )
                 # Figure out which emotes are truly new (not in global DB before)
                 newly_learned = llm_identified - global_emotes_loaded
-                
+
                 if on_status:
                     seed_count = len(laugh_tokens & _SEED_LAUGH_TOKENS)
                     llm_count = len(llm_identified)
@@ -657,7 +656,7 @@ def compute_and_save_chat_features(
                     seed_count = len(laugh_tokens & _SEED_LAUGH_TOKENS)
                     llm_count = len(llm_identified)
                     on_status(f"Learned {len(laugh_tokens)} laugh tokens ({llm_count} from AI, {seed_count} seeds)")
-                    
+
         elif (not laugh_tokens) and auto_learn_laugh_tokens and llm_complete is None:
             if strict_llm:
                 raise RuntimeError("chat.llm_strict is enabled but no LLM client is available for laugh-token learning")
@@ -689,7 +688,7 @@ def compute_and_save_chat_features(
         if llm_used:
             laugh_source = "llm"
         laugh_version = store.get_meta(_META_LAUGH_TOKENS_VERSION, "")
-        
+
         # Get LLM-learned token count for pipeline status display
         llm_learned_json = store.get_meta("laugh_tokens_llm_learned", "[]")
         try:

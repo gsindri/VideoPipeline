@@ -2,14 +2,12 @@
 
 from pathlib import Path
 
-import pytest
-
 from videopipeline.metadata import (
+    _clean_text,
+    _fmt_time,
+    _pick_hook_from_segments,
     build_metadata,
     derive_hook_text,
-    _clean_text,
-    _pick_hook_from_segments,
-    _fmt_time,
 )
 from videopipeline.subtitles import SubtitleSegment
 

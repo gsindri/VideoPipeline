@@ -104,7 +104,7 @@ def _load_silero_vad_iterator(cfg: VadConfig):
 
     # 1) pip package
     try:
-        from silero_vad import load_silero_vad, VADIterator  # type: ignore
+        from silero_vad import VADIterator, load_silero_vad  # type: ignore
 
         model = load_silero_vad(onnx=cfg.use_onnx, opset_version=cfg.opset_version)
         return model, VADIterator, "pip:silero-vad"
@@ -236,7 +236,6 @@ def _iter_audio_frames_wav(
         channels = int(wf.getnchannels())
         sample_width = int(wf.getsampwidth())
         sr = int(wf.getframerate())
-        total_frames = int(wf.getnframes())
 
         if channels != 1:
             raise RuntimeError(f"WAV stream requires mono audio (got channels={channels})")
@@ -501,7 +500,7 @@ def compute_audio_vad_analysis(
     except Exception as exc:
         logger.warning("[audio_vad] Failed to get duration via ffprobe (%s): %s", media_path, exc)
         duration_s = 0.0
-    
+
     # Helper for progress reporting with optional message
     def _report(frac: float, msg: str = "") -> None:
         if on_progress:

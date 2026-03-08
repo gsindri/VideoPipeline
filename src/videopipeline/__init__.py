@@ -1,5 +1,6 @@
 # Suppress TensorFlow warnings (only affects TF if it's imported later)
 import os as _os
+
 _os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # Suppress TF info/warning logs
 _os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")  # Disable oneDNN message
 
@@ -10,6 +11,7 @@ _os.environ.setdefault("USE_TF", "0")
 _os.environ.setdefault("USE_FLAX", "0")
 
 import warnings as _warnings
+
 _warnings.filterwarnings("ignore", message=".*pkg_resources.*deprecated.*")
 
 __all__ = ["__version__"]

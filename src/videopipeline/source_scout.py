@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
-import time
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -15,7 +15,6 @@ import yaml
 
 from .project import default_projects_root
 from .source_inbox import list_source_inbox_entries
-
 
 _YOUTUBE_ID_RE = re.compile(r"(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]+)")
 _TWITCH_VOD_ID_RE = re.compile(r"twitch\.tv/videos/(\d+)")

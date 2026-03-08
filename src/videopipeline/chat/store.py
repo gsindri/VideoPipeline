@@ -11,11 +11,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
-
-from ..utils import utc_iso
 
 
 @dataclass
@@ -93,7 +91,7 @@ class ChatStore:
     """SQLite-backed chat message store.
 
     Provides efficient time-range queries for synced playback.
-    
+
     Can be used as a context manager:
         with ChatStore(db_path) as store:
             store.initialize()

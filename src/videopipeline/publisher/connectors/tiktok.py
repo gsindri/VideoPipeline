@@ -14,7 +14,6 @@ import requests
 from ..accounts import Account
 from ..secrets import store_tokens
 
-
 AUTH_BASE = "https://www.tiktok.com/v2/auth/authorize/"
 TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
 API_BASE = "https://open.tiktokapis.com"

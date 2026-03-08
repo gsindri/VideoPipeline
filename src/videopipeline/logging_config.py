@@ -3,7 +3,7 @@
 Usage:
     from videopipeline.logging_config import setup_logging
     setup_logging()  # Call once at startup
-    
+
     # Then in any module:
     import logging
     log = logging.getLogger("videopipeline.mymodule")
@@ -17,7 +17,6 @@ import re
 import sys
 from pathlib import Path
 from typing import Dict, Optional
-
 
 _CONFIGURED = False
 
@@ -64,7 +63,7 @@ def setup_logging(
     format_string: Optional[str] = None,
 ) -> None:
     """Configure logging for the videopipeline package.
-    
+
     Args:
         level: Logging level (default: INFO)
         log_file: Optional file path to write logs to
@@ -73,17 +72,17 @@ def setup_logging(
     global _CONFIGURED
     if _CONFIGURED:
         return
-    
+
     if format_string is None:
         format_string = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    
+
     # Configure the root videopipeline logger
     logger = logging.getLogger("videopipeline")
     logger.setLevel(level)
-    
+
     # Remove existing handlers to avoid duplicates
     logger.handlers.clear()
-    
+
     # Console handler
     console_handler = logging.StreamHandler(sys.stderr)
     # Keep handler permissive so per-module overrides can enable DEBUG without
@@ -91,7 +90,7 @@ def setup_logging(
     console_handler.setLevel(logging.DEBUG)
     console_handler.setFormatter(logging.Formatter(format_string, datefmt="%Y-%m-%d %H:%M:%S"))
     logger.addHandler(console_handler)
-    
+
     # Optional file handler
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -99,7 +98,7 @@ def setup_logging(
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(logging.Formatter(format_string, datefmt="%Y-%m-%d %H:%M:%S"))
         logger.addHandler(file_handler)
-    
+
     # Don't propagate to root logger
     logger.propagate = False
 
@@ -109,18 +108,18 @@ def setup_logging(
     module_levels = _parse_module_levels(os.getenv("VP_LOG_MODULE_LEVELS", ""))
     for name, lvl in module_levels.items():
         logging.getLogger(name).setLevel(lvl)
-    
+
     _CONFIGURED = True
 
 
 def get_logger(name: str) -> logging.Logger:
     """Get a logger for the given module name.
-    
+
     If name doesn't start with 'videopipeline', it will be prefixed.
-    
+
     Args:
         name: Module name (e.g., 'studio.app' or 'videopipeline.studio.app')
-    
+
     Returns:
         Configured logger instance
     """

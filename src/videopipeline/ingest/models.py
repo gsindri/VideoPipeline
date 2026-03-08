@@ -48,18 +48,18 @@ SPEED_MODE_N: dict[SpeedMode, int] = {
 @dataclass
 class SitePolicy:
     """Policy for downloading from a specific site type."""
-    
+
     site_type: SiteType
     display_name: str
-    
+
     # HLS-specific settings
     use_hls_native: bool = False
     supports_fragment_concurrency: bool = False
     default_concurrency: int = 1
-    
+
     # Behavior hints
     notes: str = ""
-    
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "site_type": self.site_type.value,
@@ -111,21 +111,21 @@ SITE_POLICIES: dict[SiteType, SitePolicy] = {
 @dataclass
 class ProbeResult:
     """Result of probing a URL."""
-    
+
     url: str
     site_type: SiteType
     policy: SitePolicy
-    
+
     # From yt-dlp extract_info
     title: str = ""
     duration_seconds: float = 0.0
     extractor: str = ""
     video_id: str = ""
     is_live: bool = False
-    
+
     # Detection details
     detected_by: str = "heuristic"  # "heuristic" or "ytdlp"
-    
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "url": self.url,
@@ -144,7 +144,7 @@ class ProbeResult:
 @dataclass
 class IngestRequest:
     """Request to download a URL."""
-    
+
     url: str
     speed_mode: SpeedMode = SpeedMode.AUTO
     quality_cap: QualityCap = QualityCap.SOURCE
@@ -156,19 +156,19 @@ class IngestRequest:
 @dataclass
 class PostprocessResult:
     """Result of postprocessing a downloaded file."""
-    
+
     source_path: Path
     preview_path: Optional[Path] = None
-    
+
     # What was done
     remuxed: bool = False
     preview_created: bool = False
-    
+
     # Codec info
     source_video_codec: str = ""
     source_audio_codec: str = ""
     source_container: str = ""
-    
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "source_path": str(self.source_path),
@@ -184,29 +184,29 @@ class PostprocessResult:
 @dataclass
 class IngestResult:
     """Complete result of URL ingestion."""
-    
+
     # Paths
     video_path: Path
     info_json_path: Optional[Path] = None
     preview_path: Optional[Path] = None
     thumbnail_path: Optional[Path] = None
-    
+
     # Metadata from yt-dlp
     title: str = ""
     url: str = ""
     extractor: str = ""
     video_id: str = ""
     duration_seconds: float = 0.0
-    
+
     # Site detection
     site_type: SiteType = SiteType.GENERIC
-    
+
     # Postprocess info
     postprocess: Optional[PostprocessResult] = None
-    
+
     # Status
     created_at: str = field(default_factory=_utc_iso)
-    
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "video_path": str(self.video_path),

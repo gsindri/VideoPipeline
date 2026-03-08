@@ -21,7 +21,7 @@ class TestParseSilencedetectOutput:
 [silencedetect @ 0x12345] silence_end: 26.5 | silence_duration: 1.5
 """
         intervals = parse_silencedetect_output(output)
-        
+
         assert len(intervals) == 2
         assert intervals[0].start == pytest.approx(10.5)
         assert intervals[0].end == pytest.approx(12.3)
@@ -44,7 +44,7 @@ class TestParseSilencedetectOutput:
 [silencedetect @ 0x12345] silence_start: 99.0
 """
         intervals = parse_silencedetect_output(output)
-        
+
         # Should only have 1 complete interval
         assert len(intervals) == 1
         assert intervals[0].start == pytest.approx(10.5)
@@ -56,7 +56,7 @@ class TestParseSilencedetectOutput:
 [silencedetect @ 0x12345] silence_end: 20.0 | silence_duration: 5.0
 """
         intervals = parse_silencedetect_output(output)
-        
+
         assert len(intervals) == 1
         assert intervals[0].start == pytest.approx(15.0)
         assert intervals[0].end == pytest.approx(20.0)
@@ -90,6 +90,6 @@ class TestSilenceInterval:
         """Test dictionary conversion."""
         interval = SilenceInterval(start=10.0, end=12.0)
         d = interval.to_dict()
-        
+
         assert d["start"] == 10.0
         assert d["end"] == 12.0

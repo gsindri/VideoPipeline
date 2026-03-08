@@ -25,7 +25,6 @@ import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .project import Project, get_project_data, save_json, update_project

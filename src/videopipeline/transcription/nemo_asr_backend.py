@@ -15,15 +15,15 @@ import types
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
+from ..utils import subprocess_flags
 from .base import (
-    BaseTranscriber,
     BackendNotAvailableError,
+    BaseTranscriber,
     TranscriberConfig,
     TranscriptResult,
     TranscriptSegment,
     TranscriptWord,
 )
-from ..utils import subprocess_flags
 
 logger = logging.getLogger(__name__)
 

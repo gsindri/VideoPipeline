@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Task:
     """A unit of work in the analysis DAG.
-    
+
     Attributes:
         name: Human-readable name
         requires: Artifacts that must exist (or be optional via can_run_partial)
@@ -46,7 +46,7 @@ class Task:
     optional_inputs: Set[str] = field(default_factory=set)
     upgrade_triggers: Set[str] = field(default_factory=set)
     enabled_check: Optional[Callable[[Dict[str, Any]], bool]] = None
-    
+
     def is_enabled(self, config: Dict[str, Any]) -> bool:
         """Check if this task should run based on config."""
         if self.enabled_check is None:
@@ -56,27 +56,27 @@ class Task:
 
 class TaskRegistry:
     """Registry of tasks keyed by produced artifact."""
-    
+
     def __init__(self) -> None:
         self._by_artifact: Dict[str, Task] = {}
         self._by_name: Dict[str, Task] = {}
         self._all_tasks: list[Task] = []
-    
+
     def register(self, task: Task) -> None:
         """Register a task."""
         self._by_name[task.name] = task
         self._all_tasks.append(task)
         for artifact in task.produces:
             self._by_artifact[artifact] = task
-    
+
     def get_by_artifact(self, artifact: str) -> Optional[Task]:
         """Get the task that produces an artifact."""
         return self._by_artifact.get(artifact)
-    
+
     def get_by_name(self, name: str) -> Optional[Task]:
         """Get a task by name."""
         return self._by_name.get(name)
-    
+
     def all_tasks(self) -> list[Task]:
         """Get all registered tasks."""
         return list(self._all_tasks)
@@ -146,7 +146,7 @@ def _run_audio_decode(proj: Project, cfg: Dict[str, Any], on_progress: Optional[
 def _run_audio_features(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Compute audio RMS/energy features."""
     from ..analysis_audio import compute_audio_analysis
-    
+
     audio_cfg = cfg.get("audio", {})
     compute_audio_analysis(
         proj,
@@ -168,9 +168,9 @@ def _run_audio_events(proj: Project, cfg: Dict[str, Any], on_progress: Optional[
     audio_events_cfg = cfg.get("audio_events", {})
     if not audio_events_cfg.get("enabled", True):
         return
-    
-    from ..analysis_audio_events import compute_audio_events_analysis, AudioEventsConfig
-    
+
+    from ..analysis_audio_events import AudioEventsConfig, compute_audio_events_analysis
+
     events_cfg = AudioEventsConfig.from_dict(audio_events_cfg)
 
     compute_audio_events_analysis(
@@ -183,8 +183,8 @@ def _run_audio_events(proj: Project, cfg: Dict[str, Any], on_progress: Optional[
 
 def _run_silence(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Detect silence intervals in audio."""
-    from ..analysis_silence import compute_silence_analysis, SilenceConfig
-    
+    from ..analysis_silence import SilenceConfig, compute_silence_analysis
+
     silence_cfg = cfg.get("silence", {})
     compute_silence_analysis(
         proj,
@@ -208,7 +208,7 @@ def _run_audio_vad(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Cal
         logger.info("[audio_vad] torch not installed; skipping VAD (install with: pip install torch)")
         return
 
-    from ..analysis_vad import compute_audio_vad_analysis, VadConfig
+    from ..analysis_vad import VadConfig, compute_audio_vad_analysis
 
     vad_cfg = cfg.get("vad", {}) or {}
     compute_audio_vad_analysis(
@@ -240,7 +240,7 @@ def _run_reaction_audio(proj: Project, cfg: Dict[str, Any], on_progress: Optiona
     if not reaction_cfg.get("enabled", True):
         return
 
-    from ..analysis_reaction_audio import compute_reaction_audio_features, ReactionAudioConfig
+    from ..analysis_reaction_audio import ReactionAudioConfig, compute_reaction_audio_features
 
     # Default hop to the main analysis hop for easy alignment.
     audio_cfg = cfg.get("audio", {})
@@ -262,7 +262,7 @@ def _run_diarization(proj: Project, cfg: Dict[str, Any], on_progress: Optional[C
     if not speech_cfg.get("diarize", False):
         return
 
-    from ..analysis_diarization import compute_diarization_analysis, DiarizationConfig
+    from ..analysis_diarization import DiarizationConfig, compute_diarization_analysis
 
     diar_cfg = cfg.get("diarization", {})
     # If there's no dedicated diarization section, fall back to speech.* keys.
@@ -289,8 +289,8 @@ def _run_diarization(proj: Project, cfg: Dict[str, Any], on_progress: Optional[C
 
 def _run_transcript(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Compute full video transcript."""
-    from ..analysis_transcript import compute_transcript_analysis, TranscriptConfig
-    
+    from ..analysis_transcript import TranscriptConfig, compute_transcript_analysis
+
     speech_cfg = cfg.get("speech", {})
 
     compute_transcript_analysis(
@@ -347,8 +347,8 @@ def _run_transcript(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Ca
 
 def _run_sentences(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Extract sentence boundaries from transcript."""
-    from ..analysis_sentences import compute_sentences_analysis, SentenceConfig
-    
+    from ..analysis_sentences import SentenceConfig, compute_sentences_analysis
+
     sentences_cfg = cfg.get("sentences", {})
     compute_sentences_analysis(
         proj,
@@ -362,8 +362,8 @@ def _run_sentences(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Cal
 
 def _run_speech_features(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Compute speech features (word density, speech rate, etc.)."""
-    from ..analysis_speech_features import compute_speech_features, SpeechFeatureConfig
-    
+    from ..analysis_speech_features import SpeechFeatureConfig, compute_speech_features
+
     speech_cfg = cfg.get("speech_features", cfg.get("speech", {}))
     compute_speech_features(
         proj,
@@ -379,9 +379,9 @@ def _run_chapters(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Call
     chapters_cfg = cfg.get("chapters", {})
     if not chapters_cfg.get("enabled", True):
         return
-    
-    from ..analysis_chapters import compute_chapters_analysis, ChapterConfig
-    
+
+    from ..analysis_chapters import ChapterConfig, compute_chapters_analysis
+
     # Get LLM function if available
     llm_complete = cfg.get("_llm_complete")  # Injected by runner
     ai_cfg = cfg.get("ai", {})
@@ -390,7 +390,7 @@ def _run_chapters(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Call
     model_name = str(director_cfg.get("model_name", "local-gguf-vulkan"))
     api_key = str(director_cfg.get("api_key", "")).strip() or None
     timeout_s = float(director_cfg.get("timeout_s", 30.0))
-    
+
     compute_chapters_analysis(
         proj,
         cfg=ChapterConfig(
@@ -444,8 +444,9 @@ def _run_chat_features(proj: Project, cfg: Dict[str, Any], on_progress: Optional
             return
         try:
             import numpy as np
-            from ..project import load_npz
+
             from ..chat.store import ChatStore
+            from ..project import load_npz
 
             data = load_npz(proj.chat_features_path)
             counts = data.get("counts")
@@ -477,14 +478,14 @@ def _run_chat_features(proj: Project, cfg: Dict[str, Any], on_progress: Optional
     if not chat_db.exists() and not chat_json.exists():
         logger.info("[chat_features] No chat data found; skipping.")
         return  # No chat data
-    
+
     highlights_cfg = cfg.get("highlights", {})
     audio_cfg = cfg.get("audio", {})
     hop_s = float(audio_cfg.get("hop_seconds", 0.5))
-    
+
     if chat_db.exists():
-        from ..chat.features import compute_and_save_chat_features
         from ..chat.emote_db import get_channel_for_project
+        from ..chat.features import compute_and_save_chat_features
 
         channel_info = get_channel_for_project(proj)
         channel_id = channel_info[0] if channel_info else None
@@ -514,9 +515,9 @@ def _run_chat_boundaries(proj: Project, cfg: Dict[str, Any], on_progress: Option
     """Compute chat activity valleys (good boundary points)."""
     if not proj.chat_features_path.exists():
         return  # Need chat features first
-    
-    from ..analysis_chat_boundaries import compute_chat_boundaries_analysis, ChatBoundaryConfig
-    
+
+    from ..analysis_chat_boundaries import ChatBoundaryConfig, compute_chat_boundaries_analysis
+
     chat_cfg = cfg.get("chat_boundaries", {})
     compute_chat_boundaries_analysis(
         proj,
@@ -550,7 +551,7 @@ def _run_chat_sync(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Cal
 def _run_motion_features(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Compute motion features from video frames."""
     from ..analysis_motion import compute_motion_analysis
-    
+
     motion_cfg = cfg.get("motion", {})
     compute_motion_analysis(
         proj,
@@ -566,9 +567,9 @@ def _run_scenes(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callab
     scenes_cfg = cfg.get("scenes", {})
     if not scenes_cfg.get("enabled", True):
         return
-    
+
     from ..analysis_scenes import compute_scene_analysis
-    
+
     compute_scene_analysis(
         proj,
         threshold_z=float(scenes_cfg.get("threshold_z", 3.5)),
@@ -580,12 +581,12 @@ def _run_scenes(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callab
 
 def _run_boundary_graph(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Compute unified boundary graph from all available sources.
-    
+
     This task is special: it can run with partial inputs and should be
     re-run when new boundary sources become available.
     """
-    from ..analysis_boundaries import compute_boundary_graph, BoundaryConfig, save_boundary_graph
-    
+    from ..analysis_boundaries import BoundaryConfig, compute_boundary_graph, save_boundary_graph
+
     # Load scene cuts if available
     scene_cuts = None
     if proj.scenes_path.exists():
@@ -596,7 +597,7 @@ def _run_boundary_graph(proj: Project, cfg: Dict[str, Any], on_progress: Optiona
             scene_cuts = scenes_data.get("cuts_seconds") or scenes_data.get("cuts") or []
         except Exception as exc:
             logger.warning("[boundary_graph] Failed to read/parse scenes.json (%s): %s", proj.scenes_path, exc)
-    
+
     boundaries_cfg = cfg.get("boundaries", {})
     boundary_cfg = BoundaryConfig(
         prefer_vad=bool(boundaries_cfg.get("prefer_vad", True)),
@@ -611,26 +612,26 @@ def _run_boundary_graph(proj: Project, cfg: Dict[str, Any], on_progress: Optiona
         chapter_boundary_score=float(boundaries_cfg.get("chapter_boundary_score", 2.0)),
         turn_boundary_score=float(boundaries_cfg.get("turn_boundary_score", 1.3)),
     )
-    
+
     graph = compute_boundary_graph(proj, boundary_cfg, scene_cuts=scene_cuts)
     save_boundary_graph(proj, graph)
-    
+
     if on_progress:
         on_progress(1.0)
 
 
 def _run_highlights_scores(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Compute combined highlight scores and peak indices.
-    
+
     This is the SCORING phase - it fuses signals and finds peaks.
     Clip shaping is done separately in highlights_candidates.
     """
     # NOTE: We keep this call forwards/backwards compatible.
     # If your compute_highlights_scores implementation doesn't yet support
     # reaction_audio / diarization-derived signals, this will still run.
-    from ..analysis_highlights import compute_highlights_scores
-
     import inspect
+
+    from ..analysis_highlights import compute_highlights_scores
 
     kwargs: Dict[str, Any] = {
         "audio_cfg": cfg.get("audio", {}),
@@ -659,13 +660,13 @@ def _run_highlights_scores(proj: Project, cfg: Dict[str, Any], on_progress: Opti
 
 def _run_highlights_candidates(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Shape peaks into clip candidates using boundary graph.
-    
+
     This is the SHAPING phase - it uses the boundary graph to find
     optimal clip boundaries. This is fast and can be re-run when
     the boundary graph improves.
     """
     from ..analysis_highlights import compute_highlights_candidates
-    
+
     compute_highlights_candidates(
         proj,
         highlights_cfg=cfg.get("highlights", {}),
@@ -678,7 +679,7 @@ def _run_highlights_candidates(proj: Project, cfg: Dict[str, Any], on_progress: 
 def _run_variants(proj: Project, cfg: Dict[str, Any], on_progress: Optional[Callable[[float], None]]) -> None:
     """Generate clip variants (titles, hooks, etc.)."""
     from ..clip_variants import compute_variants
-    
+
     compute_variants(
         proj,
         cfg=cfg.get("variants", {}),

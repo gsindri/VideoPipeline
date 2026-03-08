@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Generator, Optional
+from typing import Any, Dict, Generator, Optional
 
 import numpy as np
 
@@ -235,10 +235,10 @@ class Project:
     @property
     def audio_raw_path(self) -> Path:
         """Path to store downloaded audio file within the project.
-        
+
         When audio is downloaded before video (e.g., during URL download),
         it's copied here so all analysis can use it without external references.
-        
+
         Note: This returns the expected path for a new audio file.
         Use find_audio_raw() to find an existing audio file with any extension.
         """
@@ -246,15 +246,15 @@ class Project:
 
     def find_audio_raw(self) -> Optional[Path]:
         """Find downloaded audio file in the inputs directory.
-        
+
         Searches for audio files with common extensions (m4a, mp3, opus, wav, webm, ogg, mp4).
-        
+
         Returns:
             Path to audio file if found, None otherwise
         """
         if not self.inputs_dir.exists():
             return None
-        
+
         # Include mp4 because yt-dlp sometimes downloads audio as .mp4 container
         audio_extensions = {".m4a", ".mp3", ".opus", ".wav", ".webm", ".ogg", ".aac", ".flac", ".mp4"}
         for f in self.inputs_dir.iterdir():
@@ -265,24 +265,24 @@ class Project:
     @property
     def audio_source(self) -> Path:
         """Get the path to use for audio extraction.
-        
+
         Priority order:
         1. Audio file in inputs_dir - Audio file stored in project (best: self-contained)
         2. video_path - Extract audio from video (normal case)
         3. early_audio_path from project.json - Legacy temp file reference
         4. video_path as fallback
-        
+
         This allows early analysis during download when only audio is available.
         """
         # 1. Prefer audio file stored in project (self-contained)
         audio_raw = self.find_audio_raw()
         if audio_raw and audio_raw.exists():
             return audio_raw
-        
+
         # 2. If video exists, use it (normal case)
         if self.video_path.exists():
             return self.video_path
-        
+
         # 3. Check for early audio path in project.json (legacy/temp reference)
         if self.project_json_path.exists():
             try:
@@ -294,34 +294,34 @@ class Project:
                         return early_path
             except Exception:
                 pass
-        
+
         # 4. Fall back to video_path (may not exist, but callers will handle)
         return self.video_path
 
 
 def find_project_for_video(video_path: Path, projects_root: Optional[Path] = None) -> Optional[Path]:
     """Find an existing project directory that contains a given video file.
-    
+
     This handles the case where a project was created via URL download (using content_id hash)
     and we later want to open it by video path.
-    
+
     Checks:
     1. If video_path is already inside a project's video/ folder -> return that project
     2. Scan all projects for matching video path in project.json
-    
+
     Args:
         video_path: Path to the video file
         projects_root: Optional custom projects directory
-        
+
     Returns:
         Path to the project directory if found, None otherwise
     """
     video_path = Path(video_path).expanduser().resolve()
     projects_root = projects_root or default_projects_root()
-    
+
     if not projects_root.exists():
         return None
-    
+
     # Check if video_path is already inside a project's video/ folder
     # e.g., outputs/projects/<hash>/video/video.mp4
     try:
@@ -332,16 +332,16 @@ def find_project_for_video(video_path: Path, projects_root: Optional[Path] = Non
                     return parent
     except Exception:
         pass
-    
+
     # Scan all projects to find one that references this video
     for proj_dir in projects_root.iterdir():
         if not proj_dir.is_dir():
             continue
-        
+
         project_json = proj_dir / "project.json"
         if not project_json.exists():
             continue
-        
+
         try:
             data = load_json(project_json)
             stored_path = data.get("video", {}).get("path")
@@ -349,19 +349,19 @@ def find_project_for_video(video_path: Path, projects_root: Optional[Path] = Non
                 return proj_dir
         except Exception:
             continue
-    
+
     return None
 
 
 def create_or_load_project(video_path: Path, projects_root: Optional[Path] = None) -> Project:
     video_path = Path(video_path).expanduser().resolve()
-    
+
     # First, check if there's already a project for this video
     # (handles projects created via URL download with different hash)
     existing_pdir = find_project_for_video(video_path, projects_root)
     if existing_pdir:
         return Project(project_dir=existing_pdir, video_path=video_path)
-    
+
     # No existing project found, create new one based on file fingerprint
     pdir = project_dir_for_video(video_path, projects_root)
     pdir.mkdir(parents=True, exist_ok=True)
@@ -404,30 +404,30 @@ def create_project_early(
     projects_root: Optional[Path] = None,
 ) -> Project:
     """Create a project early, before video download completes.
-    
+
     This allows running audio-based analysis (transcript, silence, etc.)
     while the video is still downloading.
-    
+
     Args:
         content_id: Unique identifier for the content (e.g., video ID from URL)
         source_url: Original URL being downloaded
         audio_path: Path to downloaded audio file (optional, for duration detection)
         duration_seconds: Known duration (optional, from metadata)
         projects_root: Custom projects directory
-        
+
     Returns:
         Project with placeholder video path
     """
     import hashlib
     import shutil
-    
+
     projects_root = projects_root or default_projects_root()
-    
+
     # Create project ID from content_id hash
     pid = hashlib.sha256(content_id.encode()).hexdigest()
     pdir = projects_root / pid
     pdir.mkdir(parents=True, exist_ok=True)
-    
+
     # Check if this is a re-download (project exists but video doesn't)
     # If so, clear stale analysis outputs so tasks re-run
     video_dir = pdir / "video"
@@ -438,12 +438,12 @@ def create_project_early(
         import logging
         logging.getLogger(__name__).info(f"Clearing stale analysis for re-download: {pdir.name[:12]}...")
         shutil.rmtree(analysis_dir, ignore_errors=True)
-    
+
     # Placeholder video path (will be updated when video downloads)
     placeholder_video = pdir / "video_pending"
-    
+
     proj = Project(project_dir=pdir, video_path=placeholder_video)
-    
+
     if not proj.project_json_path.exists():
         # Try to get duration from audio if available
         if duration_seconds is None and audio_path and audio_path.exists():
@@ -451,7 +451,7 @@ def create_project_early(
                 duration_seconds = ffprobe_duration_seconds(audio_path)
             except Exception:
                 pass
-        
+
         initial = {
             "project_id": pdir.name,
             "created_at": utc_now_iso(),
@@ -473,7 +473,7 @@ def create_project_early(
             "exports": [],
         }
         save_json(proj.project_json_path, initial)
-    
+
     return proj
 
 
@@ -513,30 +513,30 @@ def set_project_video(
     thumbnail_path: Optional[Path] = None,
 ) -> None:
     """Update a project with the final video path after download completes.
-    
+
     Uses a staging + promote flow so the final project video path is only written
     once the file is fully present (and best-effort validated). This avoids
     "half-baked" final files if the process crashes mid-copy.
-    
+
     Args:
         proj: Project to update
         video_path: Path to downloaded video file
         preview_path: Optional browser-friendly preview/proxy video
     """
-    import shutil
     import os
-    
+    import shutil
+
     src_video = Path(video_path).expanduser().resolve()
     src_preview = Path(preview_path).expanduser().resolve() if preview_path is not None else None
     src_thumb = Path(thumbnail_path).expanduser().resolve() if thumbnail_path is not None else None
-    
+
     # Create video directory in project
     video_dir = proj.video_dir
     video_dir.mkdir(parents=True, exist_ok=True)
 
     staging_dir = proj.project_dir / "staging"
     staging_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Destination path - always use "video.mp4" for consistency
     dest_path = video_dir / "video.mp4"
 
@@ -660,18 +660,18 @@ def set_project_video(
                     thumb_dest = None
         except Exception:
             thumb_dest = None
-    
+
     # Update the project's video_path to point to the project-local copy
     proj.video_path = dest_path
-    
+
     # Get video info
     try:
         duration_s = ffprobe_duration_seconds(dest_path)
     except Exception:
         duration_s = None
-    
+
     st = dest_path.stat()
-    
+
     def _upd(d: Dict[str, Any]) -> None:
         d["status"] = "ready"
         d["status_error"] = None
@@ -685,7 +685,7 @@ def set_project_video(
             "mtime_ns": getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)),
             "duration_seconds": duration_s or d.get("video", {}).get("duration_seconds"),
         }
-    
+
     update_project(proj, _upd)
 
 
@@ -803,7 +803,7 @@ def _file_lock(lock_file: Path, *, timeout_s: float = 10.0, poll_s: float = 0.02
     We use this for project.json updates because many analysis tasks run in parallel
     and update_project() does a read-modify-write cycle. On Windows, concurrent
     os.replace() calls can raise PermissionError (WinError 5).
-    
+
     The lock times out quickly (10s default) and considers locks stale after 5s,
     because save_json/load_json should be very fast operations.
     """
@@ -830,7 +830,7 @@ def _file_lock(lock_file: Path, *, timeout_s: float = 10.0, poll_s: float = 0.02
                 # Some other OS error, wait and retry
                 time.sleep(poll_s)
                 continue
-            
+
             # Lock file exists - check if it's stale
             try:
                 content = lock_file.read_text(encoding="utf-8").strip()

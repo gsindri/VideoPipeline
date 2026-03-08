@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import importlib.util
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -17,15 +17,12 @@ from fastapi.responses import JSONResponse
 
 from .. import source_inbox as source_inbox_mod
 from .. import source_scout as source_scout_mod
+from ..ai.helpers import get_llm_complete_fn
 from ..analysis import run_analysis
 from ..analysis_director import DirectorConfig
 from ..analysis_highlights import CONTENT_TYPE_GUIDANCE
-from ..ai.helpers import get_llm_complete_fn
 from ..ingest import IngestRequest, QualityCap, SpeedMode
 from ..ingest.ytdlp_runner import DownloadCancelled, download_url
-from ..publisher.accounts import AccountStore
-from ..publisher.jobs import PublishJobStore
-from ..publisher.secrets import load_tokens
 from ..project import (
     Project,
     create_project_early,
@@ -36,19 +33,27 @@ from ..project import (
     set_project_status,
     set_source_url,
 )
+from ..publisher.accounts import AccountStore
+from ..publisher.jobs import PublishJobStore
+from ..publisher.secrets import load_tokens
 from .dag_config import (
     apply_llm_mode_to_dag_config,
     build_dag_config,
     dag_config_needs_llm,
     llm_mode_is_strict_external,
     llm_mode_uses_local,
+)
+from .dag_config import (
     normalize_llm_mode as _normalize_llm_mode_raw,
+)
+from .dag_config import (
     profile_default_llm_mode as _profile_default_llm_mode_raw,
+)
+from .dag_config import (
     resolve_llm_mode as _resolve_llm_mode_raw,
 )
 from .jobs import JOB_MANAGER, with_prevent_sleep
 from .publisher_api import is_safe_export_path, scan_project_exports
-
 
 _PROJECT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _YOUTUBE_ID_RE = re.compile(r"(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]+)")
@@ -1521,30 +1526,30 @@ def create_actions_router(
                             "content": {
                                 "application/json": {
                                     "schema": {"$ref": "#/components/schemas/AnalyzeFullRequest"},
-	                                    "examples": {
-	                                        "basic": {
-	                                            "summary": "Analyze with defaults",
-	                                            "value": {
-	                                                "project_id": "<project_id from ingest>",
-	                                                "client_request_id": "analyze-001",
-	                                            },
-	                                        },
-	                                        "external_llm": {
-	                                            "summary": "Analyze without local LLM (ChatGPT-in-the-loop)",
-	                                            "value": {
-	                                                "project_id": "<project_id from ingest>",
-	                                                "llm_mode": "external",
-	                                                "client_request_id": "analyze-003",
-	                                            },
-	                                        },
-	                                        "with_overrides": {
-	                                            "summary": "Analyze with profile overrides",
-	                                            "value": {
-	                                                "project_id": "<project_id from ingest>",
-	                                                "overrides": {"highlights": {"top_n": 10}},
-	                                                "client_request_id": "analyze-002",
-	                                            },
-	                                        },
+                                    "examples": {
+                                        "basic": {
+                                            "summary": "Analyze with defaults",
+                                            "value": {
+                                                "project_id": "<project_id from ingest>",
+                                                "client_request_id": "analyze-001",
+                                            },
+                                        },
+                                        "external_llm": {
+                                            "summary": "Analyze without local LLM (ChatGPT-in-the-loop)",
+                                            "value": {
+                                                "project_id": "<project_id from ingest>",
+                                                "llm_mode": "external",
+                                                "client_request_id": "analyze-003",
+                                            },
+                                        },
+                                        "with_overrides": {
+                                            "summary": "Analyze with profile overrides",
+                                            "value": {
+                                                "project_id": "<project_id from ingest>",
+                                                "overrides": {"highlights": {"top_n": 10}},
+                                                "client_request_id": "analyze-002",
+                                            },
+                                        },
                                     },
                                 }
                             },
@@ -1569,27 +1574,27 @@ def create_actions_router(
                             "content": {
                                 "application/json": {
                                     "schema": {"$ref": "#/components/schemas/RunIngestAnalyzeRequest"},
-	                                    "examples": {
-	                                        "twitch_vod": {
-	                                            "summary": "Ingest + analyze a Twitch VOD",
-	                                            "value": {
-	                                                "url": "https://twitch.tv/videos/1637616602",
-	                                                "analyze_overrides": {"highlights": {"top_n": 10}},
-	                                                "client_request_id": "run-001",
-	                                            },
-	                                        },
-	                                        "twitch_vod_external_llm": {
-	                                            "summary": "Ingest + analyze (no local LLM calls)",
-	                                            "value": {
-	                                                "url": "https://twitch.tv/videos/1637616602",
-	                                                "llm_mode": "external",
-	                                                "client_request_id": "run-001-external",
-	                                            },
-	                                        },
-	                                    },
-	                                }
-	                            },
-	                        },
+                                    "examples": {
+                                        "twitch_vod": {
+                                            "summary": "Ingest + analyze a Twitch VOD",
+                                            "value": {
+                                                "url": "https://twitch.tv/videos/1637616602",
+                                                "analyze_overrides": {"highlights": {"top_n": 10}},
+                                                "client_request_id": "run-001",
+                                            },
+                                        },
+                                        "twitch_vod_external_llm": {
+                                            "summary": "Ingest + analyze (no local LLM calls)",
+                                            "value": {
+                                                "url": "https://twitch.tv/videos/1637616602",
+                                                "llm_mode": "external",
+                                                "client_request_id": "run-001-external",
+                                            },
+                                        },
+                                    },
+                                }
+                            },
+                        },
                         "responses": {
                             "200": {
                                 "description": "Run created",
@@ -6087,6 +6092,7 @@ def create_actions_router(
 
         # Create selections for picks (persisted in project.json), but avoid duplicates.
         import uuid
+
         from ..project import update_project, utc_now_iso
 
         created_ids: list[str] = []

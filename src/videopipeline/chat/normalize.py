@@ -10,13 +10,11 @@ Supports:
 from __future__ import annotations
 
 import json
-import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .store import ChatMessage
-
 
 # Known timestamp field names to check
 _TS_KEYS = (
@@ -102,7 +100,7 @@ def _parse_hhmmss(val: str) -> Optional[float]:
 
 def _parse_timestamp(val: Any, key: str) -> Optional[float]:
     """Parse a timestamp value to seconds.
-    
+
     NOTE: The codebase receives a mix of:
       - relative seconds (e.g., 12.34)
       - relative milliseconds (e.g., 12340) usually with *_ms keys

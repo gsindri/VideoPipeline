@@ -5,7 +5,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Iterator
+from typing import BinaryIO, Iterator
 
 import numpy as np
 

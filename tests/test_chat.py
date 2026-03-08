@@ -11,21 +11,19 @@ Tests:
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from videopipeline.chat.store import ChatStore, ChatMessage, ChatMeta
-from videopipeline.chat.normalize import (
-    normalize_chat_messages,
-    detect_chat_format,
-    ChatFormat,
-    load_and_normalize,
-)
 from videopipeline.chat.features import compute_chat_features
-
+from videopipeline.chat.normalize import (
+    ChatFormat,
+    detect_chat_format,
+    load_and_normalize,
+    normalize_chat_messages,
+)
+from videopipeline.chat.store import ChatMessage, ChatMeta, ChatStore
 
 # ---------------------------------------------------------------------------
 # ChatStore Tests
@@ -484,9 +482,9 @@ class TestEdgeCases:
                 }
             }
         ]
-        
+
         messages = normalize_chat_messages(data)
-        
+
         assert len(messages) == 1
         assert messages[0].text == "Hello world!"
         assert messages[0].author == "viewer1"
@@ -495,7 +493,7 @@ class TestEdgeCases:
     def test_load_and_normalize_jsonl(self, tmp_path: Path):
         """Test loading JSONL (newline-delimited JSON) format."""
         from videopipeline.chat.normalize import load_chat_data
-        
+
         jsonl_file = tmp_path / "chat.json"
         lines = [
             '{"time_in_seconds": 1.0, "message": "First", "author": {"name": "a"}}',
@@ -503,12 +501,12 @@ class TestEdgeCases:
             '{"time_in_seconds": 3.0, "message": "Third", "author": {"name": "c"}}',
         ]
         jsonl_file.write_text("\n".join(lines))
-        
+
         data = load_chat_data(jsonl_file)
-        
+
         assert isinstance(data, list)
         assert len(data) == 3
-        
+
         messages = normalize_chat_messages(data)
         assert len(messages) == 3
         assert messages[0].text == "First"

@@ -13,7 +13,6 @@ import threading
 import traceback
 from typing import Callable, Iterable, Optional
 
-
 logger = logging.getLogger("videopipeline.import_tracer")
 
 _DEFAULT_PREFIXES = ("tensorflow", "tf_keras", "tensorflow_hub")

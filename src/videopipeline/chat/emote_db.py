@@ -29,28 +29,28 @@ def _get_default_db_path() -> Path:
 
 class GlobalEmoteDB:
     """SQLite database for storing learned emotes across projects.
-    
+
     Schema:
         channels: channel_id, channel_name, platform, first_seen, last_updated
         emotes: channel_id, token, source (llm/seed/manual), learned_at, frequency
-        
+
     Usage:
         db = GlobalEmoteDB()
-        
+
         # Load known emotes for a channel
         emotes = db.get_channel_emotes("shroud")
-        
+
         # Save newly learned emotes
         db.save_channel_emotes("shroud", {"KEKW", "OMEGALUL"}, source="llm")
-        
+
         # Merge (add new, keep existing)
         db.merge_channel_emotes("shroud", new_emotes, source="llm")
     """
-    
+
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or _get_default_db_path()
         self._init_db()
-    
+
     def _init_db(self) -> None:
         """Initialize the database schema."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -65,7 +65,7 @@ class GlobalEmoteDB:
                     last_updated TEXT,
                     video_count INTEGER DEFAULT 1
                 );
-                
+
                 CREATE TABLE IF NOT EXISTS emotes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     channel_id TEXT NOT NULL,
@@ -76,14 +76,14 @@ class GlobalEmoteDB:
                     UNIQUE(channel_id, token),
                     FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
                 );
-                
+
                 CREATE INDEX IF NOT EXISTS idx_emotes_channel ON emotes(channel_id);
                 CREATE INDEX IF NOT EXISTS idx_emotes_token ON emotes(token);
             """)
             conn.commit()
         finally:
             conn.close()
-    
+
     def get_channel_emotes(self, channel_id: str) -> Set[str]:
         """Get all known emotes for a channel."""
         channel_id = channel_id.lower().strip()
@@ -96,7 +96,7 @@ class GlobalEmoteDB:
             return {row[0] for row in cur.fetchall()}
         finally:
             conn.close()
-    
+
     def get_channel_llm_emotes(self, channel_id: str) -> Set[str]:
         """Get only LLM-learned emotes for a channel (excludes seeds)."""
         channel_id = channel_id.lower().strip()
@@ -109,7 +109,7 @@ class GlobalEmoteDB:
             return {row[0] for row in cur.fetchall()}
         finally:
             conn.close()
-    
+
     def get_channel_info(self, channel_id: str) -> Optional[Dict]:
         """Get channel metadata."""
         channel_id = channel_id.lower().strip()
@@ -133,7 +133,7 @@ class GlobalEmoteDB:
             return None
         finally:
             conn.close()
-    
+
     def save_channel_emotes(
         self,
         channel_id: str,
@@ -144,12 +144,12 @@ class GlobalEmoteDB:
         platform: str = "twitch",
     ) -> int:
         """Save emotes for a channel (replaces existing).
-        
+
         Returns number of emotes saved.
         """
         channel_id = channel_id.lower().strip()
         now = _utc_iso()
-        
+
         conn = sqlite3.connect(str(self.db_path))
         try:
             # Upsert channel
@@ -161,13 +161,13 @@ class GlobalEmoteDB:
                     last_updated = excluded.last_updated,
                     video_count = video_count + 1
             """, (channel_id, channel_name or channel_id, platform, now, now))
-            
+
             # Clear existing emotes for this source
             conn.execute(
                 "DELETE FROM emotes WHERE channel_id = ? AND source = ?",
                 (channel_id, source)
             )
-            
+
             # Insert new emotes
             for token in emotes:
                 token = token.lower().strip()
@@ -176,12 +176,12 @@ class GlobalEmoteDB:
                         INSERT OR REPLACE INTO emotes (channel_id, token, source, learned_at, frequency)
                         VALUES (?, ?, ?, ?, 1)
                     """, (channel_id, token, source, now))
-            
+
             conn.commit()
             return len(emotes)
         finally:
             conn.close()
-    
+
     def merge_channel_emotes(
         self,
         channel_id: str,
@@ -192,12 +192,12 @@ class GlobalEmoteDB:
         platform: str = "twitch",
     ) -> Tuple[int, int]:
         """Merge new emotes with existing ones for a channel.
-        
+
         Returns (total_count, new_count) - total emotes and newly added count.
         """
         channel_id = channel_id.lower().strip()
         now = _utc_iso()
-        
+
         conn = sqlite3.connect(str(self.db_path))
         try:
             # Upsert channel
@@ -209,14 +209,14 @@ class GlobalEmoteDB:
                     last_updated = excluded.last_updated,
                     video_count = video_count + 1
             """, (channel_id, channel_name or channel_id, platform, now, now))
-            
+
             # Get existing emotes
             cur = conn.execute(
                 "SELECT token FROM emotes WHERE channel_id = ?",
                 (channel_id,)
             )
             existing = {row[0] for row in cur.fetchall()}
-            
+
             # Insert only new emotes
             new_count = 0
             for token in new_emotes:
@@ -230,29 +230,29 @@ class GlobalEmoteDB:
                 elif token in existing:
                     # Increment frequency for existing tokens
                     conn.execute("""
-                        UPDATE emotes SET frequency = frequency + 1 
+                        UPDATE emotes SET frequency = frequency + 1
                         WHERE channel_id = ? AND token = ?
                     """, (channel_id, token))
-            
+
             conn.commit()
-            
+
             # Get final count
             cur = conn.execute(
                 "SELECT COUNT(*) FROM emotes WHERE channel_id = ?",
                 (channel_id,)
             )
             total = cur.fetchone()[0]
-            
+
             return (total, new_count)
         finally:
             conn.close()
-    
+
     def list_channels(self) -> List[Dict]:
         """List all channels with emote counts."""
         conn = sqlite3.connect(str(self.db_path))
         try:
             cur = conn.execute("""
-                SELECT c.channel_id, c.channel_name, c.platform, c.video_count, 
+                SELECT c.channel_id, c.channel_name, c.platform, c.video_count,
                        c.last_updated, COUNT(e.id) as emote_count
                 FROM channels c
                 LEFT JOIN emotes e ON c.channel_id = e.channel_id
@@ -272,7 +272,7 @@ class GlobalEmoteDB:
             ]
         finally:
             conn.close()
-    
+
     def delete_channel(self, channel_id: str) -> bool:
         """Delete a channel and all its emotes."""
         channel_id = channel_id.lower().strip()
@@ -284,7 +284,7 @@ class GlobalEmoteDB:
             return cur.rowcount > 0
         finally:
             conn.close()
-    
+
     def get_stats(self) -> Dict:
         """Get database statistics."""
         conn = sqlite3.connect(str(self.db_path))
@@ -306,13 +306,13 @@ class GlobalEmoteDB:
 
 def extract_channel_from_url(url: str) -> Optional[Tuple[str, str]]:
     """Extract channel ID and platform from a URL.
-    
+
     Returns (channel_id, platform) or None if not recognized.
     """
     import re
-    
+
     url = url.strip()
-    
+
     # Twitch patterns
     # https://www.twitch.tv/videos/1234567890
     # https://www.twitch.tv/shroud
@@ -321,13 +321,13 @@ def extract_channel_from_url(url: str) -> Optional[Tuple[str, str]]:
     if twitch_video:
         # Video URL - we'll need to get channel from metadata later
         return None
-    
+
     twitch_channel = re.search(r"twitch\.tv/([a-zA-Z0-9_]+)", url)
     if twitch_channel:
         channel = twitch_channel.group(1).lower()
         if channel not in ("videos", "clip", "clips", "directory"):
             return (channel, "twitch")
-    
+
     # YouTube patterns
     # https://www.youtube.com/watch?v=...
     # https://www.youtube.com/@channelname
@@ -335,33 +335,33 @@ def extract_channel_from_url(url: str) -> Optional[Tuple[str, str]]:
     yt_handle = re.search(r"youtube\.com/@([a-zA-Z0-9_-]+)", url)
     if yt_handle:
         return (yt_handle.group(1).lower(), "youtube")
-    
+
     yt_channel = re.search(r"youtube\.com/channel/([a-zA-Z0-9_-]+)", url)
     if yt_channel:
         return (yt_channel.group(1), "youtube")
-    
+
     return None
 
 
 def extract_channel_from_chat_store(chat_db_path: Path) -> Optional[Tuple[str, str]]:
     """Extract channel ID from chat database metadata.
-    
+
     The Twitch chat downloader often stores streamer info in the chat data.
-    
+
     Returns (channel_id, platform) or None if not found.
     """
     import logging
     log = logging.getLogger("videopipeline.chat.emote_db")
-    
+
     from .store import ChatStore
-    
+
     if not chat_db_path.exists():
         log.debug("[EMOTE] Chat DB path does not exist: %s", chat_db_path)
         return None
-    
+
     try:
         store = ChatStore(chat_db_path)
-        
+
         # Try various metadata keys that might contain channel info
         # ChatMeta uses "channel" as the standard key
         channel = store.get_meta("channel", "")
@@ -379,7 +379,7 @@ def extract_channel_from_chat_store(chat_db_path: Path) -> Optional[Tuple[str, s
             if not channel_name:
                 channel_name = channel
                 store.set_meta("channel_name", channel_name)
-        
+
         log.debug(
             "[EMOTE] Chat store metadata: channel=%r channel_id=%r channel_name=%r streamer=%r broadcaster=%r",
             channel,
@@ -388,16 +388,16 @@ def extract_channel_from_chat_store(chat_db_path: Path) -> Optional[Tuple[str, s
             streamer,
             broadcaster,
         )
-        
+
         store.close()
-        
+
         # Return first non-empty value
         for candidate in [channel, channel_id, channel_name, streamer, broadcaster]:
             if candidate:
                 result = (candidate.lower().strip(), "twitch")
                 log.debug("[EMOTE] Extracted channel from chat store: %s", result)
                 return result
-        
+
         log.debug("[EMOTE] No channel found in chat store metadata")
         return None
     except Exception as e:
@@ -407,24 +407,23 @@ def extract_channel_from_chat_store(chat_db_path: Path) -> Optional[Tuple[str, s
 
 def get_channel_for_project(proj: Project, source_url: Optional[str] = None) -> Optional[Tuple[str, str]]:
     """Get channel ID for a project, trying multiple sources.
-    
+
     Order of precedence:
     1. Source URL (if it has channel info)
     2. Chat database metadata
     3. Project metadata
-    
+
     Args:
         proj: Project instance
         source_url: Optional source URL (if known)
-    
+
     Returns (channel_id, platform) or None
     """
     import logging
-    import json
     log = logging.getLogger("videopipeline.chat.emote_db")
-    
+
     log.debug("[EMOTE] get_channel_for_project called with source_url=%s", source_url)
-    
+
     # Try URL first
     if source_url:
         result = extract_channel_from_url(source_url)
@@ -432,7 +431,7 @@ def get_channel_for_project(proj: Project, source_url: Optional[str] = None) -> 
         if result:
             log.info("[EMOTE] Channel resolved from URL: %s (%s)", result[0], result[1])
             return result
-    
+
     # Try chat database
     log.debug("[EMOTE] Checking chat_db_path: %s (exists=%s)", proj.chat_db_path, proj.chat_db_path.exists())
     if hasattr(proj, 'chat_db_path') and proj.chat_db_path.exists():
@@ -441,7 +440,7 @@ def get_channel_for_project(proj: Project, source_url: Optional[str] = None) -> 
         if result:
             log.info("[EMOTE] Channel resolved from chat store: %s (%s)", result[0], result[1])
             return result
-    
+
     # Try video's info.json (yt-dlp metadata)
     # This works for Twitch VODs where we can't extract channel from URL
     video_path = proj.video_path
@@ -470,7 +469,7 @@ def get_channel_for_project(proj: Project, source_url: Optional[str] = None) -> 
                         return (channel, platform)
             except Exception as e:
                 log.debug("[EMOTE] Failed to read info.json: %s", e)
-    
+
     log.warning("[EMOTE] Could not determine channel for project")
     return None
 

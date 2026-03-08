@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from typing import Dict, Set
 
-
 # Pre-download bundle: Quick analysis using audio and chat
 # Run this while video is still downloading
 BUNDLE_PRE_DOWNLOAD: Set[str] = {
@@ -75,13 +74,13 @@ _BUNDLES: Dict[str, Set[str]] = {
 
 def get_bundle(name: str) -> Set[str]:
     """Get a bundle by name.
-    
+
     Args:
         name: Bundle name ("pre_download", "full", "export", "transcript")
-        
+
     Returns:
         Set of artifact names
-        
+
     Raises:
         ValueError: If bundle not found
     """
@@ -92,7 +91,7 @@ def get_bundle(name: str) -> Set[str]:
 
 def list_bundles() -> Dict[str, Set[str]]:
     """List all available bundles.
-    
+
     Returns:
         Dict mapping bundle name to artifact set
     """

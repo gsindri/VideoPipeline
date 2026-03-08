@@ -9,13 +9,13 @@ import json
 import os
 import re
 import sqlite3
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-import urllib.request
-import urllib.error
-import urllib.parse
+from typing import Any, Dict, Optional
 
 # Import heartbeat for idle timer reset
 try:
@@ -178,7 +178,7 @@ class LLMResponseCache:
 
 def _extract_json_from_response(text: str) -> Any:
     """Extract JSON from LLM response text.
-    
+
     Handles common cases like markdown code blocks, extra text, etc.
     Supports both JSON objects and arrays.
     """
@@ -279,17 +279,17 @@ class LLMClient:
         json_mode: bool = True,
     ) -> Any:
         """Send a completion request to the LLM server.
-        
+
         Args:
             prompt: User prompt
             system_prompt: Optional system prompt
             temperature: Temperature override
             max_tokens: Max tokens override
             json_mode: If True, parse and return JSON; if False, return raw text
-            
+
         Returns:
             Parsed JSON response dict (json_mode=True) or raw string (json_mode=False)
-            
+
         Raises:
             LLMServerUnavailableError: If server is not reachable
             LLMResponseError: If response is invalid
@@ -392,7 +392,7 @@ class LLMClient:
         **kwargs,
     ) -> tuple[Dict[str, Any], bool]:
         """Complete with fallback on error.
-        
+
         Returns:
             Tuple of (response_dict, used_fallback)
         """
@@ -410,12 +410,12 @@ def create_llm_client(
     **kwargs,
 ) -> LLMClient:
     """Create an LLM client with sensible defaults.
-    
+
     Args:
         endpoint: LLM server endpoint
         cache_dir: Directory for cache database
         **kwargs: Additional config options
-        
+
     Returns:
         Configured LLMClient instance
     """

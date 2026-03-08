@@ -4,8 +4,8 @@ import pytest
 
 from videopipeline.analysis_boundaries import (
     BoundaryConfig,
-    BoundaryPoint,
     BoundaryGraph,
+    BoundaryPoint,
 )
 
 
@@ -41,7 +41,7 @@ class TestBoundaryPoint:
             sources={"silence", "sentence_end"},
             score=0.85,
         )
-        
+
         assert point.time_s == pytest.approx(10.5)
         assert point.score == pytest.approx(0.85)
         assert "silence" in point.sources
@@ -55,7 +55,7 @@ class TestBoundaryPoint:
             score=0.85,
         )
         d = point.to_dict()
-        
+
         assert d["time_s"] == 10.5
         assert d["score"] == 0.85
         assert "silence" in d["sources"]
@@ -74,7 +74,7 @@ class TestBoundaryGraph:
             BoundaryPoint(time_s=15.0, score=0.7, sources={"silence"}),
         ]
         graph = BoundaryGraph(start_boundaries=start_points, end_boundaries=end_points, duration_s=30.0)
-        
+
         assert len(graph.start_boundaries) == 2
         assert len(graph.end_boundaries) == 1
 
@@ -85,7 +85,7 @@ class TestBoundaryGraph:
         ]
         graph = BoundaryGraph(start_boundaries=start_points, end_boundaries=[], duration_s=30.0)
         d = graph.to_dict()
-        
+
         assert len(d["start_boundaries"]) == 1
         assert d["start_boundaries"][0]["time_s"] == 10.0
         assert d["duration_s"] == 30.0

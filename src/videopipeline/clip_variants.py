@@ -9,22 +9,19 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .analysis_boundaries import (
-    BoundaryConfig,
     BoundaryGraph,
-    compute_boundary_graph,
     find_best_end_boundary,
     find_best_start_boundary,
     load_boundary_graph,
 )
-from .analysis_chat_boundaries import find_burst_in_range, find_nearest_valley, load_chat_boundaries
+from .analysis_chat_boundaries import find_nearest_valley, load_chat_boundaries
 from .analysis_sentences import Sentence, get_sentences_in_range, load_sentences
-from .project import Project, get_project_data, save_json, update_project, load_npz
+from .project import Project, get_project_data, load_npz, save_json, update_project
 
 
 @dataclass(frozen=True)
@@ -217,40 +214,40 @@ def _clamp_to_chapter(
     margin_s: float = 2.0,
 ) -> Tuple[float, float]:
     """Clamp a clip to stay within its chapter boundaries.
-    
+
     Uses the chapter containing the peak time as the reference.
     Allows a small margin to prevent awkward cuts right at boundaries.
-    
+
     Args:
         start_s: Proposed clip start
         end_s: Proposed clip end
         peak_time_s: The highlight peak time (determines which chapter)
         chapters: List of (start, end) tuples for all chapters
         margin_s: Small margin to allow clips to extend past boundaries
-        
+
     Returns:
         Tuple of (clamped_start, clamped_end)
     """
     if not chapters:
         return start_s, end_s
-    
+
     # Find chapter containing the peak
     chapter = _find_chapter_at_time(chapters, peak_time_s)
     if not chapter:
         return start_s, end_s
-    
+
     ch_start, ch_end = chapter
-    
+
     # Clamp with margin
     clamped_start = max(start_s, ch_start - margin_s)
     clamped_end = min(end_s, ch_end + margin_s)
-    
+
     # Ensure valid range (start < end)
     if clamped_start >= clamped_end:
         # Chapter is very short, just use chapter bounds
         clamped_start = ch_start
         clamped_end = ch_end
-    
+
     return clamped_start, clamped_end
 
 
@@ -758,7 +755,7 @@ def generate_variants_for_candidate(
     duration_s: float = 0.0,
 ) -> CandidateVariants:
     """Generate all variants for a single candidate.
-    
+
     Args:
         candidate: Candidate dict with peak_time_s, start_s, end_s, etc.
         cfg: Variant generation configuration
@@ -769,7 +766,7 @@ def generate_variants_for_candidate(
         chapters: Optional list of (start_s, end_s) chapter boundaries
         highlights_features: Optional dict of highlight signal arrays (for reaction_arc + scores_summary)
         duration_s: Total video duration
-        
+
     Returns:
         CandidateVariants with 3-8 generated variants
     """
@@ -838,7 +835,7 @@ def generate_variants_for_candidate(
                 chapters, margin_s=cfg.chapter_margin_s,
             )
             var.duration_s = var.end_s - var.start_s
-        
+
         # Add setup/payoff text
         if not var.setup_text:
             var.setup_text = _compute_setup_text(sentences, var.start_s, var.end_s)
@@ -879,7 +876,7 @@ def compute_clip_variants(
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Compute clip variants for top N candidates.
-    
+
     Persists:
       - analysis/variants.json (canonical)
       - analysis/clip_variants.json (legacy alias for backward compatibility)
@@ -1024,7 +1021,7 @@ def compute_clip_variants(
 
 def load_clip_variants(proj: Project) -> Optional[List[CandidateVariants]]:
     """Load cached clip variants if available.
-    
+
     Prefers analysis/variants.json, falls back to legacy analysis/clip_variants.json.
     """
     for fname in ("variants.json", "clip_variants.json"):

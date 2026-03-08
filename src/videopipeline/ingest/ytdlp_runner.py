@@ -15,12 +15,12 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .models import (
+    SPEED_MODE_N,
     IngestRequest,
     IngestResult,
     QualityCap,
     SiteType,
     SpeedMode,
-    SPEED_MODE_N,
 )
 from .policy import classify_url_heuristic, get_format_selector, get_policy, probe_url
 from .postprocess import postprocess_download
@@ -31,7 +31,6 @@ from .tuner import (
     looks_like_throttle,
     update_domain_tuning,
 )
-
 
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]  # Returns True if cancelled
@@ -69,10 +68,10 @@ def _sanitize_filename(name: str, max_length: int = 100) -> str:
     name = re.sub(r'[<>:"/\\|?*]', '_', name)
     name = re.sub(r'[\x00-\x1f]', '', name)
     name = name.strip('. ')
-    
+
     if len(name) > max_length:
         name = name[:max_length].strip()
-    
+
     return name or "video"
 
 
@@ -84,23 +83,23 @@ def download_url(
     check_cancel: Optional[CancelCallback] = None,
 ) -> IngestResult:
     """Download a video from a URL using yt-dlp.
-    
+
     This is the main entry point with all the smart features:
     - Site detection and policy selection
     - Adaptive concurrency for HLS (Twitch)
     - Automatic retry with backoff on throttling
     - Post-processing (remux, preview)
-    
+
     Args:
         url: The URL to download
         request: Download options (uses defaults if None)
         output_dir: Override output directory
         on_progress: Callback for progress updates (fraction, message)
         check_cancel: Callback that returns True if download should be cancelled
-    
+
     Returns:
         IngestResult with paths and metadata
-    
+
     Raises:
         ImportError: If yt-dlp is not installed
         RuntimeError: If download fails after all retries
@@ -110,19 +109,19 @@ def download_url(
         from yt_dlp import YoutubeDL
     except ImportError:
         raise ImportError("yt-dlp is required for URL downloads. Install with: pip install yt-dlp")
-    
+
     request = request or IngestRequest(url=url)
     output_dir = output_dir or _default_downloads_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Step 1: Classify the URL
     if on_progress:
         on_progress(0.0, "Detecting site...")
-    
+
     site_type = classify_url_heuristic(url)
     policy = get_policy(site_type)
     domain = extract_domain(url)
-    
+
     # Step 2: Determine concurrency
     if policy.supports_fragment_concurrency:
         if request.speed_mode == SpeedMode.AUTO:
@@ -135,15 +134,15 @@ def download_url(
     else:
         current_n = 1
         min_n = 1
-    
+
     max_attempts = 3
     last_error: Optional[Exception] = None
     info: Optional[dict[str, Any]] = None
-    
+
     # Progress tracking
     download_progress = {"phase": "init", "last_percent": 0.0, "cancelled": False}
     partial_files: list[Path] = []  # Track partial downloads for cleanup
-    
+
     def progress_hook(d: dict[str, Any]) -> None:
         # Check for cancellation first
         if check_cancel and check_cancel():
@@ -155,24 +154,24 @@ def download_url(
             # Raise yt-dlp's expected exception to abort download
             from yt_dlp.utils import DownloadCancelled as YtDlpCancelled
             raise YtDlpCancelled("Download cancelled by user")
-        
+
         status = d.get("status")
-        
+
         if status == "downloading":
             download_progress["phase"] = "downloading"
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             downloaded = d.get("downloaded_bytes", 0)
-            
+
             if total and total > 0:
                 percent = downloaded / total
                 # Map to 0-0.7 range (leave room for post-processing)
                 mapped = percent * 0.7
                 download_progress["last_percent"] = mapped
-                
+
                 if on_progress:
                     speed = d.get("speed")
                     eta = d.get("eta")
-                    
+
                     parts = [f"Downloading... {percent:.0%}"]
                     if speed:
                         parts.append(f"{speed/1024/1024:.1f} MB/s")
@@ -205,14 +204,14 @@ def download_url(
                             pass
                     if current_n > 1:
                         parts.append(f"[N={current_n}]")
-                    
+
                     on_progress(mapped, " | ".join(parts))
-                    
+
         elif status == "finished":
             download_progress["phase"] = "postprocessing"
             if on_progress:
                 on_progress(0.72, "Download complete. Processing...")
-    
+
     # Step 3: Download with retry loop
     for attempt in range(max_attempts):
         # Build yt-dlp options
@@ -235,18 +234,18 @@ def download_url(
             # We rely on progress_hooks + on_progress for UI and structured logging.
             "noprogress": True,
         }
-        
+
         # Apply site policy
         if policy.use_hls_native:
             ydl_opts["hls_prefer_native"] = True
-        
+
         if policy.supports_fragment_concurrency and current_n > 1:
             ydl_opts["concurrent_fragment_downloads"] = current_n
-        
+
         # Format selection based on quality cap
         ydl_opts["format"] = get_format_selector(request.quality_cap.value)
         ydl_opts["merge_output_format"] = "mp4"
-        
+
         # Status message
         if on_progress:
             if attempt == 0:
@@ -256,20 +255,20 @@ def download_url(
                 on_progress(0.02, badge)
             else:
                 on_progress(0.02, f"Retrying with N={current_n}...")
-        
+
         try:
             with YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-            
+
             # Success! Update tuner
             if policy.supports_fragment_concurrency and request.speed_mode == SpeedMode.AUTO:
                 update_domain_tuning(domain, current_n, "ok")
-            
+
             break
-            
+
         except Exception as e:
             last_error = e
-            
+
             # Check for cancellation (yt-dlp wraps our exception)
             if download_progress.get("cancelled") or "cancelled" in str(e).lower():
                 # Clean up partial files
@@ -291,44 +290,44 @@ def download_url(
                     except Exception:
                         pass
                 raise DownloadCancelled("Download cancelled by user")
-            
+
             # Check for throttling
             if looks_like_throttle(e) and current_n > min_n:
                 old_n = current_n
                 current_n = calculate_backoff_n(current_n, min_n)
-                
+
                 if request.speed_mode == SpeedMode.AUTO:
                     update_domain_tuning(domain, current_n, "throttled")
-                
+
                 if on_progress:
                     on_progress(0.02, f"Throttled at N={old_n}, backing off to N={current_n}...")
                 continue
-            
+
             # Not throttling or can't back off further
             raise RuntimeError(f"Download failed: {e}")
-    
+
     if not info:
         raise RuntimeError(f"Download failed after {max_attempts} attempts: {last_error}")
-    
+
     # Step 4: Find downloaded files
     if on_progress:
         on_progress(0.75, "Finding downloaded files...")
-    
+
     video_id = info.get("id", "unknown")
     title = info.get("title", "video")
-    
+
     video_exts = {".mp4", ".mkv", ".webm", ".m4v", ".avi", ".mov", ".ts"}
     candidates = []
     for ext in video_exts:
         candidates.extend(output_dir.glob(f"*{ext}"))
-    
+
     if not candidates:
         raise RuntimeError("No video file found after download")
-    
+
     # Sort by modification time, newest first
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     video_path = candidates[0]
-    
+
     # Find info.json
     info_json_path = None
     possible_paths = [
@@ -347,37 +346,37 @@ def download_url(
         if p.exists():
             thumbnail_path = p
             break
-    
+
     # Step 5: Post-process
     if on_progress:
         on_progress(0.78, "Post-processing...")
-    
+
     postprocess_result = None
     preview_path = None
-    
+
     if request.create_preview:
         def pp_progress(frac: float, msg: str) -> None:
             # Map postprocess progress to 0.78-0.98
             if on_progress:
                 mapped = 0.78 + frac * 0.2
                 on_progress(mapped, msg)
-        
+
         postprocess_result = postprocess_download(
             video_path,
             create_preview_if_needed=True,
             on_progress=pp_progress,
         )
-        
+
         if postprocess_result.preview_path:
             preview_path = postprocess_result.preview_path
-        
+
         # Update video_path if it was remuxed
         if postprocess_result.remuxed:
             video_path = postprocess_result.source_path
-    
+
     if on_progress:
         on_progress(1.0, "Download complete!")
-    
+
     return IngestResult(
         video_path=video_path,
         info_json_path=info_json_path,
@@ -413,15 +412,15 @@ def download_audio_only(
     on_progress: Optional[ProgressCallback] = None,
 ) -> Optional[Path]:
     """Download only the audio track from a URL using yt-dlp.
-    
+
     This is much faster than downloading full video and is useful for
     starting transcription while video download is still in progress.
-    
+
     Args:
         url: The URL to download audio from
         output_dir: Override output directory
         on_progress: Callback for progress updates (fraction, message)
-    
+
     Returns:
         Path to downloaded audio file, or None if failed
     """
@@ -429,13 +428,13 @@ def download_audio_only(
         from yt_dlp import YoutubeDL
     except ImportError:
         return None
-    
+
     output_dir = output_dir or _default_downloads_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     if on_progress:
         on_progress(0.0, "Downloading audio track...", {})
-    
+
     def progress_hook(d: dict[str, Any]) -> None:
         status = d.get("status")
         if status == "downloading" and on_progress:
@@ -462,11 +461,11 @@ def download_audio_only(
                 on_progress(percent * 0.95, f"Downloading audio... {percent:.0%}", extra)
         elif status == "finished" and on_progress:
             on_progress(0.98, "Audio download complete", {})
-    
+
     # Get site policy for concurrency settings
     site_type = classify_url_heuristic(url)
     policy = get_policy(site_type)
-    
+
     ydl_opts: dict[str, Any] = {
         "outtmpl": str(output_dir / "%(title).80s_audio_[%(id)s].%(ext)s"),
         "restrictfilenames": True,
@@ -487,37 +486,37 @@ def download_audio_only(
         # NO postprocessors - skip FFmpeg conversion entirely for speed
         # Whisper can handle opus/m4a/webm audio directly
     }
-    
+
     # Enable concurrent downloads - use higher concurrency for audio since it's smaller
     if policy.supports_fragment_concurrency:
         # Use more aggressive concurrency for audio - it's smaller so less likely to throttle
         ydl_opts["concurrent_fragment_downloads"] = 16
-    
+
     try:
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-        
+
         if not info:
             return None
-        
+
         # Find the audio file - check all common audio/container formats
         # Note: yt-dlp may download audio in video containers like .mp4 or .webm
         video_id = info.get("id", "unknown")
         audio_exts = [".m4a", ".mp4", ".mp3", ".opus", ".ogg", ".webm", ".wav", ".aac", ".mkv"]
         audio_candidates = []
-        
+
         for ext in audio_exts:
             audio_candidates.extend(output_dir.glob(f"*_audio_*{video_id}*{ext}"))
-        
+
         if audio_candidates:
             # Return most recently modified
             audio_candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             if on_progress:
                 on_progress(1.0, "Audio ready for transcription")
             return audio_candidates[0]
-        
+
         return None
-        
+
     except Exception as e:
         if on_progress:
             on_progress(0.0, f"Audio download failed: {e}")

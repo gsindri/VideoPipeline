@@ -7,20 +7,20 @@ import numpy as np
 
 def moving_average(x: np.ndarray, window: int, *, use_cumsum: bool = False) -> np.ndarray:
     """Moving average with optional cumsum optimization.
-    
+
     Args:
         x: Input array.
         window: Window size for averaging.
         use_cumsum: If True, use cumsum-based O(n) algorithm (faster for large windows).
                     If False, use np.convolve (better for small windows).
-    
+
     Returns:
         Smoothed array with same length as input.
     """
     if window <= 1:
         return x
     window = int(window)
-    
+
     if use_cumsum:
         # Centered moving average using an O(n) cumsum approach.
         #
@@ -74,13 +74,13 @@ def pick_top_peaks(
     min_score: float = 0.0,
 ) -> List[int]:
     """Greedy peak selection by score with minimum spacing.
-    
+
     Args:
         scores: Array of scores to find peaks in.
         top_k: Maximum number of peaks to return.
         min_gap_frames: Minimum spacing between peaks in frames.
         min_score: Minimum score threshold. Peaks below this are ignored.
-    
+
     Returns:
         List of peak indices, sorted by score descending.
     """

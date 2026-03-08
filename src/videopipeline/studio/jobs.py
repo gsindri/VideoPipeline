@@ -15,13 +15,20 @@ from ..layouts import get_facecam_rect
 from ..metadata import build_metadata, derive_hook_text, write_metadata
 from ..project import Project, get_project_data, record_export
 from ..subtitles import SubtitleSegment, write_ass
-from ..transcribe import TranscribeConfig, WhisperNotInstalledError, load_transcript_json, save_transcript_json, transcribe_segment
-from ..utils import utc_iso as _utc_iso, PreventSleep
+from ..transcribe import (
+    TranscribeConfig,
+    WhisperNotInstalledError,
+    load_transcript_json,
+    save_transcript_json,
+    transcribe_segment,
+)
+from ..utils import PreventSleep
+from ..utils import utc_iso as _utc_iso
 
 
 def with_prevent_sleep(reason: str = "VideoPipeline job") -> Callable:
     """Decorator to wrap a function with sleep prevention.
-    
+
     Use this on job runner functions to prevent Windows from sleeping
     during long operations like analysis or export.
     """
@@ -43,20 +50,20 @@ class Job:
     progress: float = 0.0
     message: str = ""
     result: Dict[str, Any] = field(default_factory=dict)
-    
+
     # Timing fields
     started_at: Optional[float] = field(default=None)  # time.time() when job started running
-    
+
     # Cancellation flag - threads should check this periodically
     _cancel_requested: bool = field(default=False, repr=False)
 
     # SSE event stream
     events: "queue.Queue[str]" = field(default_factory=lambda: queue.Queue(maxsize=1000))
-    
+
     @property
     def cancel_requested(self) -> bool:
         return self._cancel_requested
-    
+
     @property
     def elapsed_seconds(self) -> Optional[float]:
         """Return elapsed seconds since job started, or None if not started."""

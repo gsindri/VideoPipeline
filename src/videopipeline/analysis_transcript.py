@@ -32,7 +32,7 @@ BackendType = Literal["whispercpp", "faster_whisper", "openai_whisper", "nemo_as
 @dataclass(frozen=True)
 class TranscriptConfig:
     """Configuration for full-video transcription.
-    
+
     Attributes:
         backend: Transcription backend ("openai_whisper", "faster_whisper", "whispercpp", "nemo_asr", "assemblyai", "auto")
         model_size: Model size (tiny, base, small, medium, large)
@@ -212,12 +212,12 @@ def _use_new_transcription_engine(
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> tuple[List[TranscriptSegment], Optional[str], str, bool, Optional[List[str]], bool]:
     """Use the new pluggable transcription engine.
-    
+
     Returns:
         Tuple of (segments, detected_language, backend_used, gpu_used, speakers, diarization_used)
     """
     from .transcription import TranscriberConfig, get_transcriber
-    
+
     # Convert our config to the new format
     transcriber_cfg = TranscriberConfig(
         backend=cfg.backend,
@@ -241,12 +241,12 @@ def _use_new_transcription_engine(
         assemblyai_poll_interval_s=cfg.assemblyai_poll_interval_s,
         assemblyai_timeout_s=cfg.assemblyai_timeout_s,
     )
-    
+
     # Get transcriber with fallback
     transcriber = get_transcriber(transcriber_cfg)
-    
+
     logger.info(f"Using transcription backend: {transcriber.backend_name}")
-    
+
     # Determine progress allocation based on whether diarization is enabled
     diarization_enabled = cfg.diarize
     if diarization_enabled:
@@ -259,40 +259,39 @@ def _use_new_transcription_engine(
         # Transcription: 20%-90%
         transcribe_progress_start = 0.2
         transcribe_progress_end = 0.9
-    
+
     # Wrap progress callback for transcription
     def progress_wrapper(p: float) -> None:
         if on_progress:
             mapped = transcribe_progress_start + (transcribe_progress_end - transcribe_progress_start) * p
             on_progress(mapped)
-    
+
     # Transcribe
     result = transcriber.transcribe(wav_path, on_progress=progress_wrapper)
-    
+
     # Unload transcription model to free GPU memory before diarization
     transcriber.unload_model()
-    
+
     # Backends may already include speaker labels (e.g., AssemblyAI cloud diarization).
     speakers: Optional[List[str]] = result.speakers
     diarization_used = bool(result.diarization_used)
-    
+
     if diarization_enabled and not diarization_used:
         try:
             from .transcription.diarization import (
-                is_diarization_available,
                 diarize_audio,
+                is_diarization_available,
                 merge_diarization_with_transcript,
             )
-            from .transcription import TranscriptResult as TResult
-            
+
             if is_diarization_available():
                 logger.info("Running speaker diarization...")
-                
+
                 def diarize_progress(p: float) -> None:
                     if on_progress:
                         mapped = diarize_progress_start + (diarize_progress_end - diarize_progress_start) * p
                         on_progress(mapped)
-                
+
                 # Run diarization
                 diarization = diarize_audio(
                     wav_path,
@@ -303,7 +302,7 @@ def _use_new_transcription_engine(
                     exclusive=True,
                     on_progress=diarize_progress,
                 )
-                
+
                 # Merge with transcript
                 result = merge_diarization_with_transcript(result, diarization)
                 speakers = diarization.speakers
@@ -315,7 +314,7 @@ def _use_new_transcription_engine(
             logger.warning(f"Diarization not available: {e}")
         except Exception as e:
             logger.warning(f"Diarization failed: {e}. Continuing without speaker labels.")
-    
+
     # Convert to our segment format
     segments: List[TranscriptSegment] = []
     for seg in result.segments:
@@ -331,7 +330,7 @@ def _use_new_transcription_engine(
                 )
                 for w in seg.words
             ]
-        
+
         segments.append(TranscriptSegment(
             start=seg.start,
             end=seg.end,
@@ -339,13 +338,13 @@ def _use_new_transcription_engine(
             words=words,
             speaker=getattr(seg, 'speaker', None),
         ))
-    
+
     return segments, result.language, result.backend_used, result.gpu_used, speakers, diarization_used
 
 
 def _config_matches(saved_config: Dict[str, Any], cfg: TranscriptConfig) -> bool:
     """Check if a saved transcript config matches the current config.
-    
+
     Returns True if the cached transcript can be reused.
     """
     # Core parameters that affect transcription output
@@ -355,22 +354,22 @@ def _config_matches(saved_config: Dict[str, Any], cfg: TranscriptConfig) -> bool
         "language",
         "word_timestamps",
     ]
-    
+
     for key in critical_keys:
         saved_value = saved_config.get(key)
         current_value = getattr(cfg, key, None)
-        
+
         # Handle "auto" backend: accept any backend
         if key == "backend" and (saved_value == "auto" or current_value == "auto"):
             continue
-        
+
         # Handle None language (auto-detect): always accept
         if key == "language" and (saved_value is None or current_value is None):
             continue
-        
+
         if saved_value != current_value:
             return False
-    
+
     return True
 
 
@@ -403,7 +402,7 @@ def compute_transcript_analysis(
     Persists:
       - analysis/transcript_full.json (segments with timestamps)
       - project.json -> analysis.transcript section
-    
+
     Returns cached transcript if:
       - transcript_full.json exists
       - Config (backend, model, language, word_timestamps) matches
@@ -411,13 +410,13 @@ def compute_transcript_analysis(
     """
     video_path = Path(source_audio_path) if source_audio_path is not None else Path(proj.audio_source)
     transcript_path = proj.analysis_dir / "transcript_full.json"
-    
+
     # Check for cached transcript (major speedup on re-runs)
     if not force and transcript_path.exists():
         try:
             cached_data = json.loads(transcript_path.read_text(encoding="utf-8"))
             saved_config = cached_data.get("config", {})
-            
+
             if _config_matches(saved_config, cfg):
                 logger.info(
                     f"Using cached transcript ({cached_data.get('segment_count', 0)} segments, "
@@ -433,11 +432,11 @@ def compute_transcript_analysis(
                 )
         except Exception as e:
             logger.warning(f"Failed to load cached transcript: {e}")
-    
+
     # Track computation time
     import time as _time
     start_time = _time.time()
-    
+
     # Get duration from ffprobe (may be 0 if it fails)
     ffprobe_duration = ffprobe_duration_seconds(video_path)
 
@@ -568,8 +567,7 @@ def compute_transcript_analysis_from_audio(
         Dict with transcript data (same format as compute_transcript_analysis)
         Can be saved to a project later using save_transcript_to_project()
     """
-    from .transcription import TranscriberConfig, get_transcriber
-    
+
     audio_path = Path(audio_path)
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
@@ -583,12 +581,12 @@ def compute_transcript_analysis_from_audio(
 
     # Convert audio to WAV format if needed (whisper expects 16kHz mono WAV)
     needs_conversion = audio_path.suffix.lower() not in [".wav"]
-    
+
     if needs_conversion:
         with tempfile.TemporaryDirectory(prefix="vp_transcript_") as td:
             td_path = Path(td)
             wav_path = td_path / "audio.wav"
-            
+
             # Convert to WAV
             _require_cmd("ffmpeg")
             import subprocess
@@ -604,10 +602,10 @@ def compute_transcript_analysis_from_audio(
                 str(wav_path),
             ]
             subprocess.check_call(cmd, **_subprocess_flags())
-            
+
             if on_progress:
                 on_progress(0.15)
-            
+
             segments, detected_language, backend_used, gpu_used, speakers, diarization_used = _transcribe_audio_file(
                 wav_path, cfg, on_progress
             )
@@ -615,7 +613,7 @@ def compute_transcript_analysis_from_audio(
         # Already a WAV file, use directly
         if on_progress:
             on_progress(0.15)
-        
+
         segments, detected_language, backend_used, gpu_used, speakers, diarization_used = _transcribe_audio_file(
             audio_path, cfg, on_progress
         )
@@ -675,12 +673,12 @@ def _transcribe_audio_file(
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> tuple[List[TranscriptSegment], Optional[str], str, bool, Optional[List[str]], bool]:
     """Internal: Transcribe a WAV file using the configured backend.
-    
+
     Returns:
         Tuple of (segments, detected_language, backend_used, gpu_used, speakers, diarization_used)
     """
     from .transcription import TranscriberConfig, get_transcriber
-    
+
     # Convert our config to the new format
     transcriber_cfg = TranscriberConfig(
         backend=cfg.backend,
@@ -704,34 +702,34 @@ def _transcribe_audio_file(
         assemblyai_poll_interval_s=cfg.assemblyai_poll_interval_s,
         assemblyai_timeout_s=cfg.assemblyai_timeout_s,
     )
-    
+
     # Get transcriber with fallback
     transcriber = get_transcriber(transcriber_cfg)
-    
+
     logger.info(f"Using transcription backend: {transcriber.backend_name}")
-    
+
     # Wrap progress callback
     def progress_wrapper(p: float) -> None:
         if on_progress:
             # Map 0-1 to 0.15-0.95 (conversion was 0-0.15, final is 0.95-1.0)
             on_progress(0.15 + 0.8 * p)
-    
+
     # Transcribe
     result = transcriber.transcribe(wav_path, on_progress=progress_wrapper)
-    
+
     # Unload model to free GPU memory
     transcriber.unload_model()
-    
+
     # Backends may already include speaker labels (e.g., AssemblyAI cloud diarization).
     speakers: Optional[List[str]] = result.speakers
     diarization_used = bool(result.diarization_used)
-    
+
     if cfg.diarize and not diarization_used:
-        from .transcription import is_diarization_available, diarize_audio, merge_diarization_with_transcript
-        
+        from .transcription import diarize_audio, is_diarization_available, merge_diarization_with_transcript
+
         if is_diarization_available():
             logger.info("Running speaker diarization...")
-            
+
             try:
                 diarization_result = diarize_audio(
                     wav_path,
@@ -740,19 +738,19 @@ def _transcribe_audio_file(
                     max_speakers=cfg.diarize_max_speakers,
                     exclusive=True,
                 )
-                
+
                 # Merge diarization with transcript
                 result = merge_diarization_with_transcript(result, diarization_result)
                 speakers = diarization_result.speakers
                 diarization_used = True
-                
+
                 logger.info(f"Diarization complete: identified {len(speakers)} speakers")
             except Exception as e:
                 logger.warning(f"Diarization failed: {e}. Continuing without speaker labels.")
         else:
             logger.warning("Diarization requested but pyannote-audio not installed. "
                           "Install with: pip install pyannote-audio")
-    
+
     # Convert to our segment format
     segments: List[TranscriptSegment] = []
     for seg in result.segments:
@@ -768,7 +766,7 @@ def _transcribe_audio_file(
                 )
                 for w in seg.words
             ]
-        
+
         segments.append(TranscriptSegment(
             start=seg.start,
             end=seg.end,
@@ -776,7 +774,7 @@ def _transcribe_audio_file(
             words=words,
             speaker=getattr(seg, 'speaker', None),
         ))
-    
+
     return segments, result.language, result.backend_used, result.gpu_used, speakers, diarization_used
 
 
@@ -785,10 +783,10 @@ def save_transcript_to_project(
     transcript_data: Dict[str, Any],
 ) -> None:
     """Save pre-computed transcript data to a project.
-    
+
     This is used when transcription was done early (during download)
     and now needs to be saved to the project directory.
-    
+
     Args:
         proj: Project to save transcript to
         transcript_data: Transcript data from compute_transcript_analysis_from_audio()

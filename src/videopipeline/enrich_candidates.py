@@ -12,19 +12,15 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-
-import numpy as np
 
 from .analysis_speech_features import (
     DEFAULT_REACTION_PHRASES,
-    compute_lexical_excitement,
     SpeechFeatureConfig,
+    compute_lexical_excitement,
 )
-from .analysis_transcript import FullTranscript, load_transcript, TranscriptSegment
+from .analysis_transcript import FullTranscript, TranscriptSegment, load_transcript
 from .project import Project, get_project_data, update_project
-
 
 # Payoff words that indicate a good quote/moment
 PAYOFF_WORDS: List[str] = [
@@ -61,20 +57,20 @@ def _clean_text(text: str) -> str:
 def _is_punchy(text: str, phrases: List[str]) -> bool:
     """Check if text is punchy/hook-worthy."""
     text_lower = text.lower()
-    
+
     # Has exclamation or question
     if "!" in text or "?" in text:
         return True
-    
+
     # Contains reaction phrase
     for phrase in phrases:
         if phrase.lower() in text_lower:
             return True
-    
+
     # Short and snappy
     if len(text) <= 40:
         return True
-    
+
     return False
 
 
@@ -100,7 +96,7 @@ def extract_hook_text(
     cfg: EnrichConfig,
 ) -> Optional[str]:
     """Extract a punchy hook text from the transcript within a time range.
-    
+
     Looks for short, exciting phrases near the peak moment.
     """
     # Get segments overlapping the candidate window
@@ -108,10 +104,10 @@ def extract_hook_text(
     for seg in transcript.segments:
         if seg.end >= start_s and seg.start <= end_s:
             segments.append(seg)
-    
+
     if not segments:
         return None
-    
+
     # Collect word-level candidates if available
     word_candidates: List[Tuple[float, float, str]] = []
     for seg in segments:
@@ -119,10 +115,10 @@ def extract_hook_text(
             for word in seg.words:
                 if word.end >= start_s and word.start <= end_s:
                     word_candidates.append((word.start, word.end, word.word))
-    
+
     # Build candidate phrases from consecutive words
     phrase_candidates: List[Tuple[float, str]] = []
-    
+
     if word_candidates:
         # Try phrases of 2-5 words
         for phrase_len in range(2, 6):
@@ -130,7 +126,7 @@ def extract_hook_text(
                 words = word_candidates[i:i + phrase_len]
                 phrase = " ".join(w[2] for w in words)
                 phrase = _clean_text(phrase)
-                
+
                 if len(phrase) <= cfg.hook_max_chars and _is_punchy(phrase, cfg.reaction_phrases):
                     # Score by position (prefer middle of clip) and excitement
                     mid_time = (words[0][0] + words[-1][1]) / 2
@@ -139,17 +135,17 @@ def extract_hook_text(
                     excitement_score = _sentence_excitement(phrase, cfg.reaction_phrases)
                     total_score = 0.4 * position_score + 0.6 * excitement_score
                     phrase_candidates.append((total_score, phrase))
-    
+
     # Also try segment-level text
     for seg in segments:
         text = _clean_text(seg.text)
         if text and len(text) <= cfg.hook_max_chars and _is_punchy(text, cfg.reaction_phrases):
             excitement_score = _sentence_excitement(text, cfg.reaction_phrases)
             phrase_candidates.append((excitement_score, text))
-    
+
     if not phrase_candidates:
         return None
-    
+
     # Return best scoring phrase
     phrase_candidates.sort(key=lambda x: x[0], reverse=True)
     return phrase_candidates[0][1]
@@ -162,7 +158,7 @@ def extract_quote_text(
     cfg: EnrichConfig,
 ) -> Optional[str]:
     """Extract the best quotable sentence from a time range.
-    
+
     Prefers complete sentences with payoff words and excitement.
     """
     # Get segments overlapping the candidate window
@@ -170,42 +166,42 @@ def extract_quote_text(
     for seg in transcript.segments:
         if seg.end >= start_s and seg.start <= end_s:
             segments.append(seg)
-    
+
     if not segments:
         return None
-    
+
     # Collect full text and split into sentences
     full_text = " ".join(seg.text for seg in segments)
-    
+
     # Simple sentence splitting on . ! ?
     sentences = re.split(r'(?<=[.!?])\s+', full_text)
-    
+
     # Score each sentence
     scored_sentences: List[Tuple[float, str]] = []
     for sentence in sentences:
         sentence = _clean_text(sentence)
         if not sentence or len(sentence) > cfg.quote_max_chars:
             continue
-        
+
         score = _sentence_excitement(sentence, cfg.reaction_phrases)
-        
+
         # Bonus for payoff words
         if _has_payoff_word(sentence):
             score += 2.0
-        
+
         # Penalty for very short sentences (less meaningful)
         if len(sentence) < 10:
             score *= 0.5
-        
+
         scored_sentences.append((score, sentence))
-    
+
     if not scored_sentences:
         # Fallback to first segment text
         first_text = _clean_text(segments[0].text)
         if first_text and len(first_text) <= cfg.quote_max_chars:
             return first_text
         return None
-    
+
     # Sort by score descending
     scored_sentences.sort(key=lambda x: x[0], reverse=True)
     return scored_sentences[0][1]

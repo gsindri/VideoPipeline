@@ -12,7 +12,6 @@ from .ffmpeg import ffprobe_duration_seconds
 from .peaks import moving_average, robust_z
 from .project import Project, save_npz, update_project
 
-
 _TS_KEYS = (
     "time_in_seconds",
     "timestamp",
@@ -105,10 +104,10 @@ def _normalize_timestamps(
     timestamps: list[float], duration_s: float
 ) -> tuple[list[float], str]:
     """Normalize timestamps to a 0-based timeline.
-    
+
     Detects whether timestamps are absolute (epoch seconds) or relative,
     and normalizes absolute timestamps to start from 0.
-    
+
     Returns:
         Tuple of (normalized_timestamps, timebase) where timebase is one of:
         - "relative": timestamps were already relative to video start
@@ -116,19 +115,19 @@ def _normalize_timestamps(
     """
     if not timestamps:
         return [], "relative"
-    
+
     min_ts = min(timestamps)
     max_ts = max(timestamps)
-    
+
     # Heuristic: if max > duration * 5 AND min > 10000 (likely epoch seconds),
     # treat as absolute timestamps that need normalization
     is_absolute = max_ts > duration_s * 5 and min_ts > 10_000
-    
+
     if is_absolute:
         # Normalize by subtracting the minimum timestamp (stream start)
         normalized = [t - min_ts for t in timestamps]
         return normalized, "absolute_normalized"
-    
+
     return timestamps, "relative"
 
 

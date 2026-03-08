@@ -13,13 +13,11 @@ import logging
 import time as _time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .analysis_sentences import Sentence, compute_sentences_analysis, SentenceConfig
-from .analysis_transcript import FullTranscript, load_transcript
+from .analysis_transcript import load_transcript
 from .project import Project, save_json, update_project
 
 logger = logging.getLogger(__name__)
@@ -32,7 +30,7 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class ChapterConfig:
     """Configuration for semantic chapter detection.
-    
+
     Attributes:
         min_chapter_len_s: Minimum chapter length in seconds (default 60s)
         max_chapter_len_s: Maximum chapter length in seconds (default 900s = 15 min)
@@ -147,22 +145,22 @@ def _compute_embeddings(
     """Compute sentence embeddings for a list of texts."""
     if not texts:
         return np.array([])
-    
+
     model = _load_sentence_transformer(model_name)
-    
+
     # Batch encode with progress
     batch_size = 32
     embeddings_list = []
-    
+
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
         batch_embeddings = model.encode(batch, show_progress_bar=False)
         embeddings_list.append(batch_embeddings)
-        
+
         if on_progress:
             progress = min((i + batch_size) / len(texts), 1.0)
             on_progress(progress)
-    
+
     return np.vstack(embeddings_list)
 
 
@@ -183,11 +181,11 @@ def _detect_changepoints_ruptures(
             "ruptures is required for semantic chapter detection. "
             "Install with: pip install ruptures"
         )
-    
+
     n_samples = len(embeddings)
     if n_samples < 3:
         return []
-    
+
     # Use RBF cost function (good for embedding vectors)
     if method == "pelt":
         algo = rpt.Pelt(model="rbf", min_size=2).fit(embeddings)
@@ -203,11 +201,11 @@ def _detect_changepoints_ruptures(
         changepoints = algo.predict(pen=penalty)
     else:
         raise ValueError(f"Unknown changepoint method: {method}")
-    
+
     # Remove the final point (which is always n_samples)
     if changepoints and changepoints[-1] == n_samples:
         changepoints = changepoints[:-1]
-    
+
     return changepoints
 
 
@@ -218,23 +216,23 @@ def _detect_changepoints_cosine(
 ) -> List[int]:
     """Simple cosine similarity-based changepoint detection (fallback)."""
     from numpy.linalg import norm
-    
+
     if len(embeddings) < 2:
         return []
-    
+
     changepoints = []
-    
+
     for i in range(window_size, len(embeddings) - window_size):
         # Compare windows before and after
         before = embeddings[i - window_size:i].mean(axis=0)
         after = embeddings[i:i + window_size].mean(axis=0)
-        
+
         # Cosine similarity
         sim = np.dot(before, after) / (norm(before) * norm(after) + 1e-9)
-        
+
         if sim < (1.0 - threshold):
             changepoints.append(i)
-    
+
     return changepoints
 
 
@@ -467,7 +465,7 @@ def _load_silence_intervals(proj: Project) -> List[Tuple[float, float]]:
     silence_path = proj.analysis_dir / "silence.json"
     if not silence_path.exists():
         return []
-    
+
     try:
         data = json.loads(silence_path.read_text(encoding="utf-8"))
         intervals = data.get("silences", [])
@@ -485,10 +483,10 @@ def _snap_to_silence(
     """Snap a boundary time to the nearest silence end within window."""
     if not silence_intervals:
         return boundary_time
-    
+
     best_time = boundary_time
     best_distance = float("inf")
-    
+
     for start, end in silence_intervals:
         # Check if silence end is within window
         if abs(end - boundary_time) <= window_s:
@@ -496,7 +494,7 @@ def _snap_to_silence(
             if distance < best_distance:
                 best_distance = distance
                 best_time = end
-    
+
     return best_time
 
 
@@ -515,7 +513,7 @@ def _label_chapter_with_llm(
     # Truncate transcript if too long
     if len(transcript_text) > cfg.max_chars_per_chapter:
         transcript_text = transcript_text[:cfg.max_chars_per_chapter] + "..."
-    
+
     prompt = f"""Analyze this video transcript segment and provide a JSON response with:
 - "title": A short, engaging title (3-8 words)
 - "summary": A 1-2 sentence summary of what happens
@@ -566,7 +564,7 @@ Respond ONLY with valid JSON, no other text."""
 
         if not isinstance(result, dict):
             raise ValueError("LLM chapter labeling returned non-dict payload")
-        
+
         # Result is already a parsed dict from client.complete()
         return {
             "title": str(result.get("title", "")),
@@ -584,7 +582,7 @@ def _label_chapter_fallback(transcript_text: str) -> Dict[str, Any]:
     # Extract first sentence as title
     sentences = transcript_text.split(".")
     title = sentences[0].strip()[:50] if sentences else "Chapter"
-    
+
     # Simple keyword extraction (most common words > 4 chars)
     words = transcript_text.lower().split()
     word_freq: Dict[str, int] = {}
@@ -592,9 +590,9 @@ def _label_chapter_fallback(transcript_text: str) -> Dict[str, Any]:
         w = "".join(c for c in w if c.isalnum())
         if len(w) > 4:
             word_freq[w] = word_freq.get(w, 0) + 1
-    
+
     keywords = sorted(word_freq.keys(), key=lambda x: word_freq[x], reverse=True)[:5]
-    
+
     return {
         "title": title if len(title) > 3 else "Chapter",
         "summary": "",
@@ -615,7 +613,7 @@ def compute_chapters_analysis(
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Compute semantic chapter boundaries for a project.
-    
+
     Pipeline:
     1. Load transcript (sentences preferred, segments as fallback)
     2. Compute embeddings for each sentence/segment
@@ -624,31 +622,31 @@ def compute_chapters_analysis(
     5. Enforce min/max chapter length constraints
     6. Optionally label chapters with LLM
     7. Save chapters.json and update project.json
-    
+
     Args:
         proj: Project instance
         cfg: Chapter configuration
         llm_complete: Optional completion callable supplied by DAG runner
             (uses active Studio AI backend, e.g. OpenAI API or local server)
         on_progress: Optional progress callback (0.0 to 1.0)
-    
+
     Returns:
         Dict with chapter analysis results
     """
     start_time = _time.time()
-    
+
     if on_progress:
         on_progress(0.0)
-    
+
     # Step 1: Load transcript
     transcript = load_transcript(proj)
     if transcript is None or not transcript.segments:
         raise ValueError("Transcript required for semantic chapters. Run transcription first.")
-    
+
     # Try to load sentences (better granularity)
     sentences_path = proj.analysis_dir / "sentences.json"
     units: List[Tuple[float, float, str]] = []  # (start, end, text)
-    
+
     if sentences_path.exists():
         try:
             data = json.loads(sentences_path.read_text(encoding="utf-8"))
@@ -657,26 +655,26 @@ def compute_chapters_analysis(
             logger.info(f"Loaded {len(units)} sentences for chapter detection")
         except Exception as e:
             logger.warning(f"Could not load sentences: {e}")
-    
+
     # Fallback to transcript segments
     if not units:
         for seg in transcript.segments:
             units.append((seg.start, seg.end, seg.text))
         logger.info(f"Using {len(units)} transcript segments for chapter detection")
-    
+
     if len(units) < 3:
         raise ValueError("Not enough text units for chapter detection (need at least 3)")
-    
+
     if on_progress:
         on_progress(0.1)
-    
+
     # Step 2: Compute embeddings
     texts = [u[2] for u in units]
-    
+
     def embed_progress(frac: float) -> None:
         if on_progress:
             on_progress(0.1 + 0.4 * frac)
-    
+
     try:
         embeddings = _compute_embeddings(texts, cfg.embedding_model, on_progress=embed_progress)
     except ImportError as e:
@@ -685,10 +683,10 @@ def compute_chapters_analysis(
         from sklearn.feature_extraction.text import TfidfVectorizer
         vectorizer = TfidfVectorizer(max_features=100)
         embeddings = vectorizer.fit_transform(texts).toarray()
-    
+
     if on_progress:
         on_progress(0.5)
-    
+
     # Step 3: Detect changepoints
     video_end = units[-1][1] if units else 0.0
     target_ch_min, target_ch_max, target_ch_ideal = _estimate_target_chapter_range(video_end, cfg)
@@ -810,13 +808,13 @@ def compute_chapters_analysis(
         logger.warning(
             "[chapters] No semantic changepoints detected; chapter boundaries will rely on max length fallback"
         )
-    
+
     if on_progress:
         on_progress(0.6)
-    
+
     # Step 4: Convert changepoint indices to times and snap to silence
     silence_intervals = _load_silence_intervals(proj)
-    
+
     boundary_times: List[float] = [0.0]  # Always start at 0
     for cp_idx in changepoints:
         if cp_idx < len(units):
@@ -827,26 +825,26 @@ def compute_chapters_analysis(
                 cfg.snap_to_silence_window_s,
             )
             boundary_times.append(snapped_time)
-    
+
     # Add end time
     boundary_times.append(video_end)
-    
+
     # Sort and dedupe
     boundary_times = sorted(set(boundary_times))
-    
+
     if on_progress:
         on_progress(0.65)
-    
+
     # Step 5: Enforce min/max chapter length constraints
     final_boundaries: List[float] = [0.0]
-    
+
     for i in range(1, len(boundary_times)):
         gap = boundary_times[i] - final_boundaries[-1]
-        
+
         # If gap is too small, skip this boundary
         if gap < cfg.min_chapter_len_s:
             continue
-        
+
         # If gap is too large, insert intermediate boundaries
         while gap > cfg.max_chapter_len_s:
             # Find a good split point (prefer silence)
@@ -861,26 +859,26 @@ def compute_chapters_analysis(
                 snapped_mid = final_boundaries[-1] + cfg.max_chapter_len_s * 0.8
             final_boundaries.append(snapped_mid)
             gap = boundary_times[i] - final_boundaries[-1]
-        
+
         if gap >= cfg.min_chapter_len_s:
             final_boundaries.append(boundary_times[i])
-    
+
     # Ensure we end at video end
     if final_boundaries[-1] < video_end - cfg.min_chapter_len_s:
         final_boundaries.append(video_end)
     elif final_boundaries[-1] != video_end:
         final_boundaries[-1] = video_end
-    
+
     if on_progress:
         on_progress(0.7)
-    
+
     # Step 6: Build chapter objects
     chapters: List[Chapter] = []
-    
+
     for i in range(len(final_boundaries) - 1):
         start_s = final_boundaries[i]
         end_s = final_boundaries[i + 1]
-        
+
         # Collect transcript text for this chapter
         chapter_text = ""
         for u_start, u_end, u_text in units:
@@ -889,27 +887,27 @@ def compute_chapters_analysis(
             elif u_start < end_s and u_end > start_s:
                 # Partial overlap
                 chapter_text += " " + u_text
-        
+
         chapter_text = chapter_text.strip()
-        
+
         chapters.append(Chapter(
             id=i,
             start_s=start_s,
             end_s=end_s,
             title=f"Chapter {i + 1}",  # Default title
         ))
-    
+
     if on_progress:
         on_progress(0.75)
-    
+
     # Step 7: LLM labeling (optional)
     if cfg.llm_labeling and chapters:
         logger.info(f"Running LLM labeling for {len(chapters)} chapters...")
-        
+
         consecutive_failures = 0
         max_consecutive_failures = 2  # Bail after 2 consecutive LLM failures
         llm_disabled = False
-        
+
         for i, chapter in enumerate(chapters):
             # Collect text for this chapter
             chapter_text = ""
@@ -917,14 +915,14 @@ def compute_chapters_analysis(
                 if u_start >= chapter.start_s and u_start < chapter.end_s:
                     chapter_text += " " + u_text
             chapter_text = chapter_text.strip()
-            
+
             if chapter_text:
                 labels = None
-                
+
                 # Only try LLM if we haven't hit the failure threshold
                 if not llm_disabled:
                     labels = _label_chapter_with_llm(chapter_text, cfg, llm_complete=llm_complete)
-                    
+
                     if labels:
                         consecutive_failures = 0  # Reset on success
                         chapter.title = labels.get("title", chapter.title)
@@ -940,24 +938,24 @@ def compute_chapters_analysis(
                                 f"(Is the LLM server running?)"
                             )
                             llm_disabled = True
-                
+
                 # Use fallback if LLM failed or was disabled
                 if not labels:
                     labels = _label_chapter_fallback(chapter_text)
                     chapter.title = labels.get("title", chapter.title)
                     chapter.keywords = labels.get("keywords", [])
-            
+
             if on_progress:
                 progress = 0.75 + 0.2 * ((i + 1) / len(chapters))
                 on_progress(progress)
-    
+
     if on_progress:
         on_progress(0.95)
-    
+
     # Step 8: Build and save results
     elapsed_seconds = _time.time() - start_time
     generated_at = datetime.now(timezone.utc).isoformat()
-    
+
     payload = {
         "method": "embedding_changepoint_v1",
         "config": {
@@ -981,10 +979,10 @@ def compute_chapters_analysis(
         "chapter_count": len(chapters),
         "chapters": [c.to_dict() for c in chapters],
     }
-    
+
     # Save chapters.json
     save_json(proj.chapters_path, payload)
-    
+
     # Update project.json
     def _upd(d: Dict[str, Any]) -> None:
         d.setdefault("analysis", {})
@@ -995,14 +993,14 @@ def compute_chapters_analysis(
             "chapters_json": str(proj.chapters_path.relative_to(proj.project_dir)),
             "config": payload["config"],
         }
-    
+
     update_project(proj, _upd)
-    
+
     if on_progress:
         on_progress(1.0)
-    
+
     logger.info(f"Chapter analysis complete: {len(chapters)} chapters in {elapsed_seconds:.1f}s")
-    
+
     return payload
 
 
@@ -1014,7 +1012,7 @@ def load_chapters(proj: Project) -> Optional[List[Chapter]]:
     """Load chapters from analysis/chapters.json."""
     if not proj.chapters_path.exists():
         return None
-    
+
     try:
         data = json.loads(proj.chapters_path.read_text(encoding="utf-8"))
         return [Chapter.from_dict(c) for c in data.get("chapters", [])]

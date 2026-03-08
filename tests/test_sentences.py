@@ -3,8 +3,8 @@
 import pytest
 
 from videopipeline.analysis_sentences import (
-    SentenceConfig,
     Sentence,
+    SentenceConfig,
 )
 
 
@@ -28,7 +28,7 @@ class TestSentence:
             text="Hello world",
         )
         d = sentence.to_dict()
-        
+
         assert d["t0"] == 10.0
         assert d["t1"] == 12.0
         assert d["text"] == "Hello world"

@@ -363,8 +363,8 @@ def compute_diarization_analysis(
     get_hf_token = None
     try:
         from .transcription.diarization import diarize_audio as _da  # type: ignore
-        from .transcription.diarization import is_diarization_available as _avail  # type: ignore
         from .transcription.diarization import get_hf_token as _get_token  # type: ignore
+        from .transcription.diarization import is_diarization_available as _avail  # type: ignore
 
         diarize_audio = _da
         is_available = _avail
@@ -373,8 +373,8 @@ def compute_diarization_analysis(
         # Fallback if the module isn't under transcription/.
         try:
             from .diarization import diarize_audio as _da  # type: ignore
-            from .diarization import is_diarization_available as _avail  # type: ignore
             from .diarization import get_hf_token as _get_token  # type: ignore
+            from .diarization import is_diarization_available as _avail  # type: ignore
 
             diarize_audio = _da
             is_available = _avail

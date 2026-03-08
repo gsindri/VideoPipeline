@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-
 ProgressCallback = Callable[[float], None]
 ResumeCallback = Callable[[dict[str, Any]], None]
 

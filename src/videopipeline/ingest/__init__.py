@@ -7,7 +7,11 @@ This module provides smart URL download with:
 - Post-processing (remux, preview generation)
 """
 
+# Keep old imports working
+from .downloader import DownloadOptions, DownloadResult
 from .models import (
+    SITE_POLICIES,
+    SPEED_MODE_N,
     IngestRequest,
     IngestResult,
     PostprocessResult,
@@ -16,8 +20,6 @@ from .models import (
     SitePolicy,
     SiteType,
     SpeedMode,
-    SITE_POLICIES,
-    SPEED_MODE_N,
 )
 from .policy import (
     classify_url_heuristic,
@@ -42,10 +44,7 @@ from .tuner import (
     tuning_file_path,
     update_domain_tuning,
 )
-from .ytdlp_runner import download_url, DownloadCancelled
-
-# Keep old imports working
-from .downloader import DownloadOptions, DownloadResult
+from .ytdlp_runner import DownloadCancelled, download_url
 
 __all__ = [
     # Main entry points

@@ -12,7 +12,6 @@ from .ffmpeg import ffprobe_duration_seconds
 from .peaks import moving_average, pick_top_peaks, robust_z
 from .project import Project, save_npz, update_project
 
-
 # ============================================================================
 # Standalone Audio RMS Analysis (for early processing during download)
 # ============================================================================
@@ -26,27 +25,27 @@ def compute_audio_rms_from_file(
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Compute audio RMS timeline from an audio file (no Project required).
-    
+
     This is used during URL download to run audio analysis in parallel with
     video download and transcription.
-    
+
     Args:
         audio_path: Path to audio file (WAV, MP3, M4A, etc.)
         sample_rate: Sample rate for analysis
         hop_s: Hop size in seconds
         smooth_s: Smoothing window in seconds
         on_progress: Optional progress callback
-        
+
     Returns:
         Dict with timeline_db, smoothed_db, scores, times, hop_seconds
         Can be saved to a project later using save_audio_rms_to_project()
     """
     start_time = _time.time()
     audio_path = Path(audio_path)
-    
+
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
-    
+
     # Helper for progress reporting with optional message
     def _report(frac: float, msg: str = "") -> None:
         if on_progress:
@@ -54,29 +53,29 @@ def compute_audio_rms_from_file(
                 on_progress(frac, msg)
             except TypeError:
                 on_progress(frac)
-    
+
     duration_s = ffprobe_duration_seconds(audio_path)
-    
+
     _report(0.1, "Extracting audio RMS timeline")
-    
+
     # Compute RMS timeline (works on any audio/video file)
     cfg = AudioFeatureConfig(sample_rate=sample_rate, hop_seconds=hop_s)
     timeline_db = audio_rms_db_timeline(audio_path, cfg)
-    
+
     _report(0.7, "Smoothing and computing z-scores")
-    
+
     x = np.array(timeline_db, dtype=np.float64)
     times = np.arange(len(x)) * hop_s
-    
+
     # Smooth the timeline
     smooth_frames = max(1, int(round(smooth_s / hop_s)))
     xs = moving_average(x, smooth_frames)
     scores = robust_z(xs)
-    
+
     _report(0.9, "Building results")
-    
+
     elapsed_seconds = _time.time() - start_time
-    
+
     result = {
         "timeline_db": x.tolist(),
         "smoothed_db": xs.tolist(),
@@ -89,9 +88,9 @@ def compute_audio_rms_from_file(
         "elapsed_seconds": elapsed_seconds,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
-    
+
     _report(1.0, "Done")
-    
+
     return result
 
 
@@ -100,7 +99,7 @@ def save_audio_rms_to_project(
     audio_data: Dict[str, Any],
 ) -> None:
     """Save pre-computed audio RMS analysis to a project.
-    
+
     Args:
         proj: Project instance
         audio_data: Audio analysis data from compute_audio_rms_from_file()
@@ -111,7 +110,7 @@ def save_audio_rms_to_project(
     scores = np.array(audio_data["scores"], dtype=np.float64)
     times = np.array(audio_data["times"], dtype=np.float64)
     hop_seconds = np.array([audio_data["hop_seconds"]], dtype=np.float64)
-    
+
     save_npz(
         proj.audio_features_path,
         timeline_db=timeline_db,
@@ -120,7 +119,7 @@ def save_audio_rms_to_project(
         times=times,
         hop_seconds=hop_seconds,
     )
-    
+
     def _upd(d: Dict[str, Any]) -> None:
         d.setdefault("analysis", {})
         d["analysis"]["audio"] = {
@@ -136,7 +135,7 @@ def save_audio_rms_to_project(
             "elapsed_seconds": audio_data["elapsed_seconds"],
             "generated_at": audio_data["generated_at"],
         }
-    
+
     update_project(proj, _upd)
 
 
@@ -195,7 +194,7 @@ def compute_audio_analysis(
     start_time = _time.time()
     video_path = Path(source_audio_path) if source_audio_path is not None else Path(proj.audio_source)
     duration_s = ffprobe_duration_seconds(video_path)
-    
+
     # Helper for progress reporting with optional message
     def _report(frac: float, msg: str = "") -> None:
         if on_progress:
@@ -207,14 +206,14 @@ def compute_audio_analysis(
     # Use shared RMS timeline computation
     cfg = AudioFeatureConfig(sample_rate=sample_rate, hop_seconds=hop_s)
     timeline_db = audio_rms_db_timeline(video_path, cfg)
-    
+
     _report(0.5, "Audio extraction complete, computing scores")
 
     x = np.array(timeline_db, dtype=np.float64)
-    
+
     # Create explicit times array for consistent resampling
     times = np.arange(len(x)) * hop_s
-    
+
     smooth_frames = max(1, int(round(smooth_s / hop_s)))
     xs = moving_average(x, smooth_frames)
     scores = robust_z(xs)

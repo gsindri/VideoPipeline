@@ -26,12 +26,12 @@ from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Set
 
 from ..project import Project
 from .artifacts import (
-    get_artifact_state,
-    save_artifact_state,
-    is_artifact_fresh,
     ARTIFACTS,
+    get_artifact_state,
+    is_artifact_fresh,
+    save_artifact_state,
 )
-from .tasks import task_registry, Task
+from .tasks import Task, task_registry
 
 logger = logging.getLogger(__name__)
 
@@ -81,21 +81,21 @@ _TASK_FRESHNESS_CONFIG_KEYS: Dict[str, Set[str]] = {
 @contextmanager
 def task_lock(locks_dir: Path, task_name: str, timeout: float = 300.0) -> Generator[bool, None, None]:
     """File-based lock for a task to prevent concurrent execution.
-    
+
     Args:
         locks_dir: Directory for lock files
         task_name: Name of the task to lock
         timeout: Max seconds to wait for lock (default 5 minutes)
-        
+
     Yields:
         True if lock acquired, False if timed out
     """
     locks_dir.mkdir(parents=True, exist_ok=True)
     lock_file = locks_dir / f"{task_name}.lock"
-    
+
     start = time.time()
     acquired = False
-    
+
     while time.time() - start < timeout:
         try:
             # Try to create lock file exclusively
@@ -116,10 +116,10 @@ def task_lock(locks_dir: Path, task_name: str, timeout: float = 300.0) -> Genera
                 # Corrupted lock file, remove it
                 lock_file.unlink(missing_ok=True)
                 continue
-            
+
             # Wait and retry
             time.sleep(0.5)
-    
+
     try:
         yield acquired
     finally:
@@ -154,21 +154,21 @@ class AnalysisResult:
 
 class AnalysisRunner:
     """Executes analysis tasks in dependency order.
-    
+
     The runner supports two main modes:
-    
+
     1. Target-based: Specify artifact targets, runner computes dependencies
        runner.run(targets={"highlights_candidates"})
-       
+
     2. Bundle-based: Use pre-defined bundles
        runner.run(bundle="pre_download")  # Audio+chat based early analysis
        runner.run(bundle="full")          # Full analysis with video
-    
+
     The runner also supports progressive refinement:
     - If a task has upgrade_triggers and those become available, it re-runs
     - This allows early "good enough" results that improve later
     """
-    
+
     def __init__(
         self,
         proj: Project,
@@ -179,7 +179,7 @@ class AnalysisRunner:
         upgrade_mode: bool = False,
     ):
         """Initialize the runner.
-        
+
         Args:
             proj: Project to analyze
             config: Merged config dict with sub-configs for each task
@@ -192,27 +192,27 @@ class AnalysisRunner:
         self.on_progress = on_progress
         self.llm_complete = llm_complete
         self.upgrade_mode = upgrade_mode
-        
+
         # Inject LLM function into config for tasks that need it
         if llm_complete:
             self.config["_llm_complete"] = llm_complete
-        
+
         # Track what we've computed this run (thread-safe via lock)
         import threading
         self._computed: Set[str] = set()
         self._computed_lock = threading.Lock()
         self._results: List[TaskResult] = []
-        
+
         # Logger for debug output
         self._log = logger
-    
+
     def _artifact_exists(self, artifact: str) -> bool:
         """Check if an artifact exists (file on disk)."""
         artifact_def = ARTIFACTS.get(artifact)
         if artifact_def is None:
             logger.debug(f"[DAG] Artifact '{artifact}' not found in registry")
             return False
-        
+
         # Use the artifact's exists() method which checks legacy paths too
         exists = artifact_def.exists(self.proj.analysis_dir)
         path = artifact_def.get_path(self.proj.analysis_dir)
@@ -383,23 +383,23 @@ class AnalysisRunner:
             return bool(merged.get("use_gpu", True))
 
         return False
-    
+
     def _should_run_task(self, task: Task) -> tuple[bool, str]:
         """Determine if a task should run.
-        
+
         Returns:
             (should_run, reason)
         """
         # Check if task is enabled
         if not task.is_enabled(self.config):
             return False, "disabled by config"
-        
+
         # Check if all outputs already exist
         all_outputs_exist = all(
             self._artifact_exists(a) or a in self._computed
             for a in task.produces
         )
-        
+
         if all_outputs_exist:
             # Recompute if outputs exist but are stale under current config/version.
             freshness_cfg = self._task_config_for_freshness(task)
@@ -444,39 +444,39 @@ class AnalysisRunner:
                     )
                     if new_sources:
                         return True, f"upgrade: new sources {new_sources}"
-            
+
             return False, "outputs exist"
-        
+
         return True, "outputs missing"
-    
+
     def _can_run_task(
-        self, 
-        task: Task, 
+        self,
+        task: Task,
         will_be_produced: Optional[Set[str]] = None,
     ) -> tuple[bool, str]:
         """Check if task's dependencies are satisfied.
-        
+
         Args:
             task: Task to check
-            will_be_produced: Set of artifacts that will be produced by other 
+            will_be_produced: Set of artifacts that will be produced by other
                 tasks in this DAG run. Used during planning phase.
-        
+
         Returns:
             (can_run, reason)
         """
         if will_be_produced is None:
             will_be_produced = set()
-            
+
         missing = []
         for req in task.requires:
             exists = (
-                self._artifact_exists(req) 
-                or req in self._computed 
+                self._artifact_exists(req)
+                or req in self._computed
                 or req in will_be_produced
             )
             if not exists:
                 missing.append(req)
-        
+
         if missing:
             if task.can_run_partial:
                 # Check if at least minimum requirements are met
@@ -487,32 +487,32 @@ class AnalysisRunner:
                     return False, f"missing required: {missing_required}"
                 return True, f"partial: missing optional {missing}"
             return False, f"missing: {missing}"
-        
+
         return True, "dependencies satisfied"
-    
+
     def _group_tasks_by_level(
-        self, 
+        self,
         tasks_to_run: List[tuple[Task, str]]
     ) -> List[List[tuple[Task, str]]]:
         """Group tasks into levels for parallel execution.
-        
+
         Tasks in the same level have no dependencies on each other and can
         run in parallel. Level N tasks depend only on outputs from levels < N.
-        
+
         Args:
             tasks_to_run: List of (task, reason) tuples in dependency order
-            
+
         Returns:
             List of levels, where each level is a list of (task, reason) tuples
         """
         if not tasks_to_run:
             return []
-        
+
         # Build a set of all artifacts that will be produced by tasks in this run
         will_be_produced: Set[str] = set()
         for task, _ in tasks_to_run:
             will_be_produced.update(task.produces)
-        
+
         # Track which artifacts are "available" (already exist AND won't be re-produced)
         # If a task is going to re-run (e.g., for upgrade), its outputs are NOT available
         # until that task completes
@@ -522,31 +522,31 @@ class AnalysisRunner:
                 # Only mark as available if it won't be re-produced by a task in this run
                 if artifact not in will_be_produced:
                     available.add(artifact)
-        
+
         levels: List[List[tuple[Task, str]]] = []
         remaining = list(tasks_to_run)
-        
+
         while remaining:
             # Find all tasks whose dependencies are satisfied
             current_level: List[tuple[Task, str]] = []
             still_remaining: List[tuple[Task, str]] = []
-            
+
             for task, reason in remaining:
                 # Check if all required dependencies are available
                 required_deps = task.requires - task.optional_inputs
                 deps_satisfied = all(dep in available for dep in required_deps)
-                
+
                 # ALSO check: if any optional_input is being produced in this run,
                 # wait for it to be available before running this task.
                 # This ensures we get the best quality results when both tasks are scheduled.
                 optional_deps_being_produced = task.optional_inputs & will_be_produced
                 optional_deps_ready = all(dep in available for dep in optional_deps_being_produced)
-                
+
                 if deps_satisfied and optional_deps_ready:
                     current_level.append((task, reason))
                 else:
                     still_remaining.append((task, reason))
-            
+
             if not current_level:
                 # No progress possible - shouldn't happen if dependencies are correct
                 # Fall back to running remaining tasks sequentially
@@ -554,17 +554,17 @@ class AnalysisRunner:
                 for task, reason in still_remaining:
                     levels.append([(task, reason)])
                 break
-            
+
             levels.append(current_level)
-            
+
             # Mark outputs from this level as available for next level
             for task, _ in current_level:
                 available.update(task.produces)
-            
+
             remaining = still_remaining
-        
+
         return levels
-    
+
     def _run_task(
         self,
         task: Task,
@@ -572,19 +572,19 @@ class AnalysisRunner:
         task_progress_weight: float,
     ) -> TaskResult:
         """Execute a single task.
-        
+
         Args:
             task: Task to run
             task_progress_base: Base progress (0-1) for this task
             task_progress_weight: Weight of this task in total progress
-            
+
         Returns:
             TaskResult
         """
         import time
-        
+
         result = TaskResult(task_name=task.name, status="pending")
-        
+
         # Create progress wrapper that accepts optional message
         def task_progress(frac: float, msg: Optional[str] = None) -> None:
             if self.on_progress:
@@ -599,17 +599,17 @@ class AnalysisRunner:
                     self.on_progress(overall, f"{task.name}: {pct}% {msg}")
                 else:
                     self.on_progress(overall, f"{task.name}: {pct}%")
-        
+
         # Use file-based lock to prevent race conditions
         locks_dir = self.proj.analysis_dir / ".locks"
-        
+
         with task_lock(locks_dir, task.name) as acquired:
             if not acquired:
                 logger.warning(f"[DAG] Could not acquire lock for '{task.name}', skipping")
                 result.status = "skipped"
                 result.error = "lock timeout"
                 return result
-            
+
             # Re-check whether the task still needs to run now that we hold the lock.
             # This matters for upgrade-mode runs where outputs exist but we still want to
             # rerun to incorporate newly-available optional inputs.
@@ -625,13 +625,13 @@ class AnalysisRunner:
                         if self._artifact_exists(a) or a in self._computed:
                             self._computed.add(a)
                 return result
-            
+
             try:
                 start = time.time()
-                
+
                 # Run the task
                 task.run(self.proj, self.config, task_progress)
-                
+
                 result.elapsed_seconds = time.time() - start
                 # Verify the produced artifact files actually exist before marking as completed.
                 # Tasks can "return early" (e.g., no chat data) and produce nothing.
@@ -640,16 +640,16 @@ class AnalysisRunner:
                 for artifact in task.produces:
                     if self._artifact_exists(artifact):
                         actually_produced.add(artifact)
-                
+
                 if actually_produced:
                     result.status = "completed"
                     result.artifacts_produced = actually_produced
                     freshness_cfg = self._task_config_for_freshness(task)
-                    
+
                     # Mark only actually produced artifacts as computed (thread-safe)
                     with self._computed_lock:
                         self._computed.update(actually_produced)
-                    
+
                     # Save state for each produced artifact
                     for artifact in actually_produced:
                         # Determine which sources were present for this run.
@@ -667,7 +667,7 @@ class AnalysisRunner:
                         if input_signature is not None:
                             extra_metadata["input_signature"] = input_signature
                             extra_metadata["input_artifacts"] = input_artifacts
-                        
+
                         save_artifact_state(
                             artifact,
                             self.proj.analysis_dir,
@@ -676,80 +676,80 @@ class AnalysisRunner:
                             sources_present=sources_present,
                             extra_metadata=extra_metadata or None,
                         )
-                    
+
                 else:
                     # Task ran but didn't produce any output files (e.g., no chat data)
                     result.status = "skipped"
                     result.error = "no outputs produced"
-                
+
             except Exception as e:
                 result.status = "failed"
                 result.error = str(e)
-        
+
         return result
-    
+
     def _resolve_dependencies(self, targets: Set[str]) -> List[Task]:
         """Resolve task dependencies and return execution order.
-        
+
         Args:
             targets: Set of artifact names to produce
-            
+
         Returns:
             List of tasks in dependency order (topological sort)
         """
         # Build set of all tasks needed
         needed_tasks: Set[str] = set()
-        
+
         def add_task_and_deps(artifact: str) -> None:
             task = task_registry.get_by_artifact(artifact)
             if task is None:
                 return  # Unknown artifact, treat as external input
-            
+
             if task.name in needed_tasks:
                 return
-            
+
             # Add dependencies first
             for dep in task.requires:
                 add_task_and_deps(dep)
-            
+
             # Add optional dependencies if they exist OR are in targets
             # This ensures boundary_graph gets computed when requested
             for opt in task.optional_inputs:
                 if self._artifact_exists(opt) or opt in targets:
                     add_task_and_deps(opt)
-            
+
             needed_tasks.add(task.name)
-        
+
         for target in targets:
             add_task_and_deps(target)
-        
+
         # Topological sort (simple: just follow dependency order)
         # This works because we added deps before the task itself
         ordered: List[Task] = []
         added: Set[str] = set()
-        
+
         def add_in_order(task_name: str) -> None:
             if task_name in added:
                 return
-            
+
             task = task_registry.get_by_name(task_name)
             if task is None:
                 return
-            
+
             # Add dependencies first
             for dep in task.requires:
                 dep_task = task_registry.get_by_artifact(dep)
                 if dep_task:
                     add_in_order(dep_task.name)
-            
+
             ordered.append(task)
             added.add(task_name)
-        
+
         for task_name in needed_tasks:
             add_in_order(task_name)
-        
+
         return ordered
-    
+
     def run(
         self,
         *,
@@ -757,20 +757,21 @@ class AnalysisRunner:
         bundle: Optional[str] = None,
     ) -> AnalysisResult:
         """Run analysis to produce the requested targets.
-        
+
         Args:
             targets: Artifact names to produce (e.g. {"highlights_candidates"})
             bundle: Named bundle to use (e.g. "pre_download", "full")
-            
+
         Returns:
             AnalysisResult with status and timing info
         """
         import time
+
         from .bundles import get_bundle
-        
+
         start = time.time()
         explicit_targets = targets is not None and bundle is None
-        
+
         # Resolve targets
         if bundle:
             target_set = get_bundle(bundle)
@@ -778,21 +779,21 @@ class AnalysisRunner:
             target_set = set(targets)
         else:
             raise ValueError("Must specify either targets or bundle")
-        
+
         result = AnalysisResult(targets=target_set, tasks_run=[])
         tasks: List[Task] = []
         planned_results: Dict[str, TaskResult] = {}
         blocked_results: Dict[str, TaskResult] = {}
         executed_results: Dict[str, TaskResult] = {}
-        
+
         try:
             # Resolve dependencies
             tasks = self._resolve_dependencies(target_set)
-            
+
             logger.info(f"[DAG] Resolved {len(tasks)} tasks for targets: {target_set}")
             for task in tasks:
                 logger.debug(f"[DAG]   Task '{task.name}' (produces: {task.produces})")
-            
+
             if not tasks:
                 logger.warning("[DAG] No tasks to run (all outputs exist)")
                 result.missing_targets = {
@@ -806,12 +807,12 @@ class AnalysisRunner:
                         result.error = f"Missing targets: {sorted(result.missing_targets)}"
                 result.total_elapsed_seconds = time.time() - start
                 return result
-            
+
             # Three-pass filtering:
             # Pass 1: Find all tasks that should run (outputs missing or need upgrade)
             tasks_that_should_run: List[tuple[Task, str]] = []
             will_be_produced: Set[str] = set()
-            
+
             for task in tasks:
                 should_run, reason = self._should_run_task(task)
                 if should_run:
@@ -821,7 +822,7 @@ class AnalysisRunner:
                     status = "disabled" if reason == "disabled by config" else "skipped"
                     planned_results[task.name] = TaskResult(task_name=task.name, status=status, error=reason)
                     logger.debug(f"[DAG] Skipping '{task.name}': {reason}")
-            
+
             # Pass 2: Re-check tasks that were skipped - they might need upgrade
             # now that we know what will_be_produced contains.
             # IMPORTANT: If an upgrade trigger is being PRODUCED in this run (recomputed),
@@ -850,7 +851,7 @@ class AnalysisRunner:
                 # Skip remaining checks if task has no upgrade triggers.
                 if not task.upgrade_triggers:
                     continue
-                    
+
                 # Check upgrade triggers against will_be_produced
                 trigger_will_be_produced = task.upgrade_triggers & will_be_produced
                 if trigger_will_be_produced:
@@ -862,7 +863,7 @@ class AnalysisRunner:
                     planned_results.pop(task.name, None)
                     logger.info(f"[DAG] Adding '{task.name}' for upgrade: {trigger_will_be_produced}")
                     continue
-                
+
                 # Also check: task output exists, but was created WITHOUT a trigger that now exists
                 # This catches the case where highlights_candidates ran before boundary_graph existed
                 all_outputs_exist = all(self._artifact_exists(a) for a in task.produces)
@@ -884,7 +885,7 @@ class AnalysisRunner:
                             will_be_produced.update(task.produces)
                             planned_results.pop(task.name, None)
                             logger.info(f"[DAG] Adding '{task.name}' for upgrade (new sources): {new_sources}")
-            
+
             # Pass 3: Filter to tasks that can run (considering what will be produced)
             tasks_to_run: List[tuple[Task, str]] = []
             for task, reason in tasks_that_should_run:
@@ -895,7 +896,7 @@ class AnalysisRunner:
                 else:
                     logger.warning(f"[DAG] Cannot run '{task.name}': {dep_reason}")
                     blocked_results[task.name] = TaskResult(task_name=task.name, status="skipped", error=dep_reason)
-            
+
             if not tasks_to_run:
                 logger.warning(f"[DAG] All {len(tasks)} tasks skipped (outputs exist or can't run)")
                 all_results: Dict[str, TaskResult] = {}
@@ -922,34 +923,34 @@ class AnalysisRunner:
                             result.error = f"Missing targets: {sorted(result.missing_targets)}"
                 result.total_elapsed_seconds = time.time() - start
                 return result
-            
+
             # Group tasks into parallel levels based on dependencies
             # Level 0: tasks with no unsatisfied dependencies
             # Level 1: tasks that depend only on level 0 outputs
             # etc.
             levels = self._group_tasks_by_level(tasks_to_run)
-            
+
             logger.info(f"[DAG] Grouped {len(tasks_to_run)} tasks into {len(levels)} parallel levels:")
             for level_idx, level_tasks in enumerate(levels):
                 task_names = [t.name for t, _ in level_tasks]
                 logger.info(f"[DAG]   Level {level_idx}: {task_names}")
-            
+
             # Calculate progress: each level gets equal weight
             completed_tasks = 0
             total_tasks = len(tasks_to_run)
-            
+
             # Run each level - tasks within a level run in parallel
             for level_idx, level_tasks in enumerate(levels):
                 level_start_progress = completed_tasks / total_tasks if total_tasks > 0 else 0
-                
+
                 if len(level_tasks) == 1:
                     # Single task - run directly (no threading overhead)
                     task, reason = level_tasks[0]
                     logger.info(f"[DAG] Running task '{task.name}' ({reason})")
-                    
+
                     if self.on_progress:
                         self.on_progress(level_start_progress, f"Running {task.name}...")
-                    
+
                     task_result = self._run_task(
                         task,
                         task_progress_base=level_start_progress,
@@ -987,15 +988,15 @@ class AnalysisRunner:
                     # Multiple tasks - run in parallel
                     parallel_names = [t.name for t, _ in level_tasks]
                     logger.info(f"[DAG] Running {len(level_tasks)} tasks in parallel: {parallel_names}")
-                    
+
                     if self.on_progress:
                         self.on_progress(level_start_progress, f"Running {', '.join(parallel_names)} in parallel...")
-                    
+
                     # Use ThreadPoolExecutor for parallel execution
                     # Limit to 4 workers to avoid overwhelming the system
                     max_workers = min(4, len(level_tasks))
                     cancelled = False
-                    
+
                     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                         future_to_task: Dict[concurrent.futures.Future, tuple[Task, str]] = {}
                         future_started_at: Dict[concurrent.futures.Future, float] = {}
@@ -1049,7 +1050,7 @@ class AnalysisRunner:
                                 break
 
                         _fill_slots()
-                        
+
                         heartbeat_s = 30.0
                         try:
                             env = os.environ.get("VP_DAG_HEARTBEAT_SECONDS", "").strip()
@@ -1093,7 +1094,7 @@ class AnalysisRunner:
                                     task_result = future.result()
                                     executed_results[task.name] = task_result
                                     completed_tasks += 1
-                                    
+
                                     if task_result.status == "completed":
                                         produced = sorted(task_result.artifacts_produced) if task_result.artifacts_produced else []
                                         if produced:
@@ -1137,27 +1138,27 @@ class AnalysisRunner:
 
                             # Submit more tasks if we have capacity (and GPU slots available).
                             _fill_slots()
-                    
+
                     # If cancelled, stop immediately
                     if cancelled:
-                        logger.info(f"[DAG] Stopping due to cancellation")
+                        logger.info("[DAG] Stopping due to cancellation")
                         result.success = False
                         result.error = "Cancelled by user"
                         break
-                    
+
                     # If any task in this level failed, stop processing further levels
                     if not result.success:
                         logger.warning(f"[DAG] Stopping after level {level_idx} due to task failure")
                         break
-            
+
             if self.on_progress:
                 self.on_progress(1.0, "Analysis complete")
-            
+
         except Exception as e:
             result.success = False
             result.error = str(e)
             logger.error(f"[DAG] Analysis failed: {e}")
-        
+
         all_results: Dict[str, TaskResult] = {}
         all_results.update(planned_results)
         all_results.update(blocked_results)
@@ -1196,7 +1197,7 @@ def run_analysis(
     upgrade_mode: bool = False,
 ) -> AnalysisResult:
     """Convenience function to run analysis.
-    
+
     Args:
         proj: Project to analyze
         targets: Artifact names to produce
@@ -1205,7 +1206,7 @@ def run_analysis(
         on_progress: Progress callback
         llm_complete: LLM function for semantic tasks
         upgrade_mode: Re-run tasks when upgrade triggers are satisfied
-        
+
     Returns:
         AnalysisResult
     """
@@ -1214,7 +1215,7 @@ def run_analysis(
         proj_data = get_project_data(proj)
         profile = proj_data.get("profile", {})
         config = profile.get("analysis", {})
-    
+
     runner = AnalysisRunner(
         proj,
         config,
@@ -1222,5 +1223,5 @@ def run_analysis(
         llm_complete=llm_complete,
         upgrade_mode=upgrade_mode,
     )
-    
+
     return runner.run(targets=targets, bundle=bundle)

@@ -12,7 +12,7 @@ Downloads videos from supported URLs (YouTube, Twitch, etc.) with:
     - `ingest.models` for data models
     - `ingest.tuner` for adaptive concurrency
     - `ingest.postprocess` for post-processing
-    
+
     Consider using those modules instead for new code.
 """
 
@@ -22,7 +22,6 @@ import json
 import os
 import re
 import subprocess
-import sys
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum
@@ -31,8 +30,8 @@ from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
 from ..ffmpeg import _require_cmd
-from ..utils import subprocess_flags as _subprocess_flags, utc_iso as _utc_iso
-
+from ..utils import subprocess_flags as _subprocess_flags
+from ..utils import utc_iso as _utc_iso
 
 # ---------------------------------------------------------------------------
 # Speed Mode / Adaptive Concurrency
@@ -132,17 +131,17 @@ def _looks_like_throttle(error: Exception) -> bool:
 @dataclass
 class DownloadOptions:
     """Options for URL download."""
-    
+
     # Output settings
     output_dir: Optional[Path] = None
-    
+
     # Download behavior
     no_playlist: bool = True
     best_quality: bool = True
-    
+
     # Speed / concurrency settings
     speed_mode: SpeedMode = SpeedMode.AUTO
-    
+
     # Post-processing
     create_preview: bool = True  # Create H.264/AAC proxy for browser
     preview_height: int = 720    # Preview resolution
@@ -152,22 +151,22 @@ class DownloadOptions:
 @dataclass
 class DownloadResult:
     """Result of a URL download."""
-    
+
     # Paths
     video_path: Path
     info_json_path: Optional[Path] = None
     preview_path: Optional[Path] = None
-    
+
     # Metadata from yt-dlp
     title: str = ""
     url: str = ""
     extractor: str = ""
     video_id: str = ""
     duration_seconds: float = 0.0
-    
+
     # Status
     created_at: str = field(default_factory=_utc_iso)
-    
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "video_path": str(self.video_path),
@@ -201,16 +200,16 @@ def _sanitize_filename(name: str, max_length: int = 100) -> str:
     name = re.sub(r'[<>:"/\\|?*]', '_', name)
     name = re.sub(r'[\x00-\x1f]', '', name)
     name = name.strip('. ')
-    
+
     if len(name) > max_length:
         name = name[:max_length].strip()
-    
+
     return name or "video"
 
 
 def _needs_preview(video_path: Path) -> bool:
     """Check if video needs a browser-friendly preview.
-    
+
     Returns True if the video is not H.264/AAC in MP4 container.
     """
     try:
@@ -227,34 +226,34 @@ def _needs_preview(video_path: Path) -> bool:
             timeout=30,
             **_subprocess_flags(),
         )
-        
+
         if result.returncode != 0:
             return True  # If we can't probe, assume we need preview
-        
+
         data = json.loads(result.stdout)
         streams = data.get("streams", [])
-        
+
         video_codec = None
         audio_codec = None
-        
+
         for stream in streams:
             codec_type = stream.get("codec_type")
             codec_name = stream.get("codec_name", "").lower()
-            
+
             if codec_type == "video" and video_codec is None:
                 video_codec = codec_name
             elif codec_type == "audio" and audio_codec is None:
                 audio_codec = codec_name
-        
+
         # Browser-friendly: H.264 video + AAC audio
         is_h264 = video_codec in ("h264", "avc", "avc1")
         is_aac = audio_codec in ("aac", "mp4a") or audio_codec is None  # No audio is ok
-        
+
         # Also check container (should be mp4)
         is_mp4 = video_path.suffix.lower() in (".mp4", ".m4v")
-        
+
         return not (is_h264 and is_aac and is_mp4)
-        
+
     except Exception:
         return True  # If anything fails, create preview to be safe
 
@@ -267,21 +266,21 @@ def _create_preview(
     on_progress: Optional[ProgressCallback] = None,
 ) -> bool:
     """Create a browser-friendly H.264/AAC preview.
-    
+
     Attempts hardware acceleration (AMF > NVENC > QSV > CPU) for faster encoding.
-    
+
     Returns True on success.
     """
     try:
         ffmpeg = _require_cmd("ffmpeg")
-        
+
         if on_progress:
             on_progress(0.95, "Creating browser preview...")
-        
+
         # Scale to target height while maintaining aspect ratio
         # -2 ensures width is divisible by 2 (required for H.264)
         scale_filter = f"scale=-2:{height}"
-        
+
         # Try hardware encoders in order: AMF (AMD) > NVENC (NVIDIA) > QSV (Intel) > CPU
         encoder_configs = [
             # AMD AMF
@@ -305,7 +304,7 @@ def _create_preview(
                 "opts": ["-preset", "veryfast", "-crf", str(crf)],
             },
         ]
-        
+
         for config in encoder_configs:
             cmd = [
                 ffmpeg, "-y",
@@ -318,7 +317,7 @@ def _create_preview(
                 "-movflags", "+faststart",
                 str(preview_path),
             ]
-            
+
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -326,19 +325,19 @@ def _create_preview(
                 timeout=3600,
                 **_subprocess_flags(),
             )
-            
+
             if result.returncode == 0 and preview_path.exists():
                 return True
-            
+
             # Clean up partial file before trying next encoder
             if preview_path.exists():
                 try:
                     preview_path.unlink()
                 except Exception:
                     pass
-        
+
         return False
-        
+
     except Exception:
         return False
 
@@ -349,18 +348,18 @@ def download_url(
     on_progress: Optional[ProgressCallback] = None,
 ) -> DownloadResult:
     """Download a video from a URL using yt-dlp.
-    
+
     .. deprecated::
         Use `videopipeline.ingest.ytdlp_runner.download_url` instead.
-    
+
     Args:
         url: The URL to download from
         options: Download options (uses defaults if None)
         on_progress: Callback for progress updates (fraction, message)
-    
+
     Returns:
         DownloadResult with paths and metadata
-    
+
     Raises:
         ImportError: If yt-dlp is not installed
         RuntimeError: If download fails
@@ -371,44 +370,44 @@ def download_url(
         DeprecationWarning,
         stacklevel=2,
     )
-    
+
     try:
         from yt_dlp import YoutubeDL
     except ImportError:
         raise ImportError("yt-dlp is required for URL downloads. Install with: pip install yt-dlp")
-    
+
     options = options or DownloadOptions()
     output_dir = options.output_dir or _default_downloads_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     domain = _get_domain(url)
-    
+
     # Determine initial concurrency based on speed mode
     if options.speed_mode == SpeedMode.AUTO:
         current_n = _load_best_n(domain, default=SPEED_MODE_N[SpeedMode.FAST])
     else:
         current_n = SPEED_MODE_N[options.speed_mode]
-    
+
     min_n = 2
     max_attempts = 3
-    
+
     # Progress hook for yt-dlp
     download_progress = {"phase": "extracting", "last_percent": 0.0}
-    
+
     def progress_hook(d: dict[str, Any]) -> None:
         status = d.get("status")
-        
+
         if status == "downloading":
             download_progress["phase"] = "downloading"
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             downloaded = d.get("downloaded_bytes", 0)
-            
+
             if total and total > 0:
                 percent = downloaded / total
                 # Map to 0-0.9 range (leave room for post-processing)
                 mapped = percent * 0.9
                 download_progress["last_percent"] = mapped
-                
+
                 if on_progress:
                     speed = d.get("speed")
                     speed_str = f" ({speed/1024/1024:.1f} MB/s)" if speed else ""
@@ -417,16 +416,16 @@ def download_url(
             else:
                 if on_progress:
                     on_progress(download_progress["last_percent"], "Downloading...")
-                    
+
         elif status == "finished":
             download_progress["phase"] = "postprocessing"
             if on_progress:
                 on_progress(0.92, "Download complete. Processing...")
-    
+
     # Retry loop with backoff
     last_error: Optional[Exception] = None
     info: Optional[dict[str, Any]] = None
-    
+
     for attempt in range(max_attempts):
         # Configure yt-dlp with adaptive concurrency
         ydl_opts: dict[str, Any] = {
@@ -441,7 +440,7 @@ def download_url(
             "hls_prefer_native": True,
             "concurrent_fragment_downloads": current_n,
         }
-        
+
         # Format selection
         if options.best_quality:
             # Best video+audio, prefer mp4
@@ -450,65 +449,65 @@ def download_url(
         else:
             # Just best combined format
             ydl_opts["format"] = "best[ext=mp4]/best"
-        
+
         if on_progress:
             if attempt == 0:
                 on_progress(0.0, f"Extracting video info... (N={current_n})")
             else:
                 on_progress(0.0, f"Retrying with N={current_n}...")
-        
+
         # Download
         try:
             with YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-            
+
             # Success! Save the working N value for AUTO mode
             if options.speed_mode == SpeedMode.AUTO:
                 _save_best_n(domain, current_n, ok=True)
             break
-            
+
         except Exception as e:
             last_error = e
-            
+
             # Check if it looks like throttling
             if _looks_like_throttle(e) and current_n > min_n:
                 # Back off: halve concurrency
                 old_n = current_n
                 current_n = max(min_n, current_n // 2)
-                
+
                 if options.speed_mode == SpeedMode.AUTO:
                     _save_best_n(domain, current_n, ok=False)
-                
+
                 if on_progress:
                     on_progress(0.0, f"Throttled at N={old_n}, backing off to N={current_n}...")
                 continue
             else:
                 # Not throttle-related or can't back off further
                 raise RuntimeError(f"Download failed: {e}")
-    
+
     if not info:
         raise RuntimeError(f"Download failed after {max_attempts} attempts: {last_error}")
-    
+
     if on_progress:
         on_progress(0.93, "Finding downloaded files...")
-    
+
     # Find the downloaded video file
     video_id = info.get("id", "unknown")
     title = info.get("title", "video")
-    
+
     # yt-dlp may have downloaded to various locations; find the newest mp4/mkv/webm
     video_exts = {".mp4", ".mkv", ".webm", ".m4v", ".avi", ".mov"}
     candidates = []
     for ext in video_exts:
         candidates.extend(output_dir.glob(f"*{ext}"))
-    
+
     if not candidates:
         raise RuntimeError("No video file found after download")
-    
+
     # Sort by modification time, newest first
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     video_path = candidates[0]
-    
+
     # Find info.json
     info_json_path = None
     possible_info_paths = [
@@ -519,7 +518,7 @@ def download_url(
         if p.exists():
             info_json_path = p
             break
-    
+
     # Build result
     result = DownloadResult(
         video_path=video_path,
@@ -530,14 +529,14 @@ def download_url(
         video_id=video_id,
         duration_seconds=float(info.get("duration", 0) or 0),
     )
-    
+
     # Create preview if needed
     if options.create_preview and _needs_preview(video_path):
         if on_progress:
             on_progress(0.95, "Creating browser-friendly preview...")
-        
+
         preview_path = video_path.parent / f"{video_path.stem}_preview.mp4"
-        
+
         if _create_preview(
             video_path,
             preview_path,
@@ -546,8 +545,8 @@ def download_url(
             on_progress=on_progress,
         ):
             result.preview_path = preview_path
-    
+
     if on_progress:
         on_progress(1.0, "Download complete!")
-    
+
     return result

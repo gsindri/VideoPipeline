@@ -9,10 +9,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from videopipeline.ingest.downloader import (
+    SPEED_MODE_N,
     DownloadOptions,
     DownloadResult,
     SpeedMode,
-    SPEED_MODE_N,
     _default_downloads_dir,
     _get_domain,
     _looks_like_throttle,
@@ -304,7 +304,7 @@ class TestTuningState:
 
     def test_load_save_best_n(self, tmp_path: Path):
         """Can save and load best N values."""
-        from videopipeline.ingest.downloader import _load_best_n, _save_best_n, _tuning_file_path
+        from videopipeline.ingest.downloader import _load_best_n, _save_best_n
 
         with patch('videopipeline.ingest.downloader._tuning_file_path', return_value=tmp_path / 'tuning.json'):
             # Initially returns default
@@ -321,7 +321,7 @@ class TestTuningState:
 
     def test_tuning_file_structure(self, tmp_path: Path):
         """Tuning file has correct JSON structure."""
-        from videopipeline.ingest.downloader import _save_best_n, _load_tuning
+        from videopipeline.ingest.downloader import _save_best_n
 
         tuning_file = tmp_path / 'tuning.json'
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Protocol, runtime_checkable
 
@@ -156,7 +156,7 @@ BackendType = Literal[
 @dataclass
 class TranscriberConfig:
     """Configuration for transcription engine.
-    
+
     Attributes:
         backend: Which engine to use
                  ("openai_whisper", "faster_whisper", "whispercpp", "nemo_asr", "assemblyai", "auto")
@@ -191,13 +191,13 @@ class TranscriberConfig:
     compute_type: str = "int8"  # For faster-whisper: int8 (CPU), float16 (GPU)
     strict: bool = False  # If True, don't fall back to other backends
     verbose: bool = False  # If True, print transcript to console during transcription
-    
+
     # Speaker diarization options
     diarize: bool = False  # Enable speaker diarization
     diarize_min_speakers: Optional[int] = None  # Min speakers (None = auto-detect)
     diarize_max_speakers: Optional[int] = None  # Max speakers (None = auto-detect)
     hf_token: Optional[str] = None  # Hugging Face token for pyannote
-    
+
     # Model path override (if using local models)
     model_path: Optional[str] = None
 
@@ -279,17 +279,17 @@ class TranscriberConfig:
 @runtime_checkable
 class Transcriber(Protocol):
     """Protocol for transcription backends."""
-    
+
     @property
     def backend_name(self) -> str:
         """Name of this backend (e.g., 'whispercpp', 'faster_whisper')."""
         ...
-    
+
     @property
     def gpu_available(self) -> bool:
         """Whether GPU acceleration is available for this backend."""
         ...
-    
+
     def transcribe(
         self,
         audio_path: Path,
@@ -297,11 +297,11 @@ class Transcriber(Protocol):
         on_progress: Optional[Callable[[float], None]] = None,
     ) -> TranscriptResult:
         """Transcribe an audio file.
-        
+
         Args:
             audio_path: Path to WAV file (16kHz mono recommended)
             on_progress: Optional callback for progress updates (0.0 to 1.0)
-            
+
         Returns:
             TranscriptResult with segments, language, and metadata
         """
@@ -310,28 +310,28 @@ class Transcriber(Protocol):
 
 class BaseTranscriber(ABC):
     """Abstract base class for transcription backends."""
-    
+
     def __init__(self, config: TranscriberConfig):
         self.config = config
         self._model = None
-    
+
     @property
     @abstractmethod
     def backend_name(self) -> str:
         """Name of this backend."""
         pass
-    
+
     @property
     @abstractmethod
     def gpu_available(self) -> bool:
         """Whether GPU is available."""
         pass
-    
+
     @abstractmethod
     def _load_model(self) -> Any:
         """Load the transcription model."""
         pass
-    
+
     @abstractmethod
     def transcribe(
         self,
@@ -341,13 +341,13 @@ class BaseTranscriber(ABC):
     ) -> TranscriptResult:
         """Transcribe an audio file."""
         pass
-    
+
     def ensure_model_loaded(self) -> Any:
         """Ensure the model is loaded, loading it if necessary."""
         if self._model is None:
             self._model = self._load_model()
         return self._model
-    
+
     def unload_model(self) -> None:
         """Unload the model to free memory (especially GPU VRAM)."""
         if self._model is not None:

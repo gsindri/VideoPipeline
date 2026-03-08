@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -136,7 +136,7 @@ def scan_project_exports(exports_dir: Path) -> List[ExportInfo]:
 
 def is_safe_export_path(file_path: Path, exports_dir: Path) -> bool:
     """Check that the file path is inside the exports directory.
-    
+
     This prevents publishing arbitrary files on the system.
     """
     try:
@@ -154,7 +154,7 @@ def create_publisher_router(
     job_store: PublishJobStore,
 ) -> APIRouter:
     """Create the publisher API router.
-    
+
     Args:
         get_exports_dir: Callable that returns the current project's exports directory,
                          or None if no project is active.
@@ -201,7 +201,7 @@ def create_publisher_router(
     @router.post("/queue")
     def queue_publish(body: Dict[str, Any] = Body(...)) -> JSONResponse:  # type: ignore[valid-type]
         """Queue a single publish job.
-        
+
         Body:
             account_id: str - The account to publish to
             export_id: str - The export ID (mp4 filename stem) to publish
@@ -271,13 +271,13 @@ def create_publisher_router(
     @router.post("/queue_batch")
     def queue_publish_batch(body: Dict[str, Any] = Body(...)) -> JSONResponse:  # type: ignore[valid-type]
         """Queue multiple publish jobs.
-        
+
         Body:
             account_ids: list[str] - Account IDs to publish to
             export_ids: list[str] - Export IDs to publish
             options: dict - Shared options (privacy, etc.)
             stagger_seconds: int - Seconds between scheduled jobs (default 0)
-        
+
         Creates one job per (export, account) combination.
         If stagger_seconds > 0, jobs are scheduled with increasing delays.
         """
@@ -286,7 +286,6 @@ def create_publisher_router(
         account_ids = body.get("account_ids") or []
         export_ids = body.get("export_ids") or []
         options = body.get("options") or {}
-        stagger_seconds = int(body.get("stagger_seconds", 0))
 
         if not account_ids:
             raise HTTPException(status_code=400, detail="account_ids_required")
@@ -372,7 +371,7 @@ def create_publisher_router(
     @router.get("/jobs")
     def get_jobs(limit: int = 100, project_only: bool = True) -> JSONResponse:
         """List publish jobs.
-        
+
         If project_only=True (default), filters to jobs whose file_path
         is inside the active project's exports directory.
         """
@@ -412,7 +411,7 @@ def create_publisher_router(
     @router.get("/jobs/stream")
     def jobs_stream() -> StreamingResponse:
         """SSE stream of job updates.
-        
+
         Emits job updates whenever a job's updated_at changes.
         Useful for real-time progress tracking in the UI.
         """

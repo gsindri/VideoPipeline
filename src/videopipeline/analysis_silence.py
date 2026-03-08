@@ -47,11 +47,11 @@ class SilenceInterval:
 
 def parse_silencedetect_output(stderr: str, duration_s: float = 0.0) -> List[SilenceInterval]:
     """Parse FFmpeg silencedetect filter output.
-    
+
     Example output lines:
         [silencedetect @ 0x...] silence_start: 123.456
         [silencedetect @ 0x...] silence_end: 124.789 | silence_duration: 1.333
-    
+
     Args:
         stderr: FFmpeg stderr output
         duration_s: Video duration (used to close final open interval at EOF)
@@ -91,18 +91,18 @@ def detect_silence(
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> List[SilenceInterval]:
     """Run FFmpeg silencedetect filter on video.
-    
+
     Args:
         video_path: Path to the video file
         cfg: Silence detection configuration
         duration_s: Video duration (for handling EOF silence)
         on_progress: Optional progress callback
-        
+
     Returns:
         List of SilenceInterval objects
     """
     _require_cmd("ffmpeg")
-    
+
     # Helper for progress reporting with optional message
     def _report(frac: float, msg: str = "") -> None:
         if on_progress:
@@ -159,22 +159,22 @@ def compute_silence_analysis(
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Detect silence intervals and save to project.
-    
+
     Persists:
       - analysis/silence.json
       - project.json -> analysis.silence section
     """
     from .ffmpeg import ffprobe_duration_seconds
-    
+
     video_path = Path(source_audio_path) if source_audio_path is not None else Path(proj.audio_source)
-    
+
     # Get duration for EOF handling
     try:
         duration_s = ffprobe_duration_seconds(video_path)
     except Exception as exc:
         logger.warning("[silence] Failed to get duration via ffprobe (%s): %s", video_path, exc)
         duration_s = 0.0
-    
+
     # Helper for progress reporting with optional message
     def _report(frac: float, msg: str = "") -> None:
         if on_progress:
@@ -231,7 +231,7 @@ def load_silence_intervals(proj: Project) -> Optional[List[SilenceInterval]]:
 
 def get_silence_boundaries(silences: List[SilenceInterval]) -> Dict[str, List[float]]:
     """Extract boundary timestamps from silence intervals.
-    
+
     Returns:
         Dict with:
           - silence_starts: Times where silence begins (good end points)

@@ -17,12 +17,12 @@ Usage:
         merge_diarization_with_transcript,
         is_diarization_available,
     )
-    
+
     # Check if available
     if is_diarization_available():
         # Run diarization
         diarization = diarize_audio(audio_path, hf_token="your_token")
-        
+
         # Merge with existing transcript
         result = merge_diarization_with_transcript(transcript_result, diarization)
 """
@@ -34,6 +34,7 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass, field
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -791,47 +792,47 @@ class DiarizationSegment:
     speaker: str  # e.g., "SPEAKER_00", "SPEAKER_01"
     start: float  # Start time in seconds
     end: float    # End time in seconds
-    
+
     @property
     def duration(self) -> float:
         return self.end - self.start
 
 
-@dataclass 
+@dataclass
 class DiarizationResult:
     """Result of speaker diarization."""
     segments: List[DiarizationSegment]
     speakers: List[str]  # Unique speaker labels
     duration_seconds: float
     meta: Dict[str, Any] = field(default_factory=dict)
-    
+
     def get_speaker_at_time(self, time_s: float) -> Optional[str]:
         """Get the speaker label at a specific time."""
         for seg in self.segments:
             if seg.start <= time_s < seg.end:
                 return seg.speaker
         return None
-    
+
     def get_dominant_speaker_in_range(
-        self, 
-        start_s: float, 
+        self,
+        start_s: float,
         end_s: float
     ) -> Optional[str]:
         """Get the speaker with most speaking time in a range."""
         speaker_times: Dict[str, float] = {}
-        
+
         for seg in self.segments:
             # Check overlap
             overlap_start = max(seg.start, start_s)
             overlap_end = min(seg.end, end_s)
-            
+
             if overlap_start < overlap_end:
                 duration = overlap_end - overlap_start
                 speaker_times[seg.speaker] = speaker_times.get(seg.speaker, 0.0) + duration
-        
+
         if not speaker_times:
             return None
-        
+
         return max(speaker_times.items(), key=lambda x: x[1])[0]
 
 
@@ -968,11 +969,7 @@ def _collapse_to_max_speakers(
 def is_diarization_available() -> bool:
     """Check if pyannote-audio is installed and available."""
     _maybe_add_windows_ffmpeg_dll_dir()
-    try:
-        import pyannote.audio
-        return True
-    except ImportError:
-        return False
+    return find_spec("pyannote.audio") is not None
 
 
 def get_hf_token(hf_token: Optional[str] = None) -> Optional[str]:
@@ -987,21 +984,21 @@ def _load_diarization_pipeline(
     use_gpu: bool = True,
 ) -> Any:
     """Load the pyannote diarization pipeline.
-    
+
     Args:
         hf_token: Hugging Face token (required for model download)
         use_gpu: Whether to use GPU acceleration
-        
+
     Returns:
         Loaded Pipeline instance
-        
+
     Raises:
         ImportError: If pyannote-audio is not installed
         ValueError: If no HF token provided
     """
     global _diarization_pipeline
     global _diarization_pipeline_model_id
-    
+
     model_id = (os.environ.get("VP_DIARIZATION_MODEL_ID") or "").strip() or _MODEL_ID
 
     if _diarization_pipeline is not None and _diarization_pipeline_model_id == model_id:
@@ -1027,7 +1024,7 @@ def _load_diarization_pipeline(
         message=r"std\\(\\): degrees of freedom is <= 0\\..*",
         module=r"pyannote\\.audio\\.models\\.blocks\\.pooling",
     )
-    
+
     try:
         from pyannote.audio import Pipeline
     except ImportError as e:
@@ -1035,7 +1032,7 @@ def _load_diarization_pipeline(
             "pyannote-audio is required for speaker diarization. "
             "Install with: pip install pyannote-audio"
         ) from e
-    
+
     token = get_hf_token(hf_token)
     if not token:
         raise ValueError(
@@ -1043,7 +1040,7 @@ def _load_diarization_pipeline(
             "Set HF_TOKEN environment variable or pass hf_token parameter. "
             "Get your token at https://huggingface.co/settings/tokens"
         )
-    
+
     _log.info("Loading pyannote diarization pipeline...")
 
     # Preflight Hugging Face access check. This avoids some upstream libraries
@@ -1082,7 +1079,7 @@ def _load_diarization_pipeline(
                 )
         except Exception as exc:
             _log.warning("ROCm dropout workaround failed (continuing): %s", exc)
-    
+
     # Move to GPU if available and requested
     if use_gpu:
         try:
@@ -1109,7 +1106,7 @@ def _load_diarization_pipeline(
                 _log.info("Diarization pipeline using CPU (no GPU available)")
         except Exception as e:
             _log.warning(f"Failed to move diarization to GPU: {e}, using CPU")
-    
+
     _diarization_pipeline = pipeline
     _diarization_pipeline_model_id = model_id
     return pipeline
@@ -1143,7 +1140,7 @@ def diarize_audio(
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> DiarizationResult:
     """Run speaker diarization on an audio file.
-    
+
     Args:
         audio_path: Path to audio file (WAV recommended)
         hf_token: Hugging Face token for model access
@@ -1151,10 +1148,10 @@ def diarize_audio(
         min_speakers: Minimum expected speakers (None for auto)
         max_speakers: Maximum expected speakers (None for auto)
         on_progress: Optional progress callback
-        
+
     Returns:
         DiarizationResult with speaker segments
-        
+
     Raises:
         ImportError: If pyannote-audio not installed
         ValueError: If no HF token available
@@ -1214,17 +1211,17 @@ def diarize_audio(
     )
 
     _report(0.05, "init")
-    
+
     _log.info(f"Starting speaker diarization for: {audio_path.name}")
 
     model_id = (os.environ.get("VP_DIARIZATION_MODEL_ID") or "").strip() or _MODEL_ID
-    
+
     t_load0 = time.time()
     pipeline = _load_diarization_pipeline(hf_token=hf_token, use_gpu=use_gpu)
     load_s = time.time() - t_load0
-    
+
     _report(0.12, "pipeline loaded")
-    
+
     # Build pipeline parameters
     params: Dict[str, Any] = {}
     if min_speakers is not None:
@@ -1345,7 +1342,7 @@ def diarize_audio(
                 hook = None
                 return pipeline(inp, **params)
             raise
-    
+
     # Run diarization
     _log.info(f"Running diarization (min_speakers={min_speakers}, max_speakers={max_speakers})...")
     used_waveform_input = False
@@ -1379,9 +1376,9 @@ def diarize_audio(
             except Exception:
                 pass
     run_s = time.time() - t_run0
-    
+
     _report(0.94, "post")
-    
+
     # Convert pyannote output to our format.
     #
     # pyannote-audio v3 speaker diarization returns a `DiarizeOutput` dataclass by
@@ -1417,7 +1414,7 @@ def diarize_audio(
         speakers_set.add(speaker)
     convert_s = time.time() - t_conv0
     _report(0.98, "finalize")
-    
+
     # Sort by start time
     segments.sort(key=lambda s: s.start)
 
@@ -1430,10 +1427,10 @@ def diarize_audio(
             max_s = 0
         if max_s > 0:
             segments = _collapse_to_max_speakers(segments, max_speakers=max_s, merge_gap_s=0.2)
-    
+
     # Duration is max end-time (segments may overlap).
     duration = max((s.end for s in segments), default=0.0)
-    
+
     speakers = sorted({str(s.speaker) for s in segments})
     _log.info(f"Diarization complete: found {len(speakers)} speakers, {len(segments)} segments")
     total_s = time.time() - t_total0
@@ -1446,9 +1443,9 @@ def diarize_audio(
         float(total_s),
         device_fp,
     )
-    
+
     _report(1.0)
-    
+
     return DiarizationResult(
         segments=segments,
         speakers=speakers,
@@ -1498,25 +1495,25 @@ def merge_diarization_with_transcript(
     diarization: DiarizationResult,
 ) -> TranscriptResult:
     """Merge speaker diarization results with a transcript.
-    
+
     This assigns speaker labels to transcript segments and words
     based on timing overlap with diarization segments.
-    
+
     Args:
         transcript: Original transcript (from Whisper or similar)
         diarization: Speaker diarization results
-        
+
     Returns:
         New TranscriptResult with speaker labels added
     """
     _log.info(f"Merging diarization ({len(diarization.speakers)} speakers) with transcript ({len(transcript.segments)} segments)")
-    
+
     new_segments: List[TranscriptSegment] = []
-    
+
     for seg in transcript.segments:
         # Get dominant speaker for this segment
         speaker = diarization.get_dominant_speaker_in_range(seg.start, seg.end)
-        
+
         # Also assign speakers to individual words if available
         new_words: Optional[List[TranscriptWord]] = None
         if seg.words:
@@ -1532,7 +1529,7 @@ def merge_diarization_with_transcript(
                     probability=word.probability,
                     speaker=word_speaker or speaker,  # Fall back to segment speaker
                 ))
-        
+
         new_segments.append(TranscriptSegment(
             start=seg.start,
             end=seg.end,
@@ -1540,7 +1537,7 @@ def merge_diarization_with_transcript(
             words=new_words,
             speaker=speaker,
         ))
-    
+
     return TranscriptResult(
         segments=new_segments,
         language=transcript.language,
@@ -1563,10 +1560,10 @@ def transcribe_with_diarization(
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> TranscriptResult:
     """Convenience function to transcribe and diarize in one call.
-    
+
     Runs transcription and diarization in parallel-ish fashion
     (diarization after transcription), then merges results.
-    
+
     Args:
         audio_path: Path to audio file
         transcriber: Transcriber instance to use
@@ -1575,22 +1572,22 @@ def transcribe_with_diarization(
         min_speakers: Min speakers hint
         max_speakers: Max speakers hint
         on_progress: Progress callback (0.0 to 1.0)
-        
+
     Returns:
         TranscriptResult with speaker labels
     """
     def transcribe_progress(p: float) -> None:
         if on_progress:
             on_progress(p * 0.6)  # Transcription is 60% of work
-    
+
     def diarize_progress(p: float) -> None:
         if on_progress:
             on_progress(0.6 + p * 0.4)  # Diarization is 40%
-    
+
     # Step 1: Transcribe
     _log.info("Step 1: Transcribing audio...")
     transcript = transcriber.transcribe(audio_path, on_progress=transcribe_progress)
-    
+
     # Step 2: Diarize
     _log.info("Step 2: Running speaker diarization...")
     diarization = diarize_audio(
@@ -1601,9 +1598,9 @@ def transcribe_with_diarization(
         max_speakers=max_speakers,
         on_progress=diarize_progress,
     )
-    
+
     # Step 3: Merge
     _log.info("Step 3: Merging transcript with speaker labels...")
     result = merge_diarization_with_transcript(transcript, diarization)
-    
+
     return result

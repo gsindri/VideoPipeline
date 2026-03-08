@@ -863,7 +863,6 @@ def test_actions_analyze_full_external_llm_skips_local_llm(tmp_path, monkeypatch
     hdr = {"Authorization": "Bearer secret"}
 
     import videopipeline.studio.actions_api as actions_api
-    from videopipeline.studio.jobs import JOB_MANAGER
 
     pid = hashlib.sha256("twitch_999".encode("utf-8")).hexdigest()
     proj_dir = tmp_path / "outputs" / "projects" / pid
@@ -917,8 +916,8 @@ def test_actions_publish_accounts_reports_readiness(tmp_path, monkeypatch):
     client = _make_client(tmp_path, monkeypatch, token="secret")
     hdr = {"Authorization": "Bearer secret"}
 
-    from videopipeline.publisher.accounts import AccountStore
     import videopipeline.studio.actions_api as actions_api
+    from videopipeline.publisher.accounts import AccountStore
 
     store = AccountStore()
     ready = store.add(platform="youtube", label="Ready Channel")
@@ -994,8 +993,8 @@ def test_actions_publish_queue_requires_public_release_approval(tmp_path, monkey
     client = _make_client(tmp_path, monkeypatch, token="secret")
     hdr = {"Authorization": "Bearer secret"}
 
-    from videopipeline.publisher.accounts import AccountStore
     import videopipeline.studio.actions_api as actions_api
+    from videopipeline.publisher.accounts import AccountStore
 
     store = AccountStore()
     account = store.add(platform="youtube", label="Main Channel")
@@ -1047,9 +1046,9 @@ def test_actions_publish_queue_creates_jobs_and_lists_them(tmp_path, monkeypatch
     client = _make_client(tmp_path, monkeypatch, token="secret")
     hdr = {"Authorization": "Bearer secret"}
 
+    import videopipeline.studio.actions_api as actions_api
     from videopipeline.publisher.accounts import AccountStore
     from videopipeline.publisher.jobs import PublishJobStore
-    import videopipeline.studio.actions_api as actions_api
 
     store = AccountStore()
     account = store.add(platform="youtube", label="Main Channel")

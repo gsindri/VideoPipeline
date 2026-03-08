@@ -8,19 +8,17 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
-from .peaks import moving_average, robust_z
 from .project import Project, load_npz, save_json, update_project
 
 
 @dataclass(frozen=True)
 class ChatBoundaryConfig:
     """Configuration for chat boundary detection.
-    
+
     Note: valley_threshold_z and burst_threshold_z are applied to z-scored
     chat activity. Negative z-scores indicate below-average activity.
     """
@@ -131,12 +129,12 @@ def compute_chat_boundaries(
     cfg: ChatBoundaryConfig,
 ) -> Dict[str, List[float]]:
     """Compute chat valleys and bursts from chat scores.
-    
+
     Args:
         chat_scores: Hop-aligned chat activity scores (z-scored)
         hop_s: Hop size in seconds
         cfg: Boundary detection configuration
-        
+
     Returns:
         Dict with:
           - valleys: Times of low chat activity (good cut points)
@@ -174,9 +172,9 @@ def compute_chat_boundaries_analysis(
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Compute chat boundaries and save to project.
-    
+
     Requires chat_features.npz to exist.
-    
+
     Persists:
       - analysis/chat_boundaries.json
       - project.json -> analysis.chat_boundaries section
@@ -267,13 +265,13 @@ def find_nearest_valley(
     direction: str = "both",  # "before", "after", or "both"
 ) -> Optional[float]:
     """Find the nearest valley to a given time.
-    
+
     Args:
         valleys: List of valley timestamps
         time_s: Reference time
         max_distance_s: Maximum search distance
         direction: Search direction constraint
-        
+
     Returns:
         Nearest valley time, or None if not found within constraints
     """
@@ -305,7 +303,7 @@ def find_burst_in_range(
     end_s: float,
 ) -> Optional[float]:
     """Find a chat burst within a time range.
-    
+
     Returns the first burst in the range, or None if no bursts exist.
     Note: This does not consider burst intensity, just temporal ordering.
     """

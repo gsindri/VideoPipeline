@@ -8,18 +8,17 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from ..clip_variants import CandidateVariants, ClipVariant, load_clip_variants
-from ..project import Project, get_chat_config, get_project_data, save_json, update_project
 from ..analysis_transcript import load_transcript
 from ..chat.store import ChatStore
+from ..clip_variants import CandidateVariants, ClipVariant, load_clip_variants
+from ..project import Project, get_chat_config, get_project_data, save_json, update_project
 from .llm_client import (
     LLMClient,
-    LLMClientConfig,
     LLMClientError,
     LLMServerUnavailableError,
     create_llm_client,
@@ -486,12 +485,12 @@ class AIDirector:
         score_info: Optional[Dict[str, float]] = None,
     ) -> DirectorResult:
         """Process a single candidate and generate metadata.
-        
+
         Args:
             candidate: Candidate with variants
             chat_summary: Optional summary of chat activity
             score_info: Optional score breakdown
-            
+
         Returns:
             DirectorResult with variant selection and metadata
         """
@@ -534,14 +533,14 @@ def compute_director_analysis(
     on_status: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """Run AI Director on all clip variants.
-    
+
     Persists:
       - analysis/ai_director.json
       - Updates candidates in project.json with chosen_variant and metadata
     """
     import logging
     log = logging.getLogger("videopipeline.ai")
-    
+
     # Track computation time (for pipeline status timers)
     import time as _time
     start_time = _time.time()
@@ -553,13 +552,14 @@ def compute_director_analysis(
     actual_endpoint = cfg.endpoint
     if cfg.auto_start and cfg.engine == "llama_cpp_server":
         try:
-            from .llm_server import ensure_llm_server
             from pathlib import Path
-            
+
+            from .llm_server import ensure_llm_server
+
             log.info(f"[director] Auto-starting LLM server (timeout={cfg.startup_timeout_s}s)...")
             if on_status:
                 on_status("Starting LLM server...")
-            
+
             started_endpoint = ensure_llm_server(
                 server_path=Path(cfg.server_path),
                 model_path=Path(cfg.model_path),

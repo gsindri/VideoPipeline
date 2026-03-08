@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from videopipeline.transcription.base import BaseTranscriber, TranscriberConfig, TranscriptResult, TranscriptSegment
 from videopipeline.transcription import factory
 from videopipeline.transcription import nemo_asr_backend as nemo_mod
+from videopipeline.transcription.base import BaseTranscriber, TranscriberConfig, TranscriptResult, TranscriptSegment
 
 
 class _DummyNemoTranscriber(BaseTranscriber):

@@ -10,12 +10,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .accounts import AccountStore
+from .connectors import get_connector
 from .jobs import PublishJob, PublishJobStore
 from .presets import AccountPreset, apply_presets
 from .sanitize import sanitize_metadata
 from .secrets import load_tokens
 from .state import logs_dir
-from .connectors import get_connector
 
 
 def _sha256(path: Path) -> str:

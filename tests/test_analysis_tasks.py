@@ -8,8 +8,8 @@ import pytest
 def test_run_transcript_propagates_strict_and_runtime_knobs(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    from videopipeline.analysis import tasks as task_mod
     import videopipeline.analysis_transcript as transcript_mod
+    from videopipeline.analysis import tasks as task_mod
 
     captured: dict[str, object] = {}
 
@@ -51,8 +51,8 @@ def test_run_transcript_propagates_strict_and_runtime_knobs(
 
 
 def test_run_transcript_defaults_strict_false(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    from videopipeline.analysis import tasks as task_mod
     import videopipeline.analysis_transcript as transcript_mod
+    from videopipeline.analysis import tasks as task_mod
 
     captured: dict[str, object] = {}
 

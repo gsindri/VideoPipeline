@@ -59,7 +59,7 @@ def _compute_rms(samples: np.ndarray) -> float:
 
 def _compute_zcr(samples: np.ndarray) -> float:
     """Compute zero-crossing rate.
-    
+
     Higher ZCR often indicates:
     - High-pitched voices
     - Laughter
@@ -67,7 +67,7 @@ def _compute_zcr(samples: np.ndarray) -> float:
     """
     if len(samples) < 2:
         return 0.0
-    
+
     signs = np.sign(samples)
     # Count sign changes
     crossings = np.sum(np.abs(np.diff(signs)) > 0)
@@ -76,7 +76,7 @@ def _compute_zcr(samples: np.ndarray) -> float:
 
 def _compute_spectral_centroid(samples: np.ndarray, sample_rate: int) -> float:
     """Compute spectral centroid (brightness/sharpness of sound).
-    
+
     Higher centroid indicates:
     - Brighter, sharper sounds
     - Higher pitched vocalizations
@@ -84,24 +84,24 @@ def _compute_spectral_centroid(samples: np.ndarray, sample_rate: int) -> float:
     """
     if len(samples) < 64:
         return 0.0
-    
+
     # Use FFT
     fft_size = min(2048, len(samples))
     windowed = samples[:fft_size] * np.hanning(fft_size)
     spectrum = np.abs(np.fft.rfft(windowed))
-    
+
     if np.sum(spectrum) < 1e-12:
         return 0.0
-    
+
     freqs = np.fft.rfftfreq(fft_size, d=1.0/sample_rate)
     centroid = np.sum(freqs * spectrum) / (np.sum(spectrum) + 1e-12)
-    
+
     return float(centroid)
 
 
 def _compute_spectral_flux(prev_spectrum: np.ndarray, curr_spectrum: np.ndarray) -> float:
     """Compute spectral flux (rate of spectral change).
-    
+
     Higher flux indicates:
     - Rapid changes in audio
     - Bursts of sound
@@ -109,15 +109,15 @@ def _compute_spectral_flux(prev_spectrum: np.ndarray, curr_spectrum: np.ndarray)
     """
     if len(prev_spectrum) == 0 or len(curr_spectrum) == 0:
         return 0.0
-    
+
     # Normalize spectra
     prev_norm = prev_spectrum / (np.sum(prev_spectrum) + 1e-12)
     curr_norm = curr_spectrum / (np.sum(curr_spectrum) + 1e-12)
-    
+
     # Half-wave rectified difference (only increases)
     diff = curr_norm - prev_norm
     flux = float(np.sum(np.maximum(diff, 0)))
-    
+
     return flux
 
 
@@ -125,7 +125,7 @@ def _get_spectrum(samples: np.ndarray) -> np.ndarray:
     """Get magnitude spectrum of samples."""
     if len(samples) < 64:
         return np.array([])
-    
+
     fft_size = min(2048, len(samples))
     windowed = samples[:fft_size] * np.hanning(fft_size)
     return np.abs(np.fft.rfft(windowed))
@@ -170,7 +170,7 @@ def compute_reaction_audio_features(
 
     prev_spectrum = np.array([])
     processed = 0
-    
+
     # Helper for progress reporting with optional message
     def _report(frac: float, msg: str = "") -> None:
         if on_progress:
@@ -228,7 +228,7 @@ def compute_reaction_audio_features(
     zcr = np.array(zcr_values, dtype=np.float64)
     spectral_centroid = np.array(centroid_values, dtype=np.float64)
     spectral_flux = np.array(flux_values, dtype=np.float64)
-    
+
     # Create explicit times array for consistent resampling
     times = np.arange(len(rms)) * cfg.hop_seconds
 

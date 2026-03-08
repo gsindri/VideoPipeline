@@ -4,7 +4,7 @@ import importlib.util
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 from .ffmpeg import _require_cmd
 from .utils import subprocess_flags as _subprocess_flags

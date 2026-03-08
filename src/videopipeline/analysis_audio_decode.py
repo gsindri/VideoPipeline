@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, Optional
 
 import numpy as np
+
 from .ffmpeg import _require_cmd, ffprobe_duration_seconds
 from .project import Project, save_json, update_project
 from .utils import subprocess_flags as _subprocess_flags
