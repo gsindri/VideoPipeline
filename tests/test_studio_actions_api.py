@@ -41,10 +41,12 @@ def _make_client(tmp_path: Path, monkeypatch, *, token: str | None = None, profi
     import videopipeline.project as project_mod
     import videopipeline.publisher.accounts as publisher_accounts_mod
     import videopipeline.publisher.jobs as publisher_jobs_mod
+    import videopipeline.source_scout as source_scout_mod
     import videopipeline.studio.actions_api as actions_api
     from videopipeline.studio.app import create_app
 
     monkeypatch.setattr(project_mod, "default_projects_root", lambda: projects_root)
+    monkeypatch.setattr(source_scout_mod, "default_projects_root", lambda: projects_root)
     monkeypatch.setattr(actions_api, "default_projects_root", lambda: projects_root)
     monkeypatch.setattr(publisher_accounts_mod, "accounts_path", lambda: accounts_json)
     monkeypatch.setattr(publisher_jobs_mod, "publisher_db_path", lambda: publisher_db)
@@ -217,6 +219,191 @@ analysis:
     assert data["publisher"]["policy"]["default_privacy"] == "private"
     assert any("speech:" in issue for issue in data["profile"]["readiness"]["issues"])
     assert any("audio_events:" in issue for issue in data["profile"]["readiness"]["issues"])
+
+
+def test_actions_diagnostics_reports_source_scout_readiness(tmp_path, monkeypatch):
+    watchlist_dir = tmp_path / "sources"
+    watchlist_dir.mkdir(parents=True, exist_ok=True)
+    watchlist_path = watchlist_dir / "watchlist.yaml"
+    watchlist_path.write_text(
+        """
+shadow_mode: true
+sources:
+  - id: rebbi-twitch
+    label: Rebbi Twitch
+    url: https://www.twitch.tv/rebbi/videos
+    platform: twitch
+    enabled: true
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VP_SOURCE_WATCHLIST", str(watchlist_path))
+
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    r = client.get("/api/actions/diagnostics", headers=hdr)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["source_scout"]["configured"] is True
+    assert data["source_scout"]["ready"] is True
+    assert data["source_scout"]["watchlist_path"] == str(watchlist_path)
+    assert data["source_scout"]["shadow_mode"] is True
+    assert data["source_scout"]["enabled_sources"] == 1
+
+
+def test_actions_scout_candidates_ranks_urls_from_watchlist(tmp_path, monkeypatch):
+    watchlist_dir = tmp_path / "sources"
+    watchlist_dir.mkdir(parents=True, exist_ok=True)
+    watchlist_path = watchlist_dir / "watchlist.yaml"
+    watchlist_path.write_text(
+        """
+shadow_mode: true
+sources:
+  - id: rebbi-twitch
+    label: Rebbi Twitch
+    url: https://www.twitch.tv/rebbi/videos
+    platform: twitch
+    enabled: true
+    priority: 4
+    recent_hours: 72
+    max_candidates: 3
+    min_duration_s: 1800
+    max_duration_s: 14400
+    title_include_any: [challenge, insane]
+    title_exclude_any: [rerun]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VP_SOURCE_WATCHLIST", str(watchlist_path))
+
+    existing_url = "https://www.twitch.tv/videos/111"
+    existing_pid = hashlib.sha256("twitch_111".encode("utf-8")).hexdigest()
+    existing_dir = tmp_path / "outputs" / "projects" / existing_pid
+    existing_dir.mkdir(parents=True, exist_ok=True)
+    (existing_dir / "project.json").write_text(
+        json.dumps(
+            {
+                "project_id": existing_pid,
+                "created_at": "now",
+                "source": {
+                    "source_url": existing_url,
+                    "scout": {"source_id": "rebbi-twitch"},
+                },
+                "analysis": {
+                    "highlights": {"candidates": [{"rank": 1}]},
+                    "director": {"pick_count": 1},
+                },
+                "exports": [{"status": "succeeded"}],
+                "layout": {},
+                "selections": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    import videopipeline.source_scout as source_scout_mod
+
+    now_iso = "2026-03-08T01:00:00+00:00"
+
+    def fake_fetch(source, *, limit):
+        assert source["id"] == "rebbi-twitch"
+        assert limit == 3
+        return [
+            {
+                "url": existing_url,
+                "title": "insane challenge vod",
+                "duration_seconds": 7200.0,
+                "published_at": now_iso,
+                "channel_name": "Rebbi",
+            },
+            {
+                "url": "https://www.twitch.tv/videos/222",
+                "title": "insane challenge run",
+                "duration_seconds": 6800.0,
+                "published_at": now_iso,
+                "channel_name": "Rebbi",
+            },
+            {
+                "url": "https://www.twitch.tv/videos/333",
+                "title": "rerun archive",
+                "duration_seconds": 6800.0,
+                "published_at": now_iso,
+                "channel_name": "Rebbi",
+            },
+        ]
+
+    monkeypatch.setattr(source_scout_mod, "fetch_source_entries", fake_fetch)
+
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    r = client.get("/api/actions/scout/candidates?limit=5&per_source=3", headers=hdr)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["meta"]["watchlist_path"] == str(watchlist_path)
+    assert data["meta"]["shadow_mode"] is True
+    assert data["meta"]["candidate_count"] == 1
+    assert data["diagnostics"]["ready"] is True
+    assert data["recommended"]["url"] == "https://www.twitch.tv/videos/222"
+    assert data["recommended"]["source_id"] == "rebbi-twitch"
+    assert data["recommended"]["history"]["source_project_count"] == 1
+    assert data["skipped"]["already_processed"] == 1
+    assert data["skipped"]["title_excluded"] == 1
+
+
+def test_actions_run_ingest_analyze_persists_scout_metadata(tmp_path, monkeypatch):
+    import videopipeline.chat.downloader as chat_downloader
+    import videopipeline.studio.actions_api as actions_api_mod
+    from videopipeline.ingest.models import IngestResult
+
+    dummy_src = tmp_path / "dummy.mp4"
+    dummy_src.write_bytes(b"")
+
+    def fake_download_url(url: str, *args, **kwargs):
+        return IngestResult(video_path=dummy_src, url=url, title="dummy")
+
+    monkeypatch.setattr(actions_api_mod, "download_url", fake_download_url)
+    monkeypatch.setattr(
+        chat_downloader,
+        "download_chat",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no chat")),
+    )
+
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    url = "https://www.twitch.tv/videos/12345"
+    r = client.post(
+        "/api/actions/ingest_url",
+        headers=hdr,
+        json={
+            "url": url,
+            "scout": {
+                "source_id": "rebbi-twitch",
+                "source_label": "Rebbi Twitch",
+                "candidate_id": "cand-222",
+                "score": 0.84,
+                "shadow_mode": True,
+                "reasons": ["source priority 4", "duration_score=1.00"],
+            },
+        },
+    )
+    assert r.status_code == 200
+    pid = r.json()["project_id"]
+    project_json = json.loads(
+        (tmp_path / "outputs" / "projects" / pid / "project.json").read_text(encoding="utf-8")
+    )
+    assert project_json["source"]["source_url"] == url
+    assert project_json["source"]["scout"]["source_id"] == "rebbi-twitch"
+    assert project_json["source"]["scout"]["candidate_id"] == "cand-222"
+    assert project_json["source"]["scout"]["score"] == 0.84
+    assert project_json["source"]["scout"]["shadow_mode"] is True
+    assert project_json["source"]["scout"]["reasons"] == [
+        "source priority 4",
+        "duration_score=1.00",
+    ]
+    assert project_json["source"]["scout"]["selected_at"]
 
 
 def test_actions_rate_limiting(tmp_path, monkeypatch):

@@ -1,0 +1,45 @@
+shadow_mode: true
+sources:
+  - id: rebbi-twitch
+    label: Rebbi Twitch VODs
+    url: https://www.twitch.tv/rebbi/videos
+    platform: twitch
+    enabled: true
+    priority: 4
+    recent_hours: 72
+    max_candidates: 4
+    min_duration_s: 1800
+    max_duration_s: 21600
+    title_include_any:
+      - challenge
+      - ranked
+      - tournament
+      - insane
+    title_exclude_any:
+      - rerun
+      - test
+      - archive
+    tags:
+      - gaming
+      - rebbi
+
+  - id: rebbi-youtube
+    label: Rebbi YouTube uploads
+    url: https://www.youtube.com/@rebbi/videos
+    platform: youtube
+    enabled: true
+    priority: 3
+    recent_hours: 168
+    max_candidates: 4
+    min_duration_s: 480
+    max_duration_s: 14400
+    title_include_any:
+      - highlights
+      - challenge
+      - reaction
+      - clutch
+    title_exclude_any:
+      - shorts
+      - stream archive
+    tags:
+      - gaming

@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from .. import source_scout as source_scout_mod
 from ..analysis import run_analysis
 from ..analysis_director import DirectorConfig
 from ..analysis_highlights import CONTENT_TYPE_GUIDANCE
@@ -805,6 +806,97 @@ def create_actions_router(
             "jobs": jobs,
         }
 
+    def _extract_scout_metadata(body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        raw = body.get("scout") or {}
+        if not isinstance(raw, dict):
+            return None
+
+        out: Dict[str, Any] = {}
+        for key in (
+            "source_id",
+            "source_label",
+            "source_url",
+            "candidate_id",
+            "content_key",
+            "watchlist_path",
+            "selection_mode",
+        ):
+            val = raw.get(key)
+            if val is None:
+                continue
+            text = str(val).strip()
+            if text:
+                out[key] = text
+
+        score = raw.get("score")
+        if score is not None:
+            try:
+                out["score"] = float(score)
+            except Exception:
+                pass
+
+        if raw.get("shadow_mode") is not None:
+            out["shadow_mode"] = bool(raw.get("shadow_mode"))
+
+        reasons = raw.get("reasons") or []
+        if isinstance(reasons, list):
+            cleaned = [str(item).strip() for item in reasons if str(item).strip()]
+            if cleaned:
+                out["reasons"] = cleaned
+
+        return out or None
+
+    def _persist_project_scout_metadata(*, proj: Project, url: str, body: Dict[str, Any]) -> None:
+        scout = _extract_scout_metadata(body)
+        if not scout:
+            return
+
+        from ..project import update_project, utc_now_iso
+
+        def _upd(data: Dict[str, Any]) -> None:
+            data.setdefault("source", {})
+            source_block = data.get("source")
+            if not isinstance(source_block, dict):
+                source_block = {}
+                data["source"] = source_block
+            source_block["source_url"] = url
+            source_block["scout"] = {
+                **scout,
+                "selected_at": utc_now_iso(),
+            }
+
+        update_project(proj, _upd)
+
+    def _source_scout_diagnostics() -> Dict[str, Any]:
+        try:
+            watchlist_path, watchlist = source_scout_mod.load_source_watchlist()
+        except Exception as exc:
+            return {
+                "configured": False,
+                "ready": False,
+                "watchlist_path": None,
+                "shadow_mode": True,
+                "enabled_sources": 0,
+                "issues": [f"{type(exc).__name__}: {exc}"],
+            }
+
+        enabled_sources = [
+            item for item in (watchlist.get("sources") or []) if bool(item.get("enabled", True))
+        ]
+        issues: list[str] = []
+        if watchlist_path is None:
+            issues.append("source watchlist not found")
+        if not enabled_sources:
+            issues.append("no enabled source scout entries")
+        return {
+            "configured": watchlist_path is not None,
+            "ready": bool(watchlist_path is not None and enabled_sources),
+            "watchlist_path": str(watchlist_path) if watchlist_path is not None else None,
+            "shadow_mode": bool(watchlist.get("shadow_mode", True)),
+            "enabled_sources": len(enabled_sources),
+            "issues": issues,
+        }
+
     def _rate_limit(request: Request) -> str:
         actor_key = _request_actor_key(request)
         ok, retry_after_s = limiter.allow(actor_key)
@@ -1113,6 +1205,11 @@ def create_actions_router(
                         "additionalProperties": True,
                     },
                     "PublishJobsResponse": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": True,
+                    },
+                    "ScoutCandidatesResponse": {
                         "type": "object",
                         "properties": {},
                         "additionalProperties": True,
@@ -1766,6 +1863,25 @@ def create_actions_router(
                                 "description": "Summary",
                                 "content": {
                                     "application/json": {"schema": {"$ref": "#/components/schemas/ResultsSummaryResponse"}}
+                                },
+                            }
+                        },
+                    }
+                },
+                "/api/actions/scout/candidates": {
+                    "get": {
+                        "summary": "Fetch ranked ingest URL candidates from the source watchlist",
+                        "operationId": "vp_actions_scout_candidates",
+                        "x-openai-isConsequential": False,
+                        "parameters": [
+                            {"name": "limit", "in": "query", "required": False, "schema": {"type": "integer"}},
+                            {"name": "per_source", "in": "query", "required": False, "schema": {"type": "integer"}},
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "Ranked URL candidates",
+                                "content": {
+                                    "application/json": {"schema": {"$ref": "#/components/schemas/ScoutCandidatesResponse"}}
                                 },
                             }
                         },
@@ -2796,6 +2912,7 @@ def create_actions_router(
 
         content_id = _extract_content_id(url)
         proj = create_project_early(content_id, source_url=url)
+        _persist_project_scout_metadata(proj=proj, url=url, body=body)
         project_id = proj.project_dir.name
 
         run_job = _start_run_job(
@@ -2838,6 +2955,7 @@ def create_actions_router(
 
         content_id = _extract_content_id(url)
         proj = create_project_early(content_id, source_url=url)
+        _persist_project_scout_metadata(proj=proj, url=url, body=body)
         project_id = proj.project_dir.name
 
         run_job = _start_run_job(
@@ -2889,6 +3007,7 @@ def create_actions_router(
 
         content_id = _extract_content_id(url)
         proj = create_project_early(content_id, source_url=url)
+        _persist_project_scout_metadata(proj=proj, url=url, body=body)
         project_id = proj.project_dir.name
 
         run_job = _start_run_job(
@@ -3011,6 +3130,18 @@ def create_actions_router(
             it.pop("_mtime", None)
             out.append(it)
         return JSONResponse({"projects": out})
+
+    @router.get("/scout/candidates", openapi_extra={"x-openai-isConsequential": False})
+    def scout_candidates(request: Request, limit: int = 20, per_source: int = 5):
+        _rate_limit(request)
+        limit = _clamp_int(limit, default=20, min_v=1, max_v=50)
+        per_source = _clamp_int(per_source, default=5, min_v=1, max_v=20)
+        try:
+            report = source_scout_mod.build_source_scout_report(limit=limit, per_source=per_source)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        report["diagnostics"] = _source_scout_diagnostics()
+        return JSONResponse(report)
 
     @router.get("/publish/accounts", openapi_extra={"x-openai-isConsequential": False})
     def publish_accounts(request: Request):
@@ -3136,6 +3267,7 @@ def create_actions_router(
 
         content_id = _extract_content_id(url)
         proj = create_project_early(content_id, source_url=url)
+        _persist_project_scout_metadata(proj=proj, url=url, body=body)
         project_id = proj.project_dir.name
 
         # Parse speed mode
@@ -5921,6 +6053,7 @@ def create_actions_router(
                     "default_mode": _profile_default_llm_mode(),
                     "profile_external_ai_requirements": _profile_external_ai_requirements(),
                 },
+                "source_scout": _source_scout_diagnostics(),
                 "publisher": publish_accounts,
                 "profile": _profile_readiness(profile, profile_path=profile_path, backends=backends),
                 "paths": {
