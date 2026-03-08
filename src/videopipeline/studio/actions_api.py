@@ -4606,12 +4606,71 @@ def create_actions_router(
             )
         )
 
+    def _channel_show_formats() -> list[Dict[str, Any]]:
+        return [
+            {
+                "show_format_id": "clip_court",
+                "label": "Clip Court",
+                "format_id": "commentary_breakdown",
+                "lane": "single_clip",
+                "pitch": "Verdict-driven commentary that puts one clip on trial and makes the host's judgment the real product.",
+                "best_for": [
+                    "One standout clip with a clean setup/payoff",
+                    "Moments where the host can call it genius, fraud, panic, or pure cinema",
+                ],
+                "edit_recipe": [
+                    "Hook with the accusation or question",
+                    "Play the shortest source beat needed for context",
+                    "Pause or replay the evidence",
+                    "Deliver the host verdict, score, or roast",
+                    "Close with a takeaway that stands on its own",
+                ],
+                "rubric": [
+                    "Does the host verdict land within the first few beats?",
+                    "Is the clip short enough that commentary still dominates the experience?",
+                    "Would the upload still be watchable if the source clip were shortened further?",
+                ],
+                "packaging_notes": [
+                    "Title should name the verdict or offense",
+                    "Hook should preview the judgment, not just the event",
+                ],
+            },
+            {
+                "show_format_id": "weekly_awards",
+                "label": "Weekly Awards",
+                "format_id": "ranked_roundup",
+                "lane": "multi_clip",
+                "pitch": "Recurring awards/ranking show that compares several clips and turns them into one editorial episode.",
+                "best_for": [
+                    "Two or more shortlisted clips worth comparing",
+                    "Recurring categories like choke, karma, betrayal, or pure chaos",
+                ],
+                "edit_recipe": [
+                    "Open with the award category or ranking premise",
+                    "Run each shortlisted clip with a short host verdict",
+                    "Compare the contenders directly",
+                    "Name the winner and why it beat the others",
+                    "End with the final scoreboard or host take",
+                ],
+                "rubric": [
+                    "Do the clips share a comparison angle that justifies grouping them together?",
+                    "Is each clip short enough to leave room for host commentary between entries?",
+                    "Does the winner feel earned rather than arbitrary?",
+                ],
+                "packaging_notes": [
+                    "Title should name the award or ranking category",
+                    "Description should explain why these clips belong in the same episode",
+                ],
+            },
+        ]
+
     def _channel_format_playbook() -> Dict[str, Any]:
         return {
             "channel_positioning": {
                 "rule": "Treat streamer clips as raw evidence for an editorial/commentary channel, not as the finished product.",
                 "audience_promise": "Every upload should add a clear host viewpoint, verdict, or framing that still makes sense if the source clip is shortened.",
             },
+            "launch_stack": ["clip_court", "weekly_awards"],
             "must_have_contribution": [
                 "Original commentary, narration, or written editorial framing",
                 "A clear thesis, verdict, ranking, or explanation for why the clip matters",
@@ -4663,6 +4722,7 @@ def create_actions_router(
                     ],
                 },
             ],
+            "show_formats": _channel_show_formats(),
             "upload_guardrails": [
                 "Private or unlisted by default unless public release is explicitly approved",
                 "Prefer short, purposeful source excerpts over uninterrupted reposting",
@@ -4714,6 +4774,60 @@ def create_actions_router(
         if has_export and recommendations:
             recommendations[0]["export_note"] = (
                 "An exported MP4 already exists, so verify pacing and whether the host framing still needs to be strengthened before upload."
+            )
+        return recommendations
+
+    def _clip_show_format_recommendations(
+        *,
+        candidate: Dict[str, Any],
+        primary_variant: Optional[Dict[str, Any]],
+        shortlist_count: int,
+        chapter_context: Dict[str, Any],
+        has_export: bool,
+    ) -> list[Dict[str, Any]]:
+        duration_s = _safe_float(
+            (primary_variant or {}).get("duration_s"),
+            _safe_float(candidate.get("end_s"), 0.0) - _safe_float(candidate.get("start_s"), 0.0),
+        )
+        chapter_title = str(((chapter_context.get("current") or {}).get("title") or "")).strip()
+        recommendations: list[Dict[str, Any]] = []
+        if shortlist_count >= 2:
+            reason = (
+                f"There are {shortlist_count} shortlisted clips, so this candidate can compete inside a branded ranking/awards episode."
+            )
+            if chapter_title:
+                reason += f' The current chapter "{chapter_title}" can anchor the category or comparison framing.'
+            recommendations.append(
+                {
+                    "show_format_id": "weekly_awards",
+                    "format_id": "ranked_roundup",
+                    "priority": "primary",
+                    "reason": reason,
+                }
+            )
+            recommendations.append(
+                {
+                    "show_format_id": "clip_court",
+                    "format_id": "commentary_breakdown",
+                    "priority": "secondary",
+                    "reason": "If this becomes the clear winner, it can still stand alone as a verdict-driven single-clip episode.",
+                }
+            )
+        else:
+            reason = "This is a single shortlisted clip, so the cleanest lane is a verdict-driven episode where the host judgment is the product."
+            if duration_s >= 25.0:
+                reason += " The longer runtime means the host should be especially aggressive about trimming the source beat and adding commentary."
+            recommendations.append(
+                {
+                    "show_format_id": "clip_court",
+                    "format_id": "commentary_breakdown",
+                    "priority": "primary",
+                    "reason": reason,
+                }
+            )
+        if has_export and recommendations:
+            recommendations[0]["export_note"] = (
+                "An export already exists, so confirm the branded host framing still reads clearly before publish."
             )
         return recommendations
 
@@ -5103,6 +5217,13 @@ def create_actions_router(
                         chapter_context=chapter_context,
                         has_export=bool(matching_exports),
                     ),
+                    "show_format_recommendations": _clip_show_format_recommendations(
+                        candidate=candidate,
+                        primary_variant=primary_variant,
+                        shortlist_count=len(candidate_items),
+                        chapter_context=chapter_context,
+                        has_export=bool(matching_exports),
+                    ),
                     "status": {
                         "has_transcript_excerpt": bool(candidate.get("transcript_excerpt")),
                         "has_chat_excerpt": bool(candidate.get("chat_excerpt")),
@@ -5153,7 +5274,7 @@ def create_actions_router(
                 ],
                 "preferred_outputs": {
                     "semantic": "keep/reject + semantic_score + concise reason",
-                    "director": "variant_id + format_id + title + hook + description + hashtags + confidence",
+                    "director": "variant_id + format_id + show_format_id + title + hook + description + hashtags + confidence",
                 },
             },
             "clips": clips,

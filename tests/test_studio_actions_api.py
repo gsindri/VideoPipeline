@@ -1186,12 +1186,15 @@ def test_actions_ai_bundle_reports_external_status(tmp_path, monkeypatch):
     assert data["clip_review"]["channel_format_spec"]["channel_positioning"]["rule"].startswith(
         "Treat streamer clips as raw evidence"
     )
+    assert data["clip_review"]["channel_format_spec"]["launch_stack"] == ["clip_court", "weekly_awards"]
+    assert data["clip_review"]["channel_format_spec"]["show_formats"][0]["show_format_id"] == "clip_court"
     assert (
         data["clip_review"]["review_rubric"]["preferred_outputs"]["director"]
-        == "variant_id + format_id + title + hook + description + hashtags + confidence"
+        == "variant_id + format_id + show_format_id + title + hook + description + hashtags + confidence"
     )
     assert data["clip_review"]["clips"][0]["candidate"]["candidate_id"] == "cid1"
     assert data["clip_review"]["clips"][0]["format_recommendations"][0]["format_id"] == "commentary_breakdown"
+    assert data["clip_review"]["clips"][0]["show_format_recommendations"][0]["show_format_id"] == "clip_court"
 
 
 def test_actions_ai_clip_review_joins_director_exports_and_chapters(tmp_path, monkeypatch):
@@ -1369,8 +1372,106 @@ def test_actions_ai_clip_review_joins_director_exports_and_chapters(tmp_path, mo
     assert clip["exports"][0]["selection_id"] == "sel1"
     assert clip["status"]["has_export"] is True
     assert data["channel_format_spec"]["formats"][0]["format_id"] == "commentary_breakdown"
+    assert data["channel_format_spec"]["show_formats"][1]["show_format_id"] == "weekly_awards"
     assert clip["format_recommendations"][0]["format_id"] == "commentary_breakdown"
     assert "export_note" in clip["format_recommendations"][0]
+    assert clip["show_format_recommendations"][0]["show_format_id"] == "clip_court"
+    assert "export_note" in clip["show_format_recommendations"][0]
+
+
+def test_actions_ai_clip_review_recommends_weekly_awards_for_multi_clip_shortlist(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    pid = hashlib.sha256("twitch_clip_review_multi".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "video").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "video" / "video.mp4").write_bytes(b"")
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(proj_dir / "video" / "video.mp4"), "duration_seconds": 180.0},
+        "analysis": {
+            "highlights": {
+                "candidates": [
+                    {
+                        "rank": 1,
+                        "candidate_id": "cid1",
+                        "score": 1.0,
+                        "start_s": 15.0,
+                        "end_s": 34.0,
+                        "peak_time_s": 23.0,
+                        "title": "Clip one",
+                    },
+                    {
+                        "rank": 2,
+                        "candidate_id": "cid2",
+                        "score": 0.9,
+                        "start_s": 60.0,
+                        "end_s": 84.0,
+                        "peak_time_s": 72.0,
+                        "title": "Clip two",
+                    },
+                ]
+            }
+        },
+        "layout": {},
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+    (proj_dir / "analysis" / "variants.json").write_text(
+        json.dumps(
+            {
+                "created_at": "now",
+                "candidates": [
+                    {
+                        "candidate_rank": 1,
+                        "candidate_id": "cid1",
+                        "candidate_peak_time_s": 23.0,
+                        "variants": [
+                            {"variant_id": "tight", "start_s": 15.0, "end_s": 34.0, "duration_s": 19.0}
+                        ],
+                    },
+                    {
+                        "candidate_rank": 2,
+                        "candidate_id": "cid2",
+                        "candidate_peak_time_s": 72.0,
+                        "variants": [
+                            {"variant_id": "tight", "start_s": 60.0, "end_s": 84.0, "duration_s": 24.0}
+                        ],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (proj_dir / "analysis" / "chapters.json").write_text(
+        json.dumps(
+            {
+                "generated_at": "now",
+                "chapters": [
+                    {"id": 0, "start_s": 0.0, "end_s": 90.0, "title": "Weekly chaos", "summary": "", "keywords": []},
+                    {"id": 1, "start_s": 90.0, "end_s": 180.0, "title": "Aftershow", "summary": "", "keywords": []},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    r = client.get(
+        f"/api/actions/ai/clip_review?project_id={pid}&top_n=2&chat_top_n=0&chapter_limit=10",
+        headers=hdr,
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["meta"]["clip_count"] == 2
+    first = data["clips"][0]
+    second = data["clips"][1]
+    assert first["show_format_recommendations"][0]["show_format_id"] == "weekly_awards"
+    assert first["show_format_recommendations"][0]["format_id"] == "ranked_roundup"
+    assert second["show_format_recommendations"][0]["show_format_id"] == "weekly_awards"
+    assert second["show_format_recommendations"][1]["show_format_id"] == "clip_court"
 
 
 def test_actions_ai_candidates_returns_transcript_excerpt(tmp_path, monkeypatch):
