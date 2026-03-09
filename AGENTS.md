@@ -28,3 +28,12 @@
 - Be especially careful around `launcher.py`, `VideoPipeline.spec`, subprocess/console behavior, GPU/runtime startup, and FFmpeg path discovery.
 - A known example is Windows `cmd` / console freezing or flashing behavior that appeared on the laptop but not on the main PC.
 - See `docs/machine-notes.md` for tracked cross-machine behavior and guardrails.
+
+## Commit Workflow Preference
+
+- For coding work in this repo, prefer finishing one coherent job, running the narrow relevant validation, then committing and pushing instead of stopping at local unpushed completion.
+- Treat one finished job as one coherent commit when practical.
+- Push to the appropriate branch for the repo state. If `main` is protected or the work is still checkpoint-grade, push to a feature/PR branch instead of forcing partial work onto `main`.
+- Do not push broken partial states just to create a checkpoint.
+- Do not bundle unrelated dirty-worktree changes into the same commit. Stage and commit only the files that belong to the finished job.
+- When integration work spans both `VideoPipeline` and `Gondull_Platform`, prefer one coherent commit per repo rather than mixing unrelated repo state together.
