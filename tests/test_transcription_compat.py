@@ -51,14 +51,26 @@ def test_pyannote_pipeline_from_pretrained_prefers_token_kw(monkeypatch: pytest.
     pyannote_pkg = _make_package("pyannote")
     pyannote_audio = types.ModuleType("pyannote.audio")
     pyannote_audio.Pipeline = Pipeline  # type: ignore[attr-defined]
+    huggingface_hub = types.ModuleType("huggingface_hub")
+
+    class HfApi:
+        def model_info(self, model_id: str, *, token: str | None = None):
+            calls["hf_model_id"] = model_id
+            calls["hf_token"] = token
+            return {"id": model_id}
+
+    huggingface_hub.HfApi = HfApi  # type: ignore[attr-defined]
 
     monkeypatch.setitem(sys.modules, "pyannote", pyannote_pkg)
     monkeypatch.setitem(sys.modules, "pyannote.audio", pyannote_audio)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", huggingface_hub)
 
     dia._load_diarization_pipeline(hf_token="abc123", use_gpu=False)
 
     assert calls["model_id"] == "pyannote-community/speaker-diarization-community-1"
     assert calls["token"] == "abc123"
+    assert calls["hf_model_id"] == "pyannote-community/speaker-diarization-community-1"
+    assert calls["hf_token"] == "abc123"
 
 
 def test_pyannote_pipeline_from_pretrained_falls_back_to_use_auth_token(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -79,11 +91,23 @@ def test_pyannote_pipeline_from_pretrained_falls_back_to_use_auth_token(monkeypa
     pyannote_pkg = _make_package("pyannote")
     pyannote_audio = types.ModuleType("pyannote.audio")
     pyannote_audio.Pipeline = Pipeline  # type: ignore[attr-defined]
+    huggingface_hub = types.ModuleType("huggingface_hub")
+
+    class HfApi:
+        def model_info(self, model_id: str, *, token: str | None = None):
+            calls["hf_model_id"] = model_id
+            calls["hf_token"] = token
+            return {"id": model_id}
+
+    huggingface_hub.HfApi = HfApi  # type: ignore[attr-defined]
 
     monkeypatch.setitem(sys.modules, "pyannote", pyannote_pkg)
     monkeypatch.setitem(sys.modules, "pyannote.audio", pyannote_audio)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", huggingface_hub)
 
     dia._load_diarization_pipeline(hf_token="abc123", use_gpu=False)
 
     assert calls["model_id"] == "pyannote-community/speaker-diarization-community-1"
     assert calls["use_auth_token"] == "abc123"
+    assert calls["hf_model_id"] == "pyannote-community/speaker-diarization-community-1"
+    assert calls["hf_token"] == "abc123"
