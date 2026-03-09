@@ -1,15 +1,31 @@
 # VideoPipeline
 
-Personal toolchain to:
+Pipeline backend for `Gondull_Platform` and the OpenClaw bot `Gondull` to:
 
 1. Ingest long gaming/stream videos (local file or URL)
 2. Auto-suggest highlight moments ("top clips")
 3. Export social-ready shorts (vertical, captioned, templated)
 4. Publish to multiple destination accounts (YouTube, TikTok, etc.)
 
-This repository starts with a clean foundation (README, LICENSE, .gitignore). The implementation will evolve, but the core idea stays the same:
+The core idea stays the same:
 
 **signals → candidate clips → ranking → exports → publishing**
+
+## Primary Runtime Model
+
+- Primary control plane: `Gondull_Platform` plus `Gondull`/OpenClaw
+- Primary automation surface: `VideoPipeline` Actions API (`/api/actions/*`)
+- Default heavy-work profile: `profiles/gaming_assemblyai.yaml`
+- Default LLM mode for orchestrated runs: `gondull` / `external_strict`
+- Local Studio remains available for manual review, debugging, and fallback operation, but it is not the priority operator surface
+
+In other words: `VideoPipeline` should be treated as a locally hosted pipeline backend that `Gondull_Platform` drives, not as a human-first desktop app that happens to have an API on the side.
+
+See:
+
+- `docs/gondull-control-plane.md`
+- `docs/actions.md`
+- `docs/studio.md`
 
 ## Why this exists
 
@@ -123,4 +139,4 @@ Only clip/upload content you have rights to use. Platform rules and copyright en
 
 ## Status
 
-Work in progress. First commits focus on repo hygiene and scaffolding.
+Work in progress, but no longer just scaffolding. The repository already contains a working local pipeline, Studio/API surfaces, export and publish flows, and external-AI control paths. Current priority is making `Gondull_Platform` plus `Gondull` the primary way this system is driven.

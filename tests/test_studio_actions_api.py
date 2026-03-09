@@ -2086,7 +2086,7 @@ def test_actions_export_director_picks_creates_job(tmp_path, monkeypatch):
     r = client.post(
         "/api/actions/export_director_picks",
         headers=hdr,
-        json={"project_id": pid, "limit": 1, "client_request_id": "export-dir-1"},
+        json={"project_id": pid, "limit": 1, "llm_mode": "local", "client_request_id": "export-dir-1"},
     )
     assert r.status_code == 200
     job_id = r.json()["job_id"]
@@ -2336,7 +2336,7 @@ def test_actions_export_director_picks_accepts_legacy_pick_shape(tmp_path, monke
     r = client.post(
         "/api/actions/export_director_picks",
         headers=hdr,
-        json={"project_id": pid, "limit": 1, "client_request_id": "export-dir-legacy-1"},
+        json={"project_id": pid, "limit": 1, "llm_mode": "local", "client_request_id": "export-dir-legacy-1"},
     )
     assert r.status_code == 200
     job_id = r.json()["job_id"]

@@ -1021,7 +1021,7 @@ def create_actions_router(
                             "llm_mode": {
                                 "type": "string",
                                 "enum": list(_LLM_MODE_ENUM),
-                                "description": "LLM mode for analysis: local uses in-app AI, external skips in-app AI, external_strict skips in-app AI and requires external AI completion before export. If omitted, the active profile default is used (local when unspecified).",
+                                "description": "LLM mode for analysis: local uses in-app AI, external skips in-app AI, external_strict skips in-app AI and requires external AI completion before export. If omitted, the active profile default is used (external_strict when unspecified).",
                             },
                             "client_request_id": {"type": "string"},
                         },
@@ -1071,7 +1071,7 @@ def create_actions_router(
                             "llm_mode": {
                                 "type": "string",
                                 "enum": list(_LLM_MODE_ENUM),
-                                "description": "LLM mode for analysis: local uses in-app AI, external skips in-app AI, external_strict skips in-app AI and requires the external AI checkpoint before export. If omitted, the active profile default is used (local when unspecified).",
+                                "description": "LLM mode for analysis: local uses in-app AI, external skips in-app AI, external_strict skips in-app AI and requires the external AI checkpoint before export. If omitted, the active profile default is used (external_strict when unspecified).",
                             },
                             "client_request_id": {"type": "string"},
                         },
@@ -1101,7 +1101,7 @@ def create_actions_router(
                             "llm_mode": {
                                 "type": "string",
                                 "enum": list(_LLM_MODE_ENUM),
-                                "description": "LLM mode for unattended runs: local uses in-app AI, external skips in-app AI, external_strict rejects unattended export so external AI must checkpoint first. If omitted, the active profile default is used (local when unspecified).",
+                                "description": "LLM mode for unattended runs: local uses in-app AI, external skips in-app AI, external_strict rejects unattended export so external AI must checkpoint first. If omitted, the active profile default is used (external_strict when unspecified).",
                             },
                             "client_request_id": {"type": "string"},
                         },
@@ -1436,7 +1436,7 @@ def create_actions_router(
                             "llm_mode": {
                                 "type": "string",
                                 "enum": list(_LLM_MODE_ENUM),
-                                "description": "If omitted, the active profile default is used (local when unspecified).",
+                                "description": "If omitted, the active profile default is used (external_strict when unspecified).",
                             },
                             "export": {"type": "object", "additionalProperties": True},
                             "captions": {"type": "object", "additionalProperties": True},
@@ -2559,7 +2559,7 @@ def create_actions_router(
         job: Any,
         project_id: str,
         overrides: Dict[str, Any],
-        llm_mode: str = "local",
+        llm_mode: str = "external_strict",
         run_job: Optional[Any] = None,
         run_progress_base: float = 0.33,
         run_progress_span: float = 0.33,
@@ -2864,7 +2864,7 @@ def create_actions_router(
         project_id: str,
         url: str,
         analyze_overrides: Dict[str, Any],
-        llm_mode: str = "local",
+        llm_mode: str = "external_strict",
         export_top: Optional[int] = None,
         export_cfg: Optional[Dict[str, Any]] = None,
         cap_cfg: Optional[Dict[str, Any]] = None,

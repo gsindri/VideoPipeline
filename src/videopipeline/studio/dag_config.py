@@ -16,7 +16,7 @@ def normalize_llm_mode(value: Any) -> str:
 def profile_default_llm_mode(
     profile: Optional[Mapping[str, Any]],
     *,
-    fallback: str = "local",
+    fallback: str = "external_strict",
 ) -> str:
     """Return the default llm_mode configured by the active profile."""
     fallback_mode = normalize_llm_mode(fallback)
@@ -42,7 +42,7 @@ def resolve_llm_mode(
     value: Any,
     *,
     profile: Optional[Mapping[str, Any]] = None,
-    fallback: str = "local",
+    fallback: str = "external_strict",
 ) -> str:
     """Resolve llm_mode from request input, falling back to profile defaults."""
     if value is None:

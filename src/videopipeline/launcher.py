@@ -49,6 +49,7 @@ import requests
 import uvicorn
 
 from videopipeline.logging_config import setup_logging
+from videopipeline.profile import resolve_default_profile_path
 
 APP_NAME = "VideoPipeline"
 DEFAULT_HOST = "127.0.0.1"
@@ -113,16 +114,9 @@ def _exe_dir() -> Path:
 
 
 def _default_profile_path() -> Optional[Path]:
-    """Get the default profile path (gaming.yaml in profiles dir)."""
+    """Get the default profile path for launcher/runtime use."""
     exe = _exe_dir()
-    candidates = [
-        exe / "profiles" / "gaming.yaml",
-        exe.parent / "profiles" / "gaming.yaml",  # Source layout
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    return None
+    return resolve_default_profile_path(search_roots=[exe, exe.parent])
 
 
 def _profile_from_env() -> Optional[Path]:
@@ -375,7 +369,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     port = _resolve_port(args.port)
     url = f"http://{args.host}:{port}"
 
-    # Create app in HOME mode with either explicit --profile or default gaming.yaml.
+    # Create app in HOME mode with either explicit --profile or the resolved
+    # default orchestration profile for this runtime.
     from videopipeline.studio.app import create_app
 
     app = create_app(video_path=None, profile_path=profile_path)

@@ -529,7 +529,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     s = sub.add_parser("studio", help="Launch the local review + export studio web app.")
     s.add_argument("video", type=Path, nargs="?", default=None, help="Video file to open (optional, launches Home if omitted)")
-    s.add_argument("--profile", type=Path, default=None, help="Path to a YAML profile (e.g. profiles/gaming.yaml)")
+    s.add_argument("--profile", type=Path, default=None, help="Path to a YAML profile (e.g. profiles/gaming_assemblyai.yaml)")
     s.add_argument("--host", type=str, default="127.0.0.1")
     s.add_argument("--port", type=int, default=8765)
     s.add_argument("--reload", action="store_true", help="Auto-reload server on code changes (dev)")

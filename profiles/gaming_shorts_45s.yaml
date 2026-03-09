@@ -24,3 +24,6 @@ captions:
   language: null
   device: cpu
   compute_type: int8
+
+studio:
+  default_llm_mode: external_strict

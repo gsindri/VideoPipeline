@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 import yaml
 
@@ -168,12 +170,97 @@ def default_profile() -> Dict[str, Any]:
                 "auto_stop_idle_s": 600,
             }
         },
+        "studio": {
+            "default_llm_mode": "external_strict",
+        },
     }
+
+
+def _env_default_profile_path() -> Optional[Path]:
+    for env_name in ("VP_PROFILE", "VP_STUDIO_PROFILE"):
+        raw = (os.getenv(env_name) or "").strip()
+        if raw:
+            return Path(raw).expanduser()
+    return None
+
+
+def _assemblyai_env_present() -> bool:
+    return bool((os.getenv("ASSEMBLYAI_API_KEY") or os.getenv("AAI_API_KEY") or "").strip())
+
+
+def _default_profile_names() -> list[str]:
+    # Prefer the AssemblyAI orchestration profile when the environment is
+    # configured for the primary Gondull/OpenClaw control plane.
+    if _assemblyai_env_present():
+        return [
+            "gaming_assemblyai.yaml",
+            "gaming.yaml",
+            "gaming_nvidia.yaml",
+            "gaming_shorts_45s.yaml",
+        ]
+    return [
+        "gaming.yaml",
+        "gaming_assemblyai.yaml",
+        "gaming_nvidia.yaml",
+        "gaming_shorts_45s.yaml",
+    ]
+
+
+def _dedupe_paths(paths: Iterable[Path]) -> list[Path]:
+    out: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        try:
+            key = str(path.resolve())
+        except Exception:
+            key = str(path.absolute())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def resolve_default_profile_path(*, search_roots: Optional[Iterable[Path]] = None) -> Optional[Path]:
+    """Return the default profile path for the current runtime context.
+
+    Resolution order:
+    1. Explicit env override (`VP_PROFILE` / `VP_STUDIO_PROFILE`)
+    2. Known `profiles/` directories under the provided search roots
+    3. Known `profiles/` directories under the current working tree / repo root
+    """
+    env_path = _env_default_profile_path()
+    if env_path is not None:
+        return env_path
+
+    roots: list[Path] = []
+    if search_roots is not None:
+        roots.extend(Path(p).expanduser() for p in search_roots)
+    else:
+        roots.extend(
+            [
+                Path.cwd(),
+                Path(__file__).resolve().parents[2],
+            ]
+        )
+        if getattr(sys, "frozen", False):
+            roots.insert(0, Path(sys.executable).resolve().parent)
+
+    for root in _dedupe_paths(roots):
+        profile_dir = root / "profiles"
+        for name in _default_profile_names():
+            candidate = profile_dir / name
+            if candidate.exists():
+                return candidate
+
+    return None
 
 
 def load_profile(profile_path: Optional[Path]) -> Dict[str, Any]:
     if profile_path is None:
-        return default_profile()
+        profile_path = resolve_default_profile_path()
+        if profile_path is None:
+            return default_profile()
 
     profile_path = Path(profile_path)
     if not profile_path.exists():

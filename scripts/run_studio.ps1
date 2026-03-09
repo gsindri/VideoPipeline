@@ -1,6 +1,6 @@
 param(
   [Parameter(Mandatory=$true)][string]$Video,
-  [string]$Profile = "profiles/gaming.yaml"
+  [string]$Profile = "profiles/gaming_assemblyai.yaml"
 )
 
 if (-not (Test-Path ".venv")) {

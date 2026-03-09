@@ -11,7 +11,7 @@ let isStudioMode = false;
 let currentTab = 'edit';
 
 // =========================================================================
-// LLM MODE (In-app AI vs Actions-only)
+// LLM MODE (Gondull/external AI vs in-app fallback)
 // =========================================================================
 
 const VP_LLM_MODE_KEY_PREFIX = 'vp_llm_mode';
@@ -62,11 +62,7 @@ function getLlmModeStorageKey() {
 function getDefaultLlmMode() {
   const explicit = profile?.studio?.default_llm_mode ?? profile?.ai?.default_llm_mode;
   if (explicit != null && String(explicit).trim()) return normalizeLlmMode(explicit);
-  const engine = String(profile?.ai?.director?.engine || '').trim().toLowerCase();
-  // OpenAI API profile should default to in-app mode (uses hosted API, not local llama).
-  if (engine === 'openai_api') return 'local';
-  // Local-LLM profiles keep the existing conservative default.
-  return 'external';
+  return 'external_strict';
 }
 
 function getLlmMode() {

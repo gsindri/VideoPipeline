@@ -39,6 +39,7 @@ if not defined VP_API_TOKEN (
 
 REM === Pin Studio port for stable browser origin/token storage ===
 if not defined VP_STUDIO_PORT set "VP_STUDIO_PORT=57820"
+if not defined VP_STUDIO_PROFILE if exist "%VP_REPO%\profiles\gaming_assemblyai.yaml" set "VP_STUDIO_PROFILE=%VP_REPO%\profiles\gaming_assemblyai.yaml"
 
 REM === Launch Studio ===
 start "" /min python -m videopipeline.launcher

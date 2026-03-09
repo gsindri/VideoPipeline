@@ -272,3 +272,6 @@ ai:
     # Auto-stop server after idle (seconds). Frees VRAM for gaming.
     # Set to null to disable auto-stop. Default: 600 (10 minutes)
     auto_stop_idle_s: 600
+
+studio:
+  default_llm_mode: external_strict

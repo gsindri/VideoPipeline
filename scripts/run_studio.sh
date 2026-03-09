@@ -2,7 +2,7 @@
 set -euo pipefail
 
 VIDEO="${1:-}"
-PROFILE="${2:-profiles/gaming.yaml}"
+PROFILE="${2:-profiles/gaming_assemblyai.yaml}"
 
 if [[ -z "$VIDEO" ]]; then
   echo "Usage: scripts/run_studio.sh /path/to/video.mp4 [profile.yaml]"
