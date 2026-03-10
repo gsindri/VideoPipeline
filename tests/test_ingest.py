@@ -155,7 +155,7 @@ class TestMockDownload:
 
     def test_download_import_error(self):
         """Raises ImportError if yt-dlp not installed."""
-        from videopipeline.ingest.downloader import download_url
+        from videopipeline.ingest.ytdlp_runner import download_url
 
         with patch.dict('sys.modules', {'yt_dlp': None}):
             with patch('builtins.__import__', side_effect=ImportError('No module named yt_dlp')):
@@ -164,7 +164,7 @@ class TestMockDownload:
 
     def test_download_calls_yt_dlp(self, tmp_path: Path):
         """download_url calls yt-dlp correctly."""
-        from videopipeline.ingest.downloader import download_url
+        from videopipeline.ingest.ytdlp_runner import IngestRequest, download_url
 
         # Create a fake output file
         output_file = tmp_path / 'Test Video [abc123].mp4'
@@ -184,9 +184,11 @@ class TestMockDownload:
         mock_ydl_instance.__exit__ = MagicMock(return_value=False)
 
         with patch('yt_dlp.YoutubeDL', mock_ydl_class):
-            with patch('videopipeline.ingest.downloader._default_downloads_dir', return_value=tmp_path):
-                with patch('videopipeline.ingest.downloader._needs_preview', return_value=False):
-                    result = download_url('https://youtube.com/watch?v=abc123')
+            result = download_url(
+                'https://youtube.com/watch?v=abc123',
+                request=IngestRequest(url='https://youtube.com/watch?v=abc123', create_preview=False),
+                output_dir=tmp_path,
+            )
 
         assert result.title == 'Test Video'
         assert result.video_id == 'abc123'
@@ -199,7 +201,7 @@ class TestProgressCallbacks:
 
     def test_progress_callback_called(self, tmp_path: Path):
         """Progress callback is invoked during download."""
-        from videopipeline.ingest.downloader import download_url
+        from videopipeline.ingest.ytdlp_runner import IngestRequest, download_url
 
         progress_calls = []
 
@@ -218,14 +220,16 @@ class TestProgressCallbacks:
         mock_ydl_instance.__exit__ = MagicMock(return_value=False)
 
         with patch('yt_dlp.YoutubeDL', return_value=mock_ydl_instance):
-            with patch('videopipeline.ingest.downloader._default_downloads_dir', return_value=tmp_path):
-                with patch('videopipeline.ingest.downloader._needs_preview', return_value=False):
-                    download_url('https://example.com', on_progress=on_progress)
+            download_url(
+                'https://example.com',
+                request=IngestRequest(url='https://example.com', create_preview=False),
+                output_dir=tmp_path,
+                on_progress=on_progress,
+            )
 
-        # Should have at least the initial "Extracting video info..." call
+        # Should have at least the initial site-detection update.
         assert len(progress_calls) > 0
-        # AUTO mode shows N value in the message
-        assert 'Extracting video info' in progress_calls[0][1]
+        assert 'Detecting site' in progress_calls[0][1]
 
 
 class TestSpeedMode:
