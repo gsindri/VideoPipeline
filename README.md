@@ -27,6 +27,15 @@ See:
 - `docs/actions.md`
 - `docs/studio.md`
 
+## Main PC Runtime Note
+
+- First-class usage is: `Gondull_Platform` on the main PC driving the local `VideoPipeline` backend through `/api/actions/*`.
+- When launching or testing the local runtime on that machine, prefer the repo's Windows venv explicitly:
+  - `run_studio.bat`
+  - `.venv\Scripts\python.exe -m videopipeline.launcher`
+  - `.venv\Scripts\python.exe -m pytest ...`
+- Avoid using `/usr/bin/python3` from WSL against this repo when `.venv` is the Windows venv, or you can end up diagnosing missing packages from the wrong interpreter.
+
 ## Why this exists
 
 - Speed: turn long VODs into multiple shorts quickly.

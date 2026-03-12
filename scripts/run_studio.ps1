@@ -3,11 +3,28 @@ param(
   [string]$Profile = "profiles/gaming_assemblyai.yaml"
 )
 
-if (-not (Test-Path ".venv")) {
-  python -m venv .venv
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$venvDir = Join-Path $repoRoot ".venv"
+$venvPython = Join-Path $venvDir "Scripts\python.exe"
+
+if (-not (Test-Path $venvPython)) {
+  $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+  if ($pyLauncher) {
+    & $pyLauncher.Source -3 -m venv $venvDir
+  } else {
+    python -m venv $venvDir
+  }
 }
 
-. .\.venv\Scripts\Activate.ps1
-pip install -e .
+Push-Location $repoRoot
+try {
+  & $venvPython -m pip install -e $repoRoot
+  if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+  }
 
-vp studio $Video --profile $Profile
+  & $venvPython -m videopipeline.cli studio $Video --profile $Profile
+  exit $LASTEXITCODE
+} finally {
+  Pop-Location
+}

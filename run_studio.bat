@@ -4,6 +4,7 @@ setlocal EnableExtensions
 REM === Repo location ===
 set "VP_REPO=C:\Users\gsind\Documents\GitHub\VideoPipeline"
 set "TOKEN_HELPER=%VP_REPO%\tools\vp_api_token.ps1"
+set "VENV_PY=%VP_REPO%\.venv\Scripts\python.exe"
 
 REM === Basic checks ===
 if not exist "%VP_REPO%" (
@@ -18,9 +19,17 @@ if not exist "%TOKEN_HELPER%" (
   exit /b 1
 )
 
-REM === Activate venv ===
+if not exist "%VENV_PY%" (
+  echo [studio] Repo venv python not found: %VENV_PY%
+  echo [studio] Create it with:
+  echo   py -3 -m venv "%VP_REPO%\.venv"
+  echo   "%VP_REPO%\.venv\Scripts\python.exe" -m pip install -e "%VP_REPO%"
+  pause
+  exit /b 1
+)
+
+REM === Use repo-local Windows venv explicitly ===
 cd /d "%VP_REPO%"
-call .venv\Scripts\activate
 
 REM === Set VP_API_TOKEN (persisted in %LOCALAPPDATA%\VideoPipeline\vp_api_token.txt) ===
 if not defined VP_API_TOKEN (
@@ -42,4 +51,4 @@ if not defined VP_STUDIO_PORT set "VP_STUDIO_PORT=57820"
 if not defined VP_STUDIO_PROFILE if exist "%VP_REPO%\profiles\gaming_assemblyai.yaml" set "VP_STUDIO_PROFILE=%VP_REPO%\profiles\gaming_assemblyai.yaml"
 
 REM === Launch Studio ===
-start "" /min python -m videopipeline.launcher
+start "" /min "%VENV_PY%" -m videopipeline.launcher

@@ -2,15 +2,33 @@
 
 ## Quickstart
 
+### Windows / Main PC (primary)
+
+Use the repo's Windows venv explicitly instead of relying on whichever `python` is first on `PATH`:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+.\run_studio.bat
+```
+
+For direct commands, prefer:
+
+```powershell
+.\.venv\Scripts\python.exe -m videopipeline.launcher
+.\.venv\Scripts\python.exe -m pytest tests/test_studio_actions_api.py
+```
+
+### macOS / Linux / dedicated POSIX venv
+
 ```bash
 python -m venv .venv
-# macOS/Linux
 source .venv/bin/activate
-# Windows PowerShell
-# .venv\Scripts\Activate.ps1
 
 pip install -e .
 ```
+
+If this repo already contains the Windows `.venv\Scripts\python.exe`, do not point WSL at `/usr/bin/python3` and assume it is using the same environment. Use the Windows launcher path on the main PC, or create a separate POSIX venv intentionally.
 
 ## Launch Modes
 
