@@ -175,6 +175,15 @@ class PublishJobStore:
         remote_url: Any = _UNSET,
         resume_json: Any = _UNSET,
     ) -> PublishJob:
+        current = self.get_job(job_id)
+        if current.status in {"succeeded", "failed", "canceled"}:
+            allowed_transition = (current.status, status) in {
+                ("failed", "queued"),
+                ("canceled", "queued"),
+            }
+            if status is None or (status != current.status and not allowed_transition):
+                return current
+
         updates = []
         values: list[Any] = []
         if status is not None:
@@ -253,4 +262,7 @@ class PublishJobStore:
         return self.update_job(job_id, status="queued", last_error=None, progress=0.0)
 
     def cancel(self, job_id: str) -> PublishJob:
+        current = self.get_job(job_id)
+        if current.status not in {"queued", "running"}:
+            raise ValueError(f"job_not_cancellable: {job_id}")
         return self.update_job(job_id, status="canceled")

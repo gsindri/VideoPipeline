@@ -200,7 +200,7 @@ class TestQueueAPI:
         assert retried.progress == 0.0
 
     def test_job_store_cancel(self, tmp_path: Path):
-        """Cancel sets job status to canceled."""
+        """Cancel sets queued job status to canceled."""
         db_path = tmp_path / "publisher.sqlite"
         store = PublishJobStore(path=db_path)
 

@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -14,6 +15,10 @@ from .layouts import RectNorm
 from .utils import subprocess_flags as _subprocess_flags
 
 logger = logging.getLogger(__name__)
+
+
+class ExportCancelledError(RuntimeError):
+    """Raised when an export is cancelled while ffmpeg is running."""
 
 
 @dataclass(frozen=True)
@@ -456,6 +461,7 @@ def run_ffmpeg_export(
     *,
     on_progress: Optional[Callable[[float, str], None]] = None,
     two_pass_loudnorm: bool = True,
+    check_cancel: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Run ffmpeg export, optionally reporting progress (0..1).
 
@@ -464,12 +470,19 @@ def run_ffmpeg_export(
         on_progress: Callback for progress updates (fraction, status)
         two_pass_loudnorm: If True and normalize_audio is enabled, use two-pass
             loudness normalization for more accurate results. Adds ~30-50% time.
+        check_cancel: Optional callback returning True when the export should stop.
     """
     duration = max(0.01, float(spec.end_s - spec.start_s))
+
+    if check_cancel and check_cancel():
+        raise ExportCancelledError("export cancelled")
 
     if on_progress:
         on_progress(0.0, "validating filter graph")
     _preflight_filtergraph(spec)
+
+    if check_cancel and check_cancel():
+        raise ExportCancelledError("export cancelled")
 
     # Two-pass loudness normalization: measure first, then encode with measured values
     if spec.normalize_audio and two_pass_loudnorm:
@@ -491,6 +504,9 @@ def run_ffmpeg_export(
                 "Two-pass loudnorm requested but pass 1 failed; using single-pass loudnorm for this export."
             )
 
+        if check_cancel and check_cancel():
+            raise ExportCancelledError("export cancelled")
+
     cmd = build_ffmpeg_command(spec)
 
     if on_progress:
@@ -510,6 +526,38 @@ def run_ffmpeg_export(
     assert proc.stderr is not None
 
     out_time_ms = 0
+    cancel_event = threading.Event()
+    monitor_stop = threading.Event()
+    monitor_thread: Optional[threading.Thread] = None
+
+    def _terminate_proc() -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=2.0)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
+
+    def _monitor_cancel() -> None:
+        while not monitor_stop.wait(0.1):
+            try:
+                should_cancel = bool(check_cancel and check_cancel())
+            except Exception:
+                should_cancel = False
+            if not should_cancel:
+                continue
+            cancel_event.set()
+            _terminate_proc()
+            return
+
+    if check_cancel:
+        monitor_thread = threading.Thread(target=_monitor_cancel, daemon=True)
+        monitor_thread.start()
 
     try:
         for line in proc.stdout:
@@ -536,10 +584,15 @@ def run_ffmpeg_export(
                         on_progress(1.0, "done")
 
         ret = proc.wait()
+        if cancel_event.is_set() or (check_cancel and check_cancel()):
+            raise ExportCancelledError("export cancelled")
         if ret != 0:
             err = proc.stderr.read().strip()
             raise RuntimeError(f"ffmpeg export failed (exit={ret}). {err}")
     finally:
+        monitor_stop.set()
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=1.0)
         try:
             proc.stdout.close()
         except Exception:

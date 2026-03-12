@@ -10,7 +10,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from ..exporter import ExportSpec, HookTextSpec, LayoutPipSpec, run_ffmpeg_export
+from ..exporter import ExportCancelledError, ExportSpec, HookTextSpec, LayoutPipSpec, run_ffmpeg_export
 from ..layouts import get_facecam_rect
 from ..metadata import build_metadata, derive_hook_text, write_metadata
 from ..project import Project, get_project_data, record_export
@@ -110,6 +110,9 @@ class JobManager:
             pass
 
     def _set(self, job: Job, *, status: Optional[str] = None, progress: Optional[float] = None, message: Optional[str] = None, result: Optional[Dict[str, Any]] = None) -> None:
+        if job.status in {"succeeded", "failed", "cancelled"}:
+            if status is None or status != job.status:
+                return
         if status is not None:
             job.status = status
             # Record start time when job begins running
@@ -162,8 +165,12 @@ class JobManager:
 
         @with_prevent_sleep("Exporting video")
         def runner() -> None:
+            out_path: Optional[Path] = None
             self._set(job, status="running", progress=0.0, message="starting")
             try:
+                if job.cancel_requested:
+                    raise ExportCancelledError("cancelled")
+
                 video_path = Path(proj.video_path)
                 sel_id = selection["id"]
                 start_s = float(selection["start_s"])
@@ -178,6 +185,8 @@ class JobManager:
                 subtitles_ass = None
                 segments: Optional[list[SubtitleSegment]] = None
                 if with_captions:
+                    if job.cancel_requested:
+                        raise ExportCancelledError("cancelled")
                     self._set(job, message="transcribing")
                     # Cache transcript per selection
                     tjson = proj.analysis_dir / "transcripts" / f"{sel_id}_{int(start_s)}_{int(end_s)}.json"
@@ -245,9 +254,13 @@ class JobManager:
                 )
 
                 def on_prog(frac: float, msg: str) -> None:
+                    if job.cancel_requested:
+                        return
                     self._set(job, progress=frac, message=msg)
 
-                run_ffmpeg_export(spec, on_progress=on_prog)
+                run_ffmpeg_export(spec, on_progress=on_prog, check_cancel=lambda: job.cancel_requested)
+                if job.cancel_requested:
+                    raise ExportCancelledError("cancelled")
 
                 # Look up AI metadata for this selection
                 ai_metadata = None
@@ -279,10 +292,24 @@ class JobManager:
                 )
 
                 self._set(job, status="succeeded", progress=1.0, message="done", result={"output": str(out_path)})
+            except ExportCancelledError:
+                if out_path is not None:
+                    for path in (out_path, out_path.with_suffix(".metadata.json")):
+                        try:
+                            path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                self._set(job, status="cancelled", message="cancelled", result={})
             except WhisperNotInstalledError as e:
-                self._set(job, status="failed", message=str(e), result={})
+                if job.cancel_requested:
+                    self._set(job, status="cancelled", message="cancelled", result={})
+                else:
+                    self._set(job, status="failed", message=str(e), result={})
             except Exception as e:
-                self._set(job, status="failed", message=f"{type(e).__name__}: {e}", result={})
+                if job.cancel_requested:
+                    self._set(job, status="cancelled", message="cancelled", result={})
+                else:
+                    self._set(job, status="failed", message=f"{type(e).__name__}: {e}", result={})
 
         t = threading.Thread(target=runner, daemon=True)
         t.start()
@@ -315,6 +342,10 @@ class JobManager:
             self._set(job, status="running", progress=0.0, message=f"exporting 0/{total}")
             try:
                 for idx, selection in enumerate(selections, start=1):
+                    if job.cancel_requested:
+                        self._set(job, status="cancelled", message="cancelled", result={})
+                        return
+
                     subjob = self.start_export(
                         proj=proj,
                         selection=selection,
@@ -338,14 +369,19 @@ class JobManager:
                         job_child = self.get(subjob.id)
                         if job_child is None:
                             break
-                        if job_child.status in {"succeeded", "failed"}:
+                        if job_child.status in {"succeeded", "failed", "cancelled"}:
                             break
+                        if job.cancel_requested:
+                            self.cancel(subjob.id)
                         frac = (idx - 1 + job_child.progress) / total
                         self._set(job, progress=frac, message=f"exporting {idx}/{total}")
 
                     job_child = self.get(subjob.id)
                     if job_child and job_child.status == "failed":
                         raise RuntimeError(job_child.message)
+                    if job_child and job_child.status == "cancelled":
+                        self._set(job, status="cancelled", message="cancelled", result={})
+                        return
 
                     self._set(job, progress=idx / total, message=f"exporting {idx}/{total}")
 

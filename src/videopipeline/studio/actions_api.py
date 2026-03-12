@@ -2811,6 +2811,10 @@ def create_actions_router(
                 sj = JOB_MANAGER.get(subjob.id)
                 if sj and sj.status == "failed":
                     raise RuntimeError(sj.message)
+                if sj and sj.status == "cancelled":
+                    JOB_MANAGER._set(job, status="cancelled", message="cancelled", result={"active_subjob_id": subjob.id})
+                    _set_run(1.0, "Export: cancelled")
+                    return
                 if sj and sj.status == "succeeded":
                     out = (sj.result or {}).get("output")
                     if out:
@@ -6240,6 +6244,9 @@ def create_actions_router(
                     sj = JOB_MANAGER.get(subjob.id)
                     if sj and sj.status == "failed":
                         raise RuntimeError(sj.message)
+                    if sj and sj.status == "cancelled":
+                        JOB_MANAGER._set(job, status="cancelled", message="cancelled", result={"project_id": project_id})
+                        return
                     if sj and sj.status == "succeeded":
                         out = (sj.result or {}).get("output")
                         if out:
@@ -6411,6 +6418,9 @@ def create_actions_router(
                     sj = JOB_MANAGER.get(subjob.id)
                     if sj and sj.status == "failed":
                         raise RuntimeError(sj.message)
+                    if sj and sj.status == "cancelled":
+                        JOB_MANAGER._set(job, status="cancelled", message="cancelled", result={"project_id": project_id, "created_selection_ids": created_ids})
+                        return
                     if sj and sj.status == "succeeded":
                         out = (sj.result or {}).get("output")
                         if out:

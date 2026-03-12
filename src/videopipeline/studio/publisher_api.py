@@ -407,6 +407,8 @@ def create_publisher_router(
             return JSONResponse({"job": job.to_dict()})
         except KeyError:
             raise HTTPException(status_code=404, detail="job_not_found")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="job_not_cancellable")
 
     @router.get("/jobs/stream")
     def jobs_stream() -> StreamingResponse:

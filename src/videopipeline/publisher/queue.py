@@ -92,8 +92,21 @@ class PublishWorker:
         return self.job_store.get_job(job.id)
 
     def _run_job(self, job: PublishJob) -> None:
+        class _PublishCancelled(Exception):
+            pass
+
         log_path = logs_dir() / f"publish_{job.id}.log"
+
+        def _is_cancelled() -> bool:
+            try:
+                return self.job_store.get_job(job.id).status == "canceled"
+            except KeyError:
+                return True
+
         try:
+            if _is_cancelled():
+                return
+
             account = self.account_store.get(job.account_id)
             if not account:
                 raise RuntimeError(f"account_not_found: {job.account_id}")
@@ -124,10 +137,17 @@ class PublishWorker:
             connector.validate_media(file_path, metadata)
 
             def on_progress(frac: float) -> None:
+                if _is_cancelled():
+                    raise _PublishCancelled()
                 self.job_store.update_job(job.id, progress=frac)
 
             def on_resume(state: dict[str, Any]) -> None:
+                if _is_cancelled():
+                    raise _PublishCancelled()
                 self.job_store.update_job(job.id, resume_json=json.dumps(state))
+
+            if _is_cancelled():
+                raise _PublishCancelled()
 
             result = connector.publish(
                 file_path=file_path,
@@ -136,6 +156,8 @@ class PublishWorker:
                 on_progress=on_progress,
                 on_resume=on_resume,
             )
+            if _is_cancelled():
+                raise _PublishCancelled()
             self.job_store.update_job(
                 job.id,
                 status="succeeded",
@@ -144,9 +166,19 @@ class PublishWorker:
                 remote_url=result.remote_url,
                 last_error=None,
             )
+            if _is_cancelled():
+                return
             self.job_store.mark_dedup(job.platform, job.account_id, sha, result.remote_id, result.remote_url)
+        except _PublishCancelled:
+            return
         except Exception as exc:
-            attempts = job.attempts + 1
+            try:
+                current = self.job_store.get_job(job.id)
+            except KeyError:
+                return
+            if current.status == "canceled":
+                return
+            attempts = current.attempts + 1
             status = "queued" if attempts < 5 else "failed"
             self.job_store.update_job(
                 job.id,
