@@ -226,7 +226,11 @@ def _http_ok(url: str, timeout: float = 0.25) -> bool:
         return False
 
 
-def _reuse_existing_if_running(*, requested_profile: Optional[Path] = None) -> Optional[str]:
+def _reuse_existing_if_running(
+    *,
+    requested_profile: Optional[Path] = None,
+    requested_bind_host: Optional[str] = None,
+) -> Optional[str]:
     """Check if a matching Studio instance is already running and return its URL if so."""
     rf = _runtime_file()
     if not rf.exists():
@@ -238,6 +242,9 @@ def _reuse_existing_if_running(*, requested_profile: Optional[Path] = None) -> O
         running_norm = _normalize_profile_path(Path(running_profile_raw)) if running_profile_raw else None
         if requested_norm is not None and running_norm != requested_norm:
             return None
+        running_bind_host = str(data.get("bind_host") or data.get("host") or DEFAULT_HOST)
+        if requested_bind_host and running_bind_host != requested_bind_host:
+            return None
         host = data.get("host", DEFAULT_HOST)
         port = int(data.get("port"))
         url = f"http://{host}:{port}"
@@ -248,10 +255,17 @@ def _reuse_existing_if_running(*, requested_profile: Optional[Path] = None) -> O
     return None
 
 
-def _write_runtime(host: str, port: int, *, profile_path: Optional[Path] = None) -> None:
+def _write_runtime(
+    host: str,
+    port: int,
+    *,
+    bind_host: Optional[str] = None,
+    profile_path: Optional[Path] = None,
+) -> None:
     """Write the runtime state file with server info."""
     payload = {
         "host": host,
+        "bind_host": bind_host or host,
         "port": port,
         "pid": os.getpid(),
         "started_at": time.time(),
@@ -309,6 +323,7 @@ def _open_browser_when_ready(url: str, max_wait_s: float = 8.0) -> None:
 class LaunchArgs:
     """Parsed launcher arguments."""
     host: str = DEFAULT_HOST
+    runtime_host: Optional[str] = None
     port: Optional[int] = None
     profile: Optional[Path] = None
     no_browser: bool = False
@@ -332,6 +347,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     for token in it:
         if token == "--host":
             args.host = next(it)
+        elif token == "--runtime-host":
+            args.runtime_host = next(it)
         elif token == "--port":
             args.port = int(next(it))
         elif token == "--profile":
@@ -351,7 +368,10 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     # If already running, reuse (perfect UX)
     if args.reuse:
-        existing = _reuse_existing_if_running(requested_profile=profile_path)
+        existing = _reuse_existing_if_running(
+            requested_profile=profile_path,
+            requested_bind_host=args.host,
+        )
         if existing:
             if not args.no_browser:
                 try:
@@ -367,7 +387,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     _maybe_add_ffmpeg_to_path()
 
     port = _resolve_port(args.port)
-    url = f"http://{args.host}:{port}"
+    runtime_host = args.runtime_host or args.host
+    url = f"http://{runtime_host}:{port}"
 
     # Create app in HOME mode with either explicit --profile or the resolved
     # default orchestration profile for this runtime.
@@ -375,7 +396,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     app = create_app(video_path=None, profile_path=profile_path)
 
-    _write_runtime(args.host, port, profile_path=profile_path)
+    _write_runtime(runtime_host, port, bind_host=args.host, profile_path=profile_path)
 
     if not args.no_browser:
         threading.Thread(target=_open_browser_when_ready, args=(url,), daemon=True).start()
