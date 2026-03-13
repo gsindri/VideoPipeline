@@ -80,6 +80,8 @@ def default_watchlist_paths() -> list[Path]:
         paths.append(Path(env_path))
 
     cwd = Path.cwd()
+    paths.append(cwd / "sources" / "watchlist.local.yaml")
+    paths.append(cwd / "sources" / "watchlist.local.yml")
     paths.append(cwd / "sources" / "watchlist.yaml")
     paths.append(cwd / "sources" / "watchlist.yml")
 
@@ -87,10 +89,14 @@ def default_watchlist_paths() -> list[Path]:
         appdata = os.environ.get("APPDATA")
         if appdata:
             base = Path(appdata) / "VideoPipeline"
+            paths.append(base / "source_watchlist.local.yaml")
+            paths.append(base / "source_watchlist.local.yml")
             paths.append(base / "source_watchlist.yaml")
             paths.append(base / "source_watchlist.yml")
     else:
         base = Path.home() / ".videopipeline"
+        paths.append(base / "source_watchlist.local.yaml")
+        paths.append(base / "source_watchlist.local.yml")
         paths.append(base / "source_watchlist.yaml")
         paths.append(base / "source_watchlist.yml")
 
@@ -221,13 +227,34 @@ def _twitch_source_user_id(source: Dict[str, Any]) -> str:
 
 def source_preflight_issue(source: Dict[str, Any]) -> Optional[str]:
     provider = str(source.get("provider") or "").strip().lower()
-    if provider not in {"twitch_helix", "twitch_api"}:
-        return None
-    if not twitch_api_configured():
+    source_url = str(source.get("url") or "").strip()
+    if provider in {"twitch_helix", "twitch_api"}:
+        if twitch_api_configured():
+            if not (_twitch_source_user_id(source) or _twitch_source_login(source)):
+                return "channel_login or user_id is required for twitch_helix sources"
+            return None
+        if source_url and yt_dlp_available():
+            return None
         return "TWITCH_CLIENT_ID plus TWITCH_CLIENT_SECRET or TWITCH_APP_ACCESS_TOKEN is required"
-    if not (_twitch_source_user_id(source) or _twitch_source_login(source)):
-        return "channel_login or user_id is required for twitch_helix sources"
+    if provider and source_url and not yt_dlp_available():
+        return "yt-dlp is required for source scouting"
     return None
+
+
+def _load_yt_dlp() -> Any:
+    try:
+        from yt_dlp import YoutubeDL
+    except ImportError as exc:
+        raise RuntimeError("yt-dlp is required for source scouting") from exc
+    return YoutubeDL
+
+
+def yt_dlp_available() -> bool:
+    try:
+        _load_yt_dlp()
+    except RuntimeError:
+        return False
+    return True
 
 
 def _parse_twitch_duration_seconds(value: Any) -> Optional[float]:
@@ -429,13 +456,10 @@ def _fetch_twitch_helix_entries(source: Dict[str, Any], *, limit: int) -> list[D
 
 def fetch_source_entries(source: Dict[str, Any], *, limit: int) -> list[Dict[str, Any]]:
     provider = str(source.get("provider") or "").strip().lower()
-    if provider in {"twitch_helix", "twitch_api"}:
+    if provider in {"twitch_helix", "twitch_api"} and twitch_api_configured():
         return _fetch_twitch_helix_entries(source, limit=limit)
 
-    try:
-        from yt_dlp import YoutubeDL
-    except ImportError as exc:
-        raise RuntimeError("yt-dlp is required for source scouting") from exc
+    YoutubeDL = _load_yt_dlp()
 
     source_url = str(source.get("url") or "").strip()
     if not source_url:

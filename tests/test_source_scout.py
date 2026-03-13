@@ -33,6 +33,38 @@ def test_source_preflight_issue_requires_twitch_credentials(monkeypatch):
     assert "TWITCH_CLIENT_ID" in issue
 
 
+def test_resolve_watchlist_path_prefers_local_watchlist(tmp_path, monkeypatch):
+    sources_dir = tmp_path / "sources"
+    sources_dir.mkdir()
+    watchlist_path = sources_dir / "watchlist.local.yaml"
+    watchlist_path.write_text("shadow_mode: true\nsources: []\n", encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+
+    resolved = source_scout_mod.resolve_watchlist_path()
+
+    assert resolved == watchlist_path
+
+
+def test_source_preflight_issue_allows_twitch_url_fallback_without_credentials(monkeypatch):
+    monkeypatch.delenv("TWITCH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("TWITCH_API_CLIENT_ID", raising=False)
+    monkeypatch.delenv("TWITCH_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("TWITCH_API_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("TWITCH_APP_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("TWITCH_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(source_scout_mod, "yt_dlp_available", lambda: True)
+
+    issue = source_scout_mod.source_preflight_issue(
+        {
+            "provider": "twitch_helix",
+            "url": "https://www.twitch.tv/ludwig/videos",
+        }
+    )
+
+    assert issue is None
+
+
 def test_fetch_source_entries_twitch_helix_by_login(monkeypatch):
     monkeypatch.setenv("TWITCH_CLIENT_ID", "client-id")
     monkeypatch.setenv("TWITCH_CLIENT_SECRET", "client-secret")
@@ -110,6 +142,59 @@ def test_fetch_source_entries_twitch_helix_by_login(monkeypatch):
     assert entries[0]["channel_name"] == "Ludwig"
     assert entries[0]["duration_seconds"] == 8392.0
     assert entries[0]["platform"] == "twitch"
+
+
+def test_fetch_source_entries_twitch_without_api_uses_yt_dlp_fallback(monkeypatch):
+    monkeypatch.delenv("TWITCH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("TWITCH_API_CLIENT_ID", raising=False)
+    monkeypatch.delenv("TWITCH_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("TWITCH_API_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("TWITCH_APP_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("TWITCH_ACCESS_TOKEN", raising=False)
+
+    class _FakeYoutubeDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, url, download=False):
+            assert url == "https://www.twitch.tv/ludwig/videos"
+            assert download is False
+            return {
+                "entries": [
+                    {
+                        "id": "987654321",
+                        "ie_key": "TwitchVod",
+                        "url": "987654321",
+                        "title": "Fallback twitch VOD",
+                        "duration": 1234,
+                        "timestamp": 1762502400,
+                        "channel": "Ludwig",
+                        "channel_id": "user-123",
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(source_scout_mod, "_load_yt_dlp", lambda: _FakeYoutubeDL)
+
+    entries = source_scout_mod.fetch_source_entries(
+        {
+            "provider": "twitch_helix",
+            "platform": "twitch",
+            "url": "https://www.twitch.tv/ludwig/videos",
+        },
+        limit=2,
+    )
+
+    assert len(entries) == 1
+    assert entries[0]["url"] == "https://www.twitch.tv/videos/987654321"
+    assert entries[0]["platform"] == "twitch"
+    assert entries[0]["channel_name"] == "Ludwig"
 
 
 def test_build_source_profile_separates_metrics_and_judgments():
