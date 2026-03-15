@@ -676,7 +676,7 @@ def _load_scout_probe_config(watchlist: Dict[str, Any]) -> Dict[str, Any]:
         raw = {}
     return {
         "enabled": bool(raw.get("enabled", True)),
-        "shortlist": max(2, _safe_int(raw.get("shortlist"), 4)),
+        "shortlist": max(2, _safe_int(raw.get("shortlist"), 30)),
         "min_candidates": max(2, _safe_int(raw.get("min_candidates"), 2)),
         "rerank_weight": max(0.0, min(0.5, _safe_float(raw.get("rerank_weight"), 0.24))),
         "ttl_hours": max(1.0, _safe_float(raw.get("ttl_hours"), 18.0)),
@@ -894,6 +894,10 @@ def _probe_single_candidate_chat(
 
     try:
         paths["root"].mkdir(parents=True, exist_ok=True)
+        if paths["raw"].exists():
+            paths["raw"].unlink()
+        if paths["db"].exists():
+            paths["db"].unlink()
         download_chat(str(candidate.get("url") or "").strip(), paths["raw"])
         summary = _compute_chat_probe_summary(
             candidate=candidate,
@@ -1283,8 +1287,8 @@ def _score_candidate(
 def build_source_scout_report(
     *,
     watchlist_path: Optional[Path] = None,
-    per_source: int = 5,
-    limit: int = 20,
+    per_source: int = 20,
+    limit: int = 60,
     now_ts: Optional[float] = None,
     fetch_entries_fn: Optional[Callable[..., list[Dict[str, Any]]]] = None,
     probe_candidates_fn: Optional[Callable[..., Dict[str, Dict[str, Any]]]] = None,

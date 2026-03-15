@@ -496,6 +496,49 @@ sources:
     assert data["strategy"]["manual_inbox"]["pending_count"] == 1
 
 
+def test_actions_scout_candidates_uses_wider_default_window(tmp_path, monkeypatch):
+    import videopipeline.source_scout as source_scout_mod
+
+    captured = {}
+
+    def fake_build_source_scout_report(*, limit, per_source, **kwargs):
+        captured["limit"] = limit
+        captured["per_source"] = per_source
+        return {
+            "meta": {
+                "generated_at": "2026-03-15T00:00:00+00:00",
+                "watchlist_path": None,
+                "shadow_mode": True,
+                "enabled_source_count": 0,
+                "candidate_count": 0,
+                "chat_probe": {"status": "not_enough_candidates"},
+            },
+            "strategy": {
+                "mode": "shadow",
+                "per_source": per_source,
+                "limit": limit,
+                "ranking_factors": [],
+                "chat_probe": {},
+                "source_profile_model": {},
+                "dedupe": {},
+                "manual_inbox": {"inbox_path": None, "pending_count": 0},
+            },
+            "sources": [],
+            "skipped": {},
+            "recommended": None,
+            "candidates": [],
+        }
+
+    monkeypatch.setattr(source_scout_mod, "build_source_scout_report", fake_build_source_scout_report)
+
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    r = client.get("/api/actions/scout/candidates", headers=hdr)
+    assert r.status_code == 200
+    assert captured == {"limit": 60, "per_source": 20}
+
+
 def test_actions_run_ingest_analyze_persists_scout_metadata(tmp_path, monkeypatch):
     import videopipeline.chat.downloader as chat_downloader
     import videopipeline.studio.actions_api as actions_api_mod

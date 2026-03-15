@@ -3278,10 +3278,10 @@ def create_actions_router(
         return JSONResponse({"projects": out})
 
     @router.get("/scout/candidates", openapi_extra={"x-openai-isConsequential": False})
-    def scout_candidates(request: Request, limit: int = 20, per_source: int = 5):
+    def scout_candidates(request: Request, limit: int = 60, per_source: int = 20):
         _rate_limit(request)
-        limit = _clamp_int(limit, default=20, min_v=1, max_v=50)
-        per_source = _clamp_int(per_source, default=5, min_v=1, max_v=20)
+        limit = _clamp_int(limit, default=60, min_v=1, max_v=100)
+        per_source = _clamp_int(per_source, default=20, min_v=1, max_v=50)
         try:
             report = source_scout_mod.build_source_scout_report(limit=limit, per_source=per_source)
         except ValueError as exc:

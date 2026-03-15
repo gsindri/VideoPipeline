@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import videopipeline.source_scout as source_scout_mod
 
 
@@ -420,3 +422,63 @@ sources:
     assert probe_calls["count"] == 0
     assert report["meta"]["chat_probe"]["status"] == "not_enough_candidates"
     assert report["candidates"][0]["url"] == "https://www.twitch.tv/videos/111"
+
+
+def test_probe_single_candidate_chat_replaces_existing_probe_files(tmp_path, monkeypatch):
+    import videopipeline.chat.downloader as chat_downloader_mod
+
+    cache_root = tmp_path / "probe"
+    raw_path = cache_root / "chat.json"
+    db_path = cache_root / "chat.sqlite"
+    summary_path = cache_root / "summary.json"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    raw_path.write_text("old raw", encoding="utf-8")
+    db_path.write_text("old db", encoding="utf-8")
+
+    monkeypatch.setattr(
+        source_scout_mod,
+        "_probe_cache_paths",
+        lambda url, *, content_key=None: {
+            "root": cache_root,
+            "summary": summary_path,
+            "raw": raw_path,
+            "db": db_path,
+        },
+    )
+    monkeypatch.setattr(source_scout_mod, "_load_cached_probe_summary", lambda *a, **k: None)
+    monkeypatch.setattr(chat_downloader_mod, "is_chat_download_available", lambda: True)
+
+    download_calls = {"count": 0}
+
+    def fake_download_chat(url, output_path, **kwargs):
+        download_calls["count"] += 1
+        assert not raw_path.exists()
+        assert not db_path.exists()
+        Path(output_path).write_text("new raw", encoding="utf-8")
+        return object()
+
+    monkeypatch.setattr(chat_downloader_mod, "download_chat", fake_download_chat)
+    monkeypatch.setattr(
+        source_scout_mod,
+        "_compute_chat_probe_summary",
+        lambda **kwargs: {
+            "status": "ok",
+            "method": "chat_excitement_probe",
+            "score": 0.8,
+        },
+    )
+
+    summary = source_scout_mod._probe_single_candidate_chat(
+        {
+            "url": "https://www.twitch.tv/videos/111",
+            "content_key": "twitch_111",
+            "platform": "twitch",
+        },
+        probe_config={"ttl_hours": 18.0},
+        now_ts=1742061600.0,
+    )
+
+    assert download_calls["count"] == 1
+    assert raw_path.read_text(encoding="utf-8") == "new raw"
+    assert summary_path.exists()
+    assert summary["status"] == "ok"
