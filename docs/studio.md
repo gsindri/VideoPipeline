@@ -19,6 +19,34 @@ For direct commands, prefer:
 .\.venv\Scripts\python.exe -m pytest tests/test_studio_actions_api.py
 ```
 
+### Twitch Scout API Setup
+
+If you want Scout to use Twitch Helix directly instead of the fallback fetch path:
+
+1. Create a Twitch developer application in the Twitch developer console.
+2. Use the **Client Credentials** flow for a server-side app token.
+3. Save the app credentials locally with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\setup_twitch_api.ps1
+```
+
+This validates the credentials against Twitch and writes them to:
+
+```text
+%LOCALAPPDATA%\VideoPipeline\studio.env
+```
+
+`run_studio.bat` / `videopipeline.launcher` will load that local env file automatically on startup.
+
+Optional:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\setup_twitch_api.ps1 -SetUserEnv
+```
+
+That also writes `TWITCH_CLIENT_ID` and `TWITCH_CLIENT_SECRET` to your Windows user env vars for shells outside Studio.
+
 ### macOS / Linux / dedicated POSIX venv
 
 ```bash

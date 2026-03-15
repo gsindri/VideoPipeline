@@ -56,6 +56,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765  # used only if --port specified; otherwise we auto-pick
 STUDIO_PORT_ENV = "VP_STUDIO_PORT"
 STUDIO_PROFILE_ENV = "VP_STUDIO_PROFILE"
+STUDIO_ENV_FILE_ENV = "VP_STUDIO_ENV_FILE"
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,63 @@ def _workspace_dir() -> Path:
         p = _state_dir() / "workspace"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def _local_env_candidates() -> List[Path]:
+    paths: List[Path] = []
+    explicit = (os.getenv(STUDIO_ENV_FILE_ENV) or "").strip()
+    if explicit:
+        paths.append(Path(explicit).expanduser())
+    if os.name == "nt":
+        base = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or str(Path.home() / "AppData" / "Local")
+        paths.append(Path(base) / APP_NAME / "studio.env")
+    else:
+        paths.append(Path.home() / f".{APP_NAME.lower()}" / "studio.env")
+    paths.append(_exe_dir() / ".env.local")
+    seen = set()
+    out: List[Path] = []
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def _parse_env_assignment(raw_line: str) -> Optional[tuple[str, str]]:
+    line = str(raw_line or "").strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("export "):
+        line = line[7:].strip()
+    if "=" not in line:
+        return None
+    key, value = line.split("=", 1)
+    key = key.strip()
+    if not key:
+        return None
+    value = value.strip()
+    if len(value) >= 2 and value[:1] == value[-1:] and value[:1] in {'"', "'"}:
+        value = value[1:-1]
+    return key, value
+
+
+def _load_local_env_file() -> Optional[Path]:
+    for path in _local_env_candidates():
+        if not path.exists():
+            continue
+        try:
+            for raw_line in path.read_text(encoding="utf-8").splitlines():
+                parsed = _parse_env_assignment(raw_line)
+                if parsed is None:
+                    continue
+                key, value = parsed
+                os.environ.setdefault(key, value)
+            return path
+        except Exception as exc:
+            logger.warning("Failed to load Studio env file %s: %s", path, exc)
+    return None
 
 
 def _runtime_file() -> Path:
@@ -335,9 +393,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     # Fix broken stdout/stderr when running as frozen exe without console
     _fix_frozen_streams()
 
+    loaded_env_file = _load_local_env_file()
     level = getattr(logging, os.getenv("VP_LOG_LEVEL", "INFO").upper(), logging.INFO)
     log_path = Path(os.getenv("VP_LOG_FILE", "")).expanduser() if os.getenv("VP_LOG_FILE") else _log_file()
     setup_logging(level=level, log_file=log_path)
+    if loaded_env_file is not None:
+        logger.info("Loaded Studio env file: %s", loaded_env_file)
 
     argv = argv if argv is not None else sys.argv[1:]
 

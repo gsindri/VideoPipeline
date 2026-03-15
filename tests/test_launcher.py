@@ -89,3 +89,27 @@ def test_reuse_existing_profile_unknown_runtime_profile(monkeypatch, tmp_path):
     monkeypatch.setattr(launcher, "_http_ok", lambda *args, **kwargs: True)
 
     assert launcher._reuse_existing_if_running(requested_profile=requested_profile) is None
+
+
+def test_parse_env_assignment_supports_export_and_quotes():
+    assert launcher._parse_env_assignment('export TWITCH_CLIENT_ID="abc123"') == ("TWITCH_CLIENT_ID", "abc123")
+    assert launcher._parse_env_assignment("TWITCH_CLIENT_SECRET='shh'") == ("TWITCH_CLIENT_SECRET", "shh")
+    assert launcher._parse_env_assignment("# comment") is None
+    assert launcher._parse_env_assignment("not-an-assignment") is None
+
+
+def test_load_local_env_file_sets_missing_values_only(monkeypatch, tmp_path):
+    env_file = tmp_path / "studio.env"
+    env_file.write_text(
+        'TWITCH_CLIENT_ID=client-id\nTWITCH_CLIENT_SECRET="secret-1"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VP_STUDIO_ENV_FILE", str(env_file))
+    monkeypatch.delenv("TWITCH_CLIENT_ID", raising=False)
+    monkeypatch.setenv("TWITCH_CLIENT_SECRET", "already-set")
+
+    loaded = launcher._load_local_env_file()
+
+    assert loaded == env_file
+    assert launcher.os.environ["TWITCH_CLIENT_ID"] == "client-id"
+    assert launcher.os.environ["TWITCH_CLIENT_SECRET"] == "already-set"
