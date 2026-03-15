@@ -238,3 +238,185 @@ def test_build_source_profile_separates_metrics_and_judgments():
     assert profile["judgments"]["notes"] == "High reach and strong fit, but already saturated."
     assert profile["recommendation"]["band"] in {"medium", "high"}
     assert any("clip density rated 4/5" in reason for reason in profile["recommendation"]["reasons"])
+
+
+def test_build_source_scout_report_reranks_shortlist_with_chat_probe(tmp_path, monkeypatch):
+    watchlist_path = tmp_path / "watchlist.local.yaml"
+    watchlist_path.write_text(
+        """
+shadow_mode: true
+scout_probe:
+  enabled: true
+  shortlist: 3
+  min_candidates: 2
+  rerank_weight: 0.24
+sources:
+  - id: ludwig
+    label: Ludwig Twitch VODs
+    platform: twitch
+    provider: twitch_helix
+    enabled: true
+    priority: 2
+        """.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        source_scout_mod,
+        "build_project_history",
+        lambda projects_root=None: {
+            "processed_urls": set(),
+            "processed_content_keys": set(),
+            "source_stats": {},
+        },
+    )
+    monkeypatch.setattr(
+        source_scout_mod,
+        "list_source_inbox_entries",
+        lambda status="pending": (None, []),
+    )
+
+    def fake_fetch_entries(source, limit):
+        assert source["id"] == "ludwig"
+        return [
+            {
+                "url": "https://www.twitch.tv/videos/111",
+                "title": "Candidate one",
+                "duration_seconds": 7200,
+                "published_at": "2026-03-15T14:00:00Z",
+                "platform": "twitch",
+                "channel_name": "Ludwig",
+                "video_id": "111",
+            },
+            {
+                "url": "https://www.twitch.tv/videos/222",
+                "title": "Candidate two",
+                "duration_seconds": 7200,
+                "published_at": "2026-03-15T03:00:00Z",
+                "platform": "twitch",
+                "channel_name": "Ludwig",
+                "video_id": "222",
+            },
+            {
+                "url": "https://www.twitch.tv/videos/333",
+                "title": "Candidate three",
+                "duration_seconds": 7200,
+                "published_at": "2026-03-14T22:00:00Z",
+                "platform": "twitch",
+                "channel_name": "Ludwig",
+                "video_id": "333",
+            },
+        ]
+
+    probed_urls = []
+
+    def fake_probe_candidates(selected, *, probe_config, now_ts):
+        probed_urls.extend(item["url"] for item in selected)
+        return {
+            "https://www.twitch.tv/videos/111": {
+                "status": "ok",
+                "score": 0.10,
+                "peak_count": 1,
+                "laugh_peak_count": 0,
+            },
+            "https://www.twitch.tv/videos/222": {
+                "status": "ok",
+                "score": 0.95,
+                "peak_count": 5,
+                "laugh_peak_count": 2,
+            },
+            "https://www.twitch.tv/videos/333": {
+                "status": "ok",
+                "score": 0.40,
+                "peak_count": 2,
+                "laugh_peak_count": 0,
+            },
+        }
+
+    report = source_scout_mod.build_source_scout_report(
+        watchlist_path=watchlist_path,
+        per_source=3,
+        limit=5,
+        now_ts=1742061600.0,  # 2026-03-15T15:00:00Z
+        fetch_entries_fn=fake_fetch_entries,
+        probe_candidates_fn=fake_probe_candidates,
+    )
+
+    ranked_urls = [item["url"] for item in report["candidates"]]
+    assert probed_urls == ranked_urls[:3]
+    assert ranked_urls[0] == "https://www.twitch.tv/videos/222"
+    assert report["meta"]["chat_probe"]["status"] == "applied"
+    assert report["meta"]["chat_probe"]["used_count"] == 3
+    assert "chat excitement probe across shortlisted VODs" in report["strategy"]["ranking_factors"]
+    assert report["candidates"][0]["chat_probe"]["score"] == 0.95
+    assert any(
+        "chat probe compared multiple VODs" in reason
+        for reason in report["candidates"][0]["reasons"]
+    )
+
+
+def test_build_source_scout_report_skips_chat_probe_without_multiple_candidates(tmp_path, monkeypatch):
+    watchlist_path = tmp_path / "watchlist.local.yaml"
+    watchlist_path.write_text(
+        """
+shadow_mode: true
+scout_probe:
+  enabled: true
+  shortlist: 3
+  min_candidates: 2
+sources:
+  - id: ludwig
+    label: Ludwig Twitch VODs
+    platform: twitch
+    provider: twitch_helix
+    enabled: true
+    priority: 2
+        """.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        source_scout_mod,
+        "build_project_history",
+        lambda projects_root=None: {
+            "processed_urls": set(),
+            "processed_content_keys": set(),
+            "source_stats": {},
+        },
+    )
+    monkeypatch.setattr(
+        source_scout_mod,
+        "list_source_inbox_entries",
+        lambda status="pending": (None, []),
+    )
+
+    probe_calls = {"count": 0}
+
+    def fake_probe_candidates(selected, *, probe_config, now_ts):
+        probe_calls["count"] += 1
+        return {}
+
+    report = source_scout_mod.build_source_scout_report(
+        watchlist_path=watchlist_path,
+        per_source=3,
+        limit=5,
+        now_ts=1742061600.0,
+        fetch_entries_fn=lambda source, limit: [
+            {
+                "url": "https://www.twitch.tv/videos/111",
+                "title": "Only candidate",
+                "duration_seconds": 7200,
+                "published_at": "2026-03-15T14:00:00Z",
+                "platform": "twitch",
+                "channel_name": "Ludwig",
+                "video_id": "111",
+            }
+        ],
+        probe_candidates_fn=fake_probe_candidates,
+    )
+
+    assert probe_calls["count"] == 0
+    assert report["meta"]["chat_probe"]["status"] == "not_enough_candidates"
+    assert report["candidates"][0]["url"] == "https://www.twitch.tv/videos/111"

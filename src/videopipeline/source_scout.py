@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -28,6 +29,7 @@ _TWITCH_HTTP_TIMEOUT_S = 10.0
 _TWITCH_TOKEN_LOCK = threading.Lock()
 _TWITCH_TOKEN_CACHE: dict[str, Any] = {"access_token": "", "expires_at": 0.0}
 _TWITCH_USER_CACHE: dict[str, dict[str, str]] = {}
+_SCOUT_PROBE_SCHEMA_VERSION = 1
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -152,6 +154,17 @@ def _timestamp_to_iso(value: Any) -> Optional[str]:
     if ts <= 0:
         return None
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _parse_iso_ts(value: Any) -> Optional[float]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    return dt.timestamp()
 
 
 def _age_hours(published_at: Optional[str], *, now_ts: float) -> Optional[float]:
@@ -606,6 +619,384 @@ def _weighted_average(parts: list[tuple[Optional[float], float]]) -> Optional[fl
     return total_value / total_weight
 
 
+def _clamp01(value: Any) -> float:
+    return max(0.0, min(1.0, _safe_float(value, 0.0)))
+
+
+def _mean_top(values: list[float], *, limit: int) -> float:
+    positives = sorted((float(item) for item in values if float(item) > 0.0), reverse=True)
+    if not positives:
+        return 0.0
+    top = positives[: max(1, int(limit))]
+    return sum(top) / float(len(top))
+
+
+def _feature_values(features: Dict[str, Any], key: str) -> list[float]:
+    raw = features.get(key)
+    if raw is None:
+        return []
+    return [float(item) for item in list(raw)]
+
+
+def _probe_cache_dir() -> Path:
+    if os.name == "nt":
+        base = (
+            os.environ.get("LOCALAPPDATA")
+            or os.environ.get("APPDATA")
+            or str(Path.home() / "AppData" / "Local")
+        )
+        return Path(base) / "VideoPipeline" / "scout_probe"
+    return Path.home() / ".videopipeline" / "scout_probe"
+
+
+def _probe_cache_key(url: str, content_key: Optional[str] = None) -> str:
+    raw = str(content_key or "").strip() or extract_content_key(url)
+    if not raw:
+        raw = hashlib.sha1(str(url or "").encode("utf-8")).hexdigest()
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw).strip("._-") or "candidate"
+
+
+def _probe_cache_paths(url: str, *, content_key: Optional[str] = None) -> Dict[str, Path]:
+    cache_root = _probe_cache_dir() / _probe_cache_key(url, content_key=content_key)
+    return {
+        "root": cache_root,
+        "summary": cache_root / "summary.json",
+        "raw": cache_root / "chat.json",
+        "db": cache_root / "chat.sqlite",
+    }
+
+
+def _load_scout_probe_config(watchlist: Dict[str, Any]) -> Dict[str, Any]:
+    raw = watchlist.get("scout_probe")
+    if raw is None:
+        raw = watchlist.get("chat_probe")
+    if isinstance(raw, bool):
+        raw = {"enabled": raw}
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "shortlist": max(2, _safe_int(raw.get("shortlist"), 4)),
+        "min_candidates": max(2, _safe_int(raw.get("min_candidates"), 2)),
+        "rerank_weight": max(0.0, min(0.5, _safe_float(raw.get("rerank_weight"), 0.24))),
+        "ttl_hours": max(1.0, _safe_float(raw.get("ttl_hours"), 18.0)),
+        "hop_s": max(2.0, _safe_float(raw.get("hop_s"), 15.0)),
+        "smooth_s": max(4.0, _safe_float(raw.get("smooth_s"), 45.0)),
+        "peak_threshold": max(0.5, _safe_float(raw.get("peak_threshold"), 2.25)),
+        "laugh_peak_threshold": max(0.5, _safe_float(raw.get("laugh_peak_threshold"), 1.75)),
+        "emote_peak_threshold": max(0.5, _safe_float(raw.get("emote_peak_threshold"), 1.75)),
+    }
+
+
+def _load_cached_probe_summary(path: Path, *, now_ts: float, max_age_s: float) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    generated_ts = _parse_iso_ts(payload.get("generated_at"))
+    if generated_ts is None:
+        return None
+    age_s = max(0.0, now_ts - generated_ts)
+    if age_s > max_age_s:
+        return None
+    out = dict(payload)
+    out["cached"] = True
+    out["cache_age_hours"] = round(age_s / 3600.0, 2)
+    return out
+
+
+def _save_probe_summary(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serializable = dict(payload)
+    serializable["schema_version"] = _SCOUT_PROBE_SCHEMA_VERSION
+    serializable["cached"] = False
+    path.write_text(json.dumps(serializable, indent=2, ensure_ascii=False), encoding="utf-8")
+    return serializable
+
+
+def _candidate_supports_chat_probe(candidate: Dict[str, Any]) -> bool:
+    url = str(candidate.get("url") or "").strip()
+    if not url.startswith("http"):
+        return False
+    selection_mode = str(candidate.get("selection_mode") or "").strip().lower()
+    if selection_mode and selection_mode != "watchlist":
+        return False
+    platform = str(candidate.get("platform") or "").strip().lower()
+    return platform in {"", "twitch", "youtube"}
+
+
+def _store_probe_messages(
+    *,
+    db_path: Path,
+    url: str,
+    raw_path: Path,
+    platform: str,
+    video_id: Optional[str],
+    channel_name: Optional[str],
+) -> Dict[str, Any]:
+    from .chat.normalize import load_chat_data, normalize_chat_messages
+    from .chat.store import ChatMeta, ChatStore
+
+    raw_data = load_chat_data(raw_path)
+    messages = normalize_chat_messages(raw_data)
+    if not messages:
+        raise RuntimeError("no chat messages found")
+    duration_ms = max((int(msg.t_ms) for msg in messages), default=0)
+
+    with ChatStore(db_path) as store:
+        store.initialize()
+        store.clear_messages()
+        inserted = store.insert_messages(messages)
+        store.set_all_meta(
+            ChatMeta(
+                source_url=url,
+                platform=platform,
+                video_id=str(video_id or "").strip(),
+                channel=str(channel_name or "").strip().lower(),
+                channel_id=str(channel_name or "").strip().lower(),
+                channel_name=str(channel_name or "").strip(),
+                message_count=inserted,
+                duration_ms=duration_ms,
+            )
+        )
+    return {
+        "message_count": int(len(messages)),
+        "duration_s": max(0.0, duration_ms / 1000.0),
+    }
+
+
+def _compute_chat_probe_summary(
+    *,
+    candidate: Dict[str, Any],
+    probe_config: Dict[str, Any],
+    raw_path: Path,
+    db_path: Path,
+) -> Dict[str, Any]:
+    from .chat.features import compute_chat_features
+    from .chat.store import ChatStore
+
+    store_meta = _store_probe_messages(
+        db_path=db_path,
+        url=str(candidate.get("url") or "").strip(),
+        raw_path=raw_path,
+        platform=str(candidate.get("platform") or "twitch").strip().lower() or "twitch",
+        video_id=str(candidate.get("video_id") or "").strip() or None,
+        channel_name=str(candidate.get("channel_name") or candidate.get("source_label") or "").strip() or None,
+    )
+    duration_s = max(
+        1.0,
+        _safe_float(candidate.get("duration_seconds"), 0.0),
+        _safe_float(store_meta.get("duration_s"), 0.0),
+    )
+
+    with ChatStore(db_path) as store:
+        features = compute_chat_features(
+            store,
+            duration_s=duration_s,
+            hop_s=_safe_float(probe_config.get("hop_s"), 15.0),
+            smooth_s=_safe_float(probe_config.get("smooth_s"), 45.0),
+        )
+
+    scores = _feature_values(features, "scores")
+    laugh_scores = _feature_values(features, "scores_laugh")
+    emote_scores = _feature_values(features, "scores_emote")
+    messages_total = max(0, _safe_int(features.get("messages_total"), store_meta.get("message_count", 0)))
+
+    peak_threshold = _safe_float(probe_config.get("peak_threshold"), 2.25)
+    laugh_threshold = _safe_float(probe_config.get("laugh_peak_threshold"), 1.75)
+    emote_threshold = _safe_float(probe_config.get("emote_peak_threshold"), 1.75)
+
+    peak_count = sum(1 for item in scores if item >= peak_threshold)
+    laugh_peak_count = sum(1 for item in laugh_scores if item >= laugh_threshold)
+    emote_peak_count = sum(1 for item in emote_scores if item >= emote_threshold)
+    top_composite_mean = _mean_top(scores, limit=6)
+    top_laugh_mean = _mean_top(laugh_scores, limit=4)
+    top_emote_mean = _mean_top(emote_scores, limit=4)
+    messages_per_minute = (messages_total * 60.0 / duration_s) if duration_s > 0 else 0.0
+
+    activity_signal = _clamp01(top_composite_mean / 4.0)
+    peak_signal = _clamp01(peak_count / 6.0)
+    laugh_signal = max(_clamp01(top_laugh_mean / 4.0), _clamp01(laugh_peak_count / 4.0))
+    emote_signal = max(_clamp01(top_emote_mean / 4.0), _clamp01(emote_peak_count / 4.0))
+    chatter_signal = _clamp01(messages_per_minute / 220.0)
+
+    probe_score = _weighted_average(
+        [
+            (activity_signal, 0.35),
+            (peak_signal, 0.25),
+            (laugh_signal, 0.20),
+            (emote_signal, 0.12),
+            (chatter_signal, 0.08),
+        ]
+    )
+    if probe_score is None:
+        probe_score = 0.0
+
+    return {
+        "status": "ok",
+        "method": "chat_excitement_probe",
+        "score": round(probe_score, 4),
+        "messages_total": messages_total,
+        "duration_s": round(duration_s, 2),
+        "messages_per_minute": round(messages_per_minute, 2),
+        "peak_count": int(peak_count),
+        "laugh_peak_count": int(laugh_peak_count),
+        "emote_peak_count": int(emote_peak_count),
+        "top_composite_mean": round(top_composite_mean, 3),
+        "top_laugh_mean": round(top_laugh_mean, 3),
+        "top_emote_mean": round(top_emote_mean, 3),
+        "signals": {
+            "activity": round(activity_signal, 4),
+            "peaks": round(peak_signal, 4),
+            "laughter": round(laugh_signal, 4),
+            "emotes": round(emote_signal, 4),
+            "chatter": round(chatter_signal, 4),
+        },
+    }
+
+
+def _probe_single_candidate_chat(
+    candidate: Dict[str, Any],
+    *,
+    probe_config: Dict[str, Any],
+    now_ts: float,
+) -> Dict[str, Any]:
+    ttl_s = max(3600.0, _safe_float(probe_config.get("ttl_hours"), 18.0) * 3600.0)
+    paths = _probe_cache_paths(
+        str(candidate.get("url") or "").strip(),
+        content_key=str(candidate.get("content_key") or "").strip() or None,
+    )
+    cached = _load_cached_probe_summary(paths["summary"], now_ts=now_ts, max_age_s=ttl_s)
+    if cached is not None:
+        return cached
+
+    try:
+        from .chat.downloader import download_chat, is_chat_download_available
+    except Exception as exc:
+        payload = {
+            "status": "error",
+            "generated_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
+            "error": f"chat probe import failed: {exc}",
+        }
+        return _save_probe_summary(paths["summary"], payload)
+
+    if not is_chat_download_available():
+        payload = {
+            "status": "error",
+            "generated_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
+            "error": "chat download tools unavailable",
+        }
+        return _save_probe_summary(paths["summary"], payload)
+
+    try:
+        paths["root"].mkdir(parents=True, exist_ok=True)
+        download_chat(str(candidate.get("url") or "").strip(), paths["raw"])
+        summary = _compute_chat_probe_summary(
+            candidate=candidate,
+            probe_config=probe_config,
+            raw_path=paths["raw"],
+            db_path=paths["db"],
+        )
+        summary["generated_at"] = datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat()
+        return _save_probe_summary(paths["summary"], summary)
+    except Exception as exc:
+        payload = {
+            "status": "error",
+            "generated_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        return _save_probe_summary(paths["summary"], payload)
+
+
+def _apply_chat_probe_rerank(
+    candidates: list[Dict[str, Any]],
+    *,
+    watchlist: Dict[str, Any],
+    now_ts: float,
+    probe_candidates_fn: Optional[Callable[..., Dict[str, Dict[str, Any]]]] = None,
+) -> Dict[str, Any]:
+    probe_config = _load_scout_probe_config(watchlist)
+    meta = {
+        "enabled": bool(probe_config.get("enabled", True)),
+        "eligible_candidates": 0,
+        "shortlist_count": 0,
+        "used_count": 0,
+        "status": "disabled",
+    }
+
+    for item in candidates:
+        item.setdefault("base_score", round(_safe_float(item.get("score"), 0.0), 4))
+
+    if not meta["enabled"]:
+        return meta
+
+    eligible = [item for item in candidates if _candidate_supports_chat_probe(item)]
+    meta["eligible_candidates"] = len(eligible)
+    if len(eligible) < max(2, _safe_int(probe_config.get("min_candidates"), 2)):
+        meta["status"] = "not_enough_candidates"
+        return meta
+
+    shortlist = eligible[: max(2, _safe_int(probe_config.get("shortlist"), 4))]
+    meta["shortlist_count"] = len(shortlist)
+    if len(shortlist) < 2:
+        meta["status"] = "not_enough_candidates"
+        return meta
+
+    if probe_candidates_fn is None:
+        def _default_probe(
+            selected: list[Dict[str, Any]],
+            *,
+            probe_config: Dict[str, Any],
+            now_ts: float,
+        ) -> Dict[str, Dict[str, Any]]:
+            return {
+                str(item.get("url") or "").strip(): _probe_single_candidate_chat(
+                    item,
+                    probe_config=probe_config,
+                    now_ts=now_ts,
+                )
+                for item in selected
+            }
+
+        probe_candidates_fn = _default_probe
+
+    probe_results = probe_candidates_fn(shortlist, probe_config=probe_config, now_ts=now_ts) or {}
+    rerank_weight = _safe_float(probe_config.get("rerank_weight"), 0.24)
+    used_count = 0
+    for item in shortlist:
+        key = str(item.get("url") or "").strip()
+        probe = probe_results.get(key)
+        if not isinstance(probe, dict):
+            continue
+        item["chat_probe"] = probe
+        if str(probe.get("status") or "").strip().lower() != "ok":
+            error = str(probe.get("error") or "").strip()
+            if error:
+                item.setdefault("reasons", []).append(f"chat probe unavailable: {error}")
+            continue
+        probe_score = _clamp01(probe.get("score"))
+        base_score = _safe_float(item.get("base_score"), item.get("score"))
+        score_adjustment = (probe_score - 0.5) * rerank_weight
+        item["score"] = round(base_score + score_adjustment, 4)
+        item.setdefault("reasons", []).append(
+            "chat probe compared multiple VODs: "
+            f"score={probe_score:.2f} peaks={_safe_int(probe.get('peak_count'), 0)} "
+            f"laugh_peaks={_safe_int(probe.get('laugh_peak_count'), 0)}"
+        )
+        probe["score_adjustment"] = round(score_adjustment, 4)
+        probe["base_score"] = round(base_score, 4)
+        probe["rerank_weight"] = round(rerank_weight, 4)
+        used_count += 1
+
+    meta["used_count"] = used_count
+    meta["status"] = "applied" if used_count > 0 else "unavailable"
+    return meta
+
+
 def _positive_rating_score(rating: Optional[int]) -> Optional[float]:
     if rating is None:
         return None
@@ -896,6 +1287,7 @@ def build_source_scout_report(
     limit: int = 20,
     now_ts: Optional[float] = None,
     fetch_entries_fn: Optional[Callable[..., list[Dict[str, Any]]]] = None,
+    probe_candidates_fn: Optional[Callable[..., Dict[str, Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     resolved_path, watchlist = load_source_watchlist(watchlist_path)
     now_ts = float(now_ts if now_ts is not None else time.time())
@@ -1049,6 +1441,22 @@ def build_source_scout_report(
         reverse=True,
     )
 
+    probe_meta = _apply_chat_probe_rerank(
+        candidates,
+        watchlist=watchlist,
+        now_ts=now_ts,
+        probe_candidates_fn=probe_candidates_fn,
+    )
+
+    candidates.sort(
+        key=lambda item: (
+            float(item.get("score") or 0.0),
+            -_safe_float(item.get("age_hours"), 0.0),
+            str(item.get("title") or ""),
+        ),
+        reverse=True,
+    )
+
     ranked: list[Dict[str, Any]] = []
     for idx, item in enumerate(candidates[:limit], start=1):
         ranked.append({"rank": idx, **item})
@@ -1060,6 +1468,7 @@ def build_source_scout_report(
             "shadow_mode": bool(watchlist.get("shadow_mode", True)),
             "enabled_source_count": len(enabled_sources),
             "candidate_count": len(ranked),
+            "chat_probe": probe_meta,
         },
         "strategy": {
             "mode": "shadow" if bool(watchlist.get("shadow_mode", True)) else "auto_ready",
@@ -1072,7 +1481,9 @@ def build_source_scout_report(
                 "recency",
                 "title cues",
                 "source hit history",
+                "chat excitement probe across shortlisted VODs",
             ],
+            "chat_probe": _load_scout_probe_config(watchlist),
             "source_profile_model": {
                 "objective_metrics": [
                     "candidate_hit_rate",
