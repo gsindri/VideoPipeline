@@ -899,6 +899,7 @@ def create_actions_router(
         }
 
     def _source_scout_diagnostics() -> Dict[str, Any]:
+        twitch_api_ready = source_scout_mod.twitch_api_configured()
         try:
             watchlist_path, watchlist = source_scout_mod.load_source_watchlist()
         except Exception as exc:
@@ -906,6 +907,9 @@ def create_actions_router(
             return {
                 "configured": False,
                 "ready": False,
+                "twitch_api_configured": twitch_api_ready,
+                "twitch_provider_sources": 0,
+                "twitch_helix_ready_sources": 0,
                 "watchlist_path": None,
                 "shadow_mode": True,
                 "enabled_sources": 0,
@@ -920,13 +924,20 @@ def create_actions_router(
         inbox_path, pending_entries = source_inbox_mod.list_source_inbox_entries(status="pending")
         issues: list[str] = []
         fetch_ready_sources = 0
+        twitch_provider_sources = 0
+        twitch_helix_ready_sources = 0
         for item in enabled_sources:
+            provider = str(item.get("provider") or "").strip().lower()
+            if provider in {"twitch_helix", "twitch_api"}:
+                twitch_provider_sources += 1
             provider_issue = source_scout_mod.source_preflight_issue(item)
             if provider_issue:
                 label = str(item.get("label") or item.get("id") or item.get("url") or "source").strip()
                 issues.append(f"{label}: {provider_issue}")
             else:
                 fetch_ready_sources += 1
+                if provider in {"twitch_helix", "twitch_api"}:
+                    twitch_helix_ready_sources += 1
         if watchlist_path is None:
             issues.append("source watchlist not found")
         if not fetch_ready_sources and not pending_entries:
@@ -934,6 +945,9 @@ def create_actions_router(
         return {
             "configured": watchlist_path is not None,
             "ready": bool((watchlist_path is not None and fetch_ready_sources) or pending_entries),
+            "twitch_api_configured": twitch_api_ready,
+            "twitch_provider_sources": twitch_provider_sources,
+            "twitch_helix_ready_sources": twitch_helix_ready_sources,
             "watchlist_path": str(watchlist_path) if watchlist_path is not None else None,
             "shadow_mode": bool(watchlist.get("shadow_mode", True)),
             "enabled_sources": len(enabled_sources),
@@ -6486,6 +6500,15 @@ def create_actions_router(
                     "vp_studio_profile": bool(os.environ.get("VP_STUDIO_PROFILE", "").strip()),
                     "assemblyai_api_key": _profile_env_present("ASSEMBLYAI_API_KEY", "AAI_API_KEY"),
                     "hf_token": _profile_env_present("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"),
+                    "twitch_client_id": _profile_env_present("TWITCH_CLIENT_ID", "TWITCH_API_CLIENT_ID"),
+                    "twitch_client_secret": _profile_env_present(
+                        "TWITCH_CLIENT_SECRET",
+                        "TWITCH_API_CLIENT_SECRET",
+                    ),
+                    "twitch_app_access_token": _profile_env_present(
+                        "TWITCH_APP_ACCESS_TOKEN",
+                        "TWITCH_ACCESS_TOKEN",
+                    ),
                 },
                 "transcription": {"backends": backends},
                 "chat": {
