@@ -438,6 +438,7 @@ sources:
                 "duration_seconds": 7200.0,
                 "published_at": now_iso,
                 "channel_name": "Rebbi",
+                "fetch_mode": "yt_dlp",
             },
             {
                 "url": "https://www.twitch.tv/videos/222",
@@ -445,6 +446,7 @@ sources:
                 "duration_seconds": 6800.0,
                 "published_at": now_iso,
                 "channel_name": "Rebbi",
+                "fetch_mode": "yt_dlp",
             },
             {
                 "url": "https://www.twitch.tv/videos/333",
@@ -452,6 +454,7 @@ sources:
                 "duration_seconds": 6800.0,
                 "published_at": now_iso,
                 "channel_name": "Rebbi",
+                "fetch_mode": "yt_dlp",
             },
         ]
 
@@ -469,9 +472,11 @@ sources:
     assert data["diagnostics"]["ready"] is True
     assert data["recommended"]["url"] == "https://www.twitch.tv/videos/222"
     assert data["recommended"]["source_id"] == "rebbi-twitch"
+    assert data["recommended"]["source_fetch_mode"] == "yt_dlp"
     assert data["recommended"]["history"]["source_project_count"] == 1
     assert data["recommended"]["source_profile"]["category"] == "opportunity"
     assert data["recommended"]["source_profile"]["judgments"]["clip_density_rating"] == 4
+    assert data["sources"][0]["fetch_mode"] == "yt_dlp"
     assert data["sources"][0]["profile"]["recommendation"]["band"] in {"medium", "high"}
     assert data["skipped"]["already_processed"] == 1
     assert data["skipped"]["title_excluded"] == 1

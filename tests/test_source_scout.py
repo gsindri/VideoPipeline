@@ -144,6 +144,7 @@ def test_fetch_source_entries_twitch_helix_by_login(monkeypatch):
     assert entries[0]["channel_name"] == "Ludwig"
     assert entries[0]["duration_seconds"] == 8392.0
     assert entries[0]["platform"] == "twitch"
+    assert entries[0]["fetch_mode"] == "twitch_helix"
 
 
 def test_fetch_source_entries_twitch_without_api_uses_yt_dlp_fallback(monkeypatch):
@@ -197,6 +198,7 @@ def test_fetch_source_entries_twitch_without_api_uses_yt_dlp_fallback(monkeypatc
     assert entries[0]["url"] == "https://www.twitch.tv/videos/987654321"
     assert entries[0]["platform"] == "twitch"
     assert entries[0]["channel_name"] == "Ludwig"
+    assert entries[0]["fetch_mode"] == "yt_dlp_fallback"
 
 
 def test_build_source_profile_separates_metrics_and_judgments():

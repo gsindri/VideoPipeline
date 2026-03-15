@@ -460,6 +460,7 @@ def _fetch_twitch_helix_entries(source: Dict[str, Any], *, limit: int) -> list[D
                 "video_id": video_id or None,
                 "is_live": False,
                 "platform": "twitch",
+                "fetch_mode": "twitch_helix",
             }
         )
         if len(out) >= limit:
@@ -493,6 +494,7 @@ def fetch_source_entries(source: Dict[str, Any], *, limit: int) -> list[Dict[str
         raw_entries = [info] if isinstance(info, dict) else []
 
     out: list[Dict[str, Any]] = []
+    yt_dlp_fetch_mode = "yt_dlp_fallback" if provider in {"twitch_helix", "twitch_api"} else "yt_dlp"
     for entry in raw_entries:
         if not isinstance(entry, dict):
             continue
@@ -525,11 +527,26 @@ def fetch_source_entries(source: Dict[str, Any], *, limit: int) -> list[Dict[str
                 "video_id": str(item.get("id") or "").strip(),
                 "is_live": bool(item.get("is_live")) or str(item.get("live_status") or "").lower() == "is_live",
                 "platform": str(source.get("platform") or item.get("extractor_key") or "").strip().lower() or None,
+                "fetch_mode": yt_dlp_fetch_mode,
             }
         )
         if len(out) >= limit:
             break
     return out
+
+
+def _infer_source_fetch_mode(source: Dict[str, Any]) -> Optional[str]:
+    provider = str(source.get("provider") or "").strip().lower()
+    source_url = str(source.get("url") or "").strip()
+    if provider in {"twitch_helix", "twitch_api"}:
+        if twitch_api_configured():
+            return "twitch_helix"
+        if source_url and yt_dlp_available():
+            return "yt_dlp_fallback"
+        return None
+    if source_url and yt_dlp_available():
+        return "yt_dlp"
+    return None
 
 
 def build_project_history(projects_root: Optional[Path] = None) -> Dict[str, Any]:
@@ -1259,6 +1276,7 @@ def _score_candidate(
             "source_id": source_id or None,
             "source_label": str(source.get("label") or source_id or source.get("url") or "").strip(),
             "source_url": str(source.get("url") or "").strip(),
+            "source_fetch_mode": str(entry.get("fetch_mode") or "").strip() or None,
             "platform": str(source.get("platform") or entry.get("platform") or "").strip() or None,
             "score": round(score, 4),
             "title": title,
@@ -1385,6 +1403,7 @@ def build_source_scout_report(
                 "added_by": added_by or None,
                 "notes": notes or None,
                 "source_priority": priority_raw,
+                "source_fetch_mode": None,
             }
         )
 
@@ -1396,6 +1415,7 @@ def build_source_scout_report(
             "label": str(source.get("label") or source_id or source.get("url") or "").strip(),
             "url": str(source.get("url") or "").strip(),
             "platform": str(source.get("platform") or "").strip() or None,
+            "fetch_mode": _infer_source_fetch_mode(source),
             "priority": _safe_float(source.get("priority"), 1.0),
             "recent_hours": _safe_float(source.get("recent_hours"), 72.0),
             "max_candidates": source_limit,
@@ -1411,6 +1431,16 @@ def build_source_scout_report(
             source_report["error"] = f"{type(exc).__name__}: {exc}"
             source_reports.append(source_report)
             continue
+
+        observed_fetch_modes = {
+            str(item.get("fetch_mode") or "").strip()
+            for item in raw_entries
+            if isinstance(item, dict) and str(item.get("fetch_mode") or "").strip()
+        }
+        if len(observed_fetch_modes) == 1:
+            source_report["fetch_mode"] = next(iter(observed_fetch_modes))
+        elif len(observed_fetch_modes) > 1:
+            source_report["fetch_mode"] = "mixed"
 
         source_count = 0
         for entry in raw_entries:
