@@ -426,6 +426,96 @@ sources:
     assert report["candidates"][0]["url"] == "https://www.twitch.tv/videos/111"
 
 
+def test_build_source_scout_report_dedupes_probe_shortlist_keys(tmp_path, monkeypatch):
+    watchlist_path = tmp_path / "watchlist.local.yaml"
+    watchlist_path.write_text(
+        """
+shadow_mode: true
+scout_probe:
+  enabled: true
+  shortlist: 4
+  min_candidates: 2
+sources:
+  - id: ludwig
+    label: Ludwig Twitch VODs
+    platform: twitch
+    provider: twitch_helix
+    enabled: true
+    priority: 2
+        """.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        source_scout_mod,
+        "build_project_history",
+        lambda projects_root=None: {
+            "processed_urls": set(),
+            "processed_content_keys": set(),
+            "source_stats": {},
+        },
+    )
+    monkeypatch.setattr(
+        source_scout_mod,
+        "list_source_inbox_entries",
+        lambda status="pending": (None, []),
+    )
+
+    probed_urls = []
+
+    def fake_probe_candidates(selected, *, probe_config, now_ts):
+        probed_urls.extend(item["url"] for item in selected)
+        return {
+            item["url"]: {"status": "ok", "score": 0.7, "peak_count": 2, "laugh_peak_count": 1}
+            for item in selected
+        }
+
+    report = source_scout_mod.build_source_scout_report(
+        watchlist_path=watchlist_path,
+        per_source=4,
+        limit=5,
+        now_ts=1742061600.0,
+        fetch_entries_fn=lambda source, limit: [
+            {
+                "url": "https://www.twitch.tv/videos/111",
+                "title": "Candidate one",
+                "duration_seconds": 7200,
+                "published_at": "2026-03-15T14:00:00Z",
+                "platform": "twitch",
+                "channel_name": "Ludwig",
+                "video_id": "111",
+            },
+            {
+                "url": "https://www.twitch.tv/videos/111",
+                "title": "Duplicate candidate one",
+                "duration_seconds": 7100,
+                "published_at": "2026-03-15T13:00:00Z",
+                "platform": "twitch",
+                "channel_name": "Ludwig",
+                "video_id": "111",
+            },
+            {
+                "url": "https://www.twitch.tv/videos/222",
+                "title": "Candidate two",
+                "duration_seconds": 7200,
+                "published_at": "2026-03-15T12:00:00Z",
+                "platform": "twitch",
+                "channel_name": "Ludwig",
+                "video_id": "222",
+            },
+        ],
+        probe_candidates_fn=fake_probe_candidates,
+    )
+
+    assert probed_urls == [
+        "https://www.twitch.tv/videos/111",
+        "https://www.twitch.tv/videos/222",
+    ]
+    assert report["meta"]["chat_probe"]["shortlist_count"] == 2
+    assert report["meta"]["chat_probe"]["used_count"] == 2
+
+
 def test_probe_single_candidate_chat_replaces_existing_probe_files(tmp_path, monkeypatch):
     import videopipeline.chat.downloader as chat_downloader_mod
 
@@ -451,24 +541,29 @@ def test_probe_single_candidate_chat_replaces_existing_probe_files(tmp_path, mon
     monkeypatch.setattr(chat_downloader_mod, "is_chat_download_available", lambda: True)
 
     download_calls = {"count": 0}
+    compute_calls = {"count": 0}
 
     def fake_download_chat(url, output_path, **kwargs):
         download_calls["count"] += 1
-        assert not raw_path.exists()
-        assert not db_path.exists()
+        assert Path(output_path) != raw_path
+        assert output_path.name.startswith("chat-")
         Path(output_path).write_text("new raw", encoding="utf-8")
         return object()
 
     monkeypatch.setattr(chat_downloader_mod, "download_chat", fake_download_chat)
-    monkeypatch.setattr(
-        source_scout_mod,
-        "_compute_chat_probe_summary",
-        lambda **kwargs: {
+
+    def fake_compute_chat_probe_summary(**kwargs):
+        compute_calls["count"] += 1
+        assert kwargs["raw_path"] != raw_path
+        assert kwargs["db_path"] != db_path
+        Path(kwargs["db_path"]).write_text("new db", encoding="utf-8")
+        return {
             "status": "ok",
             "method": "chat_excitement_probe",
             "score": 0.8,
-        },
-    )
+        }
+
+    monkeypatch.setattr(source_scout_mod, "_compute_chat_probe_summary", fake_compute_chat_probe_summary)
 
     summary = source_scout_mod._probe_single_candidate_chat(
         {
@@ -481,6 +576,8 @@ def test_probe_single_candidate_chat_replaces_existing_probe_files(tmp_path, mon
     )
 
     assert download_calls["count"] == 1
+    assert compute_calls["count"] == 1
     assert raw_path.read_text(encoding="utf-8") == "new raw"
+    assert db_path.read_text(encoding="utf-8") == "new db"
     assert summary_path.exists()
     assert summary["status"] == "ok"

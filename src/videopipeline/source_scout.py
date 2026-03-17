@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -909,19 +910,29 @@ def _probe_single_candidate_chat(
         }
         return _save_probe_summary(paths["summary"], payload)
 
+    temp_raw_path: Optional[Path] = None
+    temp_db_path: Optional[Path] = None
+
     try:
         paths["root"].mkdir(parents=True, exist_ok=True)
         if paths["raw"].exists():
             paths["raw"].unlink()
         if paths["db"].exists():
             paths["db"].unlink()
-        download_chat(str(candidate.get("url") or "").strip(), paths["raw"])
+        probe_run_id = uuid.uuid4().hex
+        temp_raw_path = paths["root"] / f"chat-{probe_run_id}.json"
+        temp_db_path = paths["root"] / f"chat-{probe_run_id}.sqlite"
+        download_chat(str(candidate.get("url") or "").strip(), temp_raw_path)
         summary = _compute_chat_probe_summary(
             candidate=candidate,
             probe_config=probe_config,
-            raw_path=paths["raw"],
-            db_path=paths["db"],
+            raw_path=temp_raw_path,
+            db_path=temp_db_path,
         )
+        if temp_raw_path.exists():
+            temp_raw_path.replace(paths["raw"])
+        if temp_db_path.exists():
+            temp_db_path.replace(paths["db"])
         summary["generated_at"] = datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat()
         return _save_probe_summary(paths["summary"], summary)
     except Exception as exc:
@@ -931,6 +942,13 @@ def _probe_single_candidate_chat(
             "error": f"{type(exc).__name__}: {exc}",
         }
         return _save_probe_summary(paths["summary"], payload)
+    finally:
+        for temp_path in (temp_raw_path, temp_db_path):
+            try:
+                if temp_path is not None and temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
 
 
 def _apply_chat_probe_rerank(
@@ -961,7 +979,17 @@ def _apply_chat_probe_rerank(
         meta["status"] = "not_enough_candidates"
         return meta
 
-    shortlist = eligible[: max(2, _safe_int(probe_config.get("shortlist"), 4))]
+    shortlist_limit = max(2, _safe_int(probe_config.get("shortlist"), 4))
+    shortlist: list[Dict[str, Any]] = []
+    seen_probe_keys: set[str] = set()
+    for item in eligible:
+        probe_key = str(item.get("content_key") or item.get("url") or "").strip()
+        if not probe_key or probe_key in seen_probe_keys:
+            continue
+        seen_probe_keys.add(probe_key)
+        shortlist.append(item)
+        if len(shortlist) >= shortlist_limit:
+            break
     meta["shortlist_count"] = len(shortlist)
     if len(shortlist) < 2:
         meta["status"] = "not_enough_candidates"
