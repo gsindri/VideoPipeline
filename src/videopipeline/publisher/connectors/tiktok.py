@@ -13,6 +13,7 @@ import requests
 
 from ..accounts import Account
 from ..secrets import store_tokens
+from .base import Connector
 
 AUTH_BASE = "https://www.tiktok.com/v2/auth/authorize/"
 TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
@@ -90,7 +91,7 @@ class TikTokMode:
     endpoint: str
 
 
-class TikTokConnector:
+class TikTokConnector(Connector):
     platform = "tiktok"
 
     def __init__(self, *, account: Account, tokens: dict[str, Any]) -> None:

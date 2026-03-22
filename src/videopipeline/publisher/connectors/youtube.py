@@ -8,9 +8,10 @@ from google.auth.transport.requests import AuthorizedSession, Request
 from google.oauth2.credentials import Credentials
 
 from ..accounts import Account
+from .base import Connector
 
 
-class YouTubeConnector:
+class YouTubeConnector(Connector):
     platform = "youtube"
 
     def __init__(self, *, account: Account, tokens: dict[str, Any]) -> None:

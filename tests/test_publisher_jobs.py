@@ -4,7 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from videopipeline.publisher.accounts import AccountStore
+from videopipeline.publisher.accounts import Account, AccountStore
+from videopipeline.publisher.connectors.tiktok import TikTokConnector
+from videopipeline.publisher.connectors.youtube import YouTubeConnector
 from videopipeline.publisher.jobs import PublishJobStore
 from videopipeline.publisher.queue import PublishWorker
 
@@ -109,3 +111,17 @@ def test_publish_worker_preserves_canceled_job(tmp_path: Path, monkeypatch):
     final = store.get_job("job123")
     assert final.status == "canceled"
     assert final.remote_id is None
+
+
+def test_connectors_inherit_shared_publish_flow():
+    youtube = YouTubeConnector(
+        account=Account(id="acct-yt", platform="youtube", label="YT"),
+        tokens={},
+    )
+    tiktok = TikTokConnector(
+        account=Account(id="acct-tt", platform="tiktok", label="TT"),
+        tokens={},
+    )
+
+    assert callable(getattr(youtube, "publish", None))
+    assert callable(getattr(tiktok, "publish", None))
