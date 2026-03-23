@@ -3964,6 +3964,30 @@ def create_actions_router(
             cut = cut.rsplit(" ", 1)[0]
         return (cut + "…").strip()
 
+    _PACKAGING_DOMAIN_RE = re.compile(
+        r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:com|net|org|gg|tv|io|co|app|dev)\b",
+        re.IGNORECASE,
+    )
+    _PACKAGING_GENERIC_DESCRIPTION_PATTERNS = (
+        (re.compile(r"\bthe stream (?:stops being normal|becomes|turns into)\b", re.IGNORECASE), "description_too_generic"),
+        (re.compile(r"\binstant\b.{0,48}\binstant\b", re.IGNORECASE), "description_repeated_hype"),
+        (re.compile(r"\bclip[- ]friendly\b", re.IGNORECASE), "description_clip_filler"),
+        (re.compile(r"\bout of context\b", re.IGNORECASE), "description_context_free_filler"),
+        (re.compile(r"\beasy to understand\b", re.IGNORECASE), "description_context_free_filler"),
+    )
+
+    def _packaging_quality_issues(*, title: str, hook: str, description: str) -> list[str]:
+        issues: list[str] = []
+        if _PACKAGING_DOMAIN_RE.search(title or ""):
+            issues.append("title_domain_anchor")
+        if _PACKAGING_DOMAIN_RE.search(hook or ""):
+            issues.append("hook_domain_anchor")
+        desc = str(description or "").strip()
+        for pattern, code in _PACKAGING_GENERIC_DESCRIPTION_PATTERNS:
+            if pattern.search(desc):
+                issues.append(code)
+        return issues
+
     def _clean_hashtag(value: Any) -> str:
         tag = str(value or "").strip()
         if not tag:
@@ -5927,6 +5951,22 @@ def create_actions_router(
                 p.get("description") or title,
                 max_chars=int(director_cfg.description_max_chars),
             )
+            packaging_issues = _packaging_quality_issues(
+                title=title,
+                hook=hook,
+                description=description,
+            )
+            if packaging_issues:
+                missing.append(
+                    {
+                        "candidate_rank": cand_rank,
+                        "candidate_id": cand_id or None,
+                        "variant_id": variant_id,
+                        "error": "packaging_quality",
+                        "issues": packaging_issues,
+                    }
+                )
+                continue
             template = str(p.get("template") or "").strip()
             if not template or (allowed_templates and template not in allowed_templates):
                 template = template_default

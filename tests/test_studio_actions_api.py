@@ -2194,6 +2194,96 @@ def test_actions_ai_apply_director_picks_enforces_overlap_and_normalizes_packagi
     assert pick["template"] in {"vertical_streamer_pip", "vertical_blur", "original"}
 
 
+def test_actions_ai_apply_director_picks_rejects_generic_or_domain_anchored_packaging(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    pid = hashlib.sha256("twitch_237_packaging_guard".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(proj_dir / "video" / "video.mp4"), "duration_seconds": 120.0},
+        "analysis": {
+            "highlights": {
+                "candidates": [
+                    {"rank": 1, "candidate_id": "cid1", "score": 1.0, "start_s": 10.0, "end_s": 20.0, "peak_time_s": 15.0},
+                    {"rank": 2, "candidate_id": "cid2", "score": 0.9, "start_s": 40.0, "end_s": 50.0, "peak_time_s": 45.0},
+                ]
+            }
+        },
+        "layout": {},
+        "selections": [],
+        "exports": [],
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+
+    variants_json = {
+        "created_at": "now",
+        "candidates": [
+            {
+                "candidate_rank": 1,
+                "candidate_peak_time_s": 15.0,
+                "variants": [
+                    {"variant_id": "medium", "start_s": 10.0, "end_s": 30.0, "duration_s": 20.0},
+                ],
+            },
+            {
+                "candidate_rank": 2,
+                "candidate_peak_time_s": 45.0,
+                "variants": [
+                    {"variant_id": "medium", "start_s": 40.0, "end_s": 60.0, "duration_s": 20.0},
+                ],
+            },
+        ],
+    }
+    (proj_dir / "analysis" / "variants.json").write_text(json.dumps(variants_json), encoding="utf-8")
+
+    r = client.post(
+        "/api/actions/ai/apply_director_picks",
+        headers=hdr,
+        json={
+            "project_id": pid,
+            "client_request_id": "apply-dir-packaging-1",
+            "picks": [
+                {
+                    "candidate_id": "cid1",
+                    "variant_id": "medium",
+                    "title": "She Found DolphinGirlGames.com and Locked In",
+                    "hook": "Wait for it",
+                    "description": "The stream stops being normal the second DolphinGirlGames appears. Instant obsession, instant comedy, instant clip.",
+                    "hashtags": ["clips"],
+                },
+                {
+                    "candidate_id": "cid2",
+                    "variant_id": "medium",
+                    "title": "Chat Called the Doxx Risk First",
+                    "hook": "Oh no",
+                    "description": "She clicks anyway, chat panics instantly, and the self-own lands right after.",
+                    "hashtags": ["clips"],
+                },
+            ],
+        },
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["pick_count"] == 1
+    assert any(
+        m.get("error") == "packaging_quality"
+        and "title_domain_anchor" in (m.get("issues") or [])
+        and "description_too_generic" in (m.get("issues") or [])
+        for m in data.get("missing", [])
+    )
+
+    director = json.loads((proj_dir / "analysis" / "director.json").read_text(encoding="utf-8"))
+    assert director["pick_count"] == 1
+    pick = director["picks"][0]
+    assert pick["candidate_id"] == "cid2"
+    assert pick["title"] == "Chat Called the Doxx Risk First"
+
+
 def test_actions_ai_apply_chapter_labels_accepts_chapter_zero(tmp_path, monkeypatch):
     client = _make_client(tmp_path, monkeypatch, token="secret")
     hdr = {"Authorization": "Bearer secret"}
