@@ -3459,6 +3459,7 @@ def create_actions_router(
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+        source_scout_mod.clear_source_scout_cache()
         return JSONResponse(
             {
                 "meta": {"inbox_path": str(inbox_path), "created": bool(created)},
@@ -3484,6 +3485,7 @@ def create_actions_router(
             raise HTTPException(status_code=404, detail="inbox_entry_not_found")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+        source_scout_mod.clear_source_scout_cache()
         return JSONResponse({"meta": {"inbox_path": str(inbox_path)}, "entry": entry})
 
     @router.get("/publish/accounts", openapi_extra={"x-openai-isConsequential": False})

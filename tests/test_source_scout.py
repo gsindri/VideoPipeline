@@ -360,6 +360,89 @@ sources:
     )
 
 
+def test_load_scout_probe_config_defaults_to_smaller_shortlist():
+    config = source_scout_mod._load_scout_probe_config({})
+
+    assert config["shortlist"] == 6
+
+
+def test_build_source_scout_report_reuses_short_lived_cache(tmp_path, monkeypatch):
+    source_scout_mod.clear_source_scout_cache()
+    watchlist_path = tmp_path / "watchlist.local.yaml"
+    watchlist_path.write_text(
+        """
+shadow_mode: true
+scout_probe:
+  enabled: false
+sources:
+  - id: ludwig
+    label: Ludwig Twitch VODs
+    platform: twitch
+    provider: twitch_helix
+    enabled: true
+    priority: 2
+        """.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        source_scout_mod,
+        "build_project_history",
+        lambda projects_root=None: {
+            "processed_urls": set(),
+            "processed_content_keys": set(),
+            "source_stats": {},
+        },
+    )
+    monkeypatch.setattr(
+        source_scout_mod,
+        "list_source_inbox_entries",
+        lambda status="pending": (None, []),
+    )
+
+    fetch_calls = {"count": 0}
+
+    def fake_fetch_entries(source, limit):
+        fetch_calls["count"] += 1
+        return [
+            {
+                "url": "https://www.twitch.tv/videos/111",
+                "title": "Candidate one",
+                "duration_seconds": 7200,
+                "published_at": "2026-03-15T14:00:00Z",
+                "platform": "twitch",
+                "channel_name": "Ludwig",
+                "video_id": "111",
+                "fetch_mode": "twitch_helix",
+            }
+        ]
+
+    monkeypatch.setattr(source_scout_mod, "fetch_source_entries", fake_fetch_entries)
+
+    first = source_scout_mod.build_source_scout_report(
+        watchlist_path=watchlist_path,
+        now_ts=1_000.0,
+    )
+    second = source_scout_mod.build_source_scout_report(
+        watchlist_path=watchlist_path,
+        now_ts=1_010.0,
+    )
+
+    assert fetch_calls["count"] == 1
+    assert first["recommended"]["url"] == "https://www.twitch.tv/videos/111"
+    assert second["recommended"]["url"] == "https://www.twitch.tv/videos/111"
+
+    source_scout_mod.clear_source_scout_cache()
+    third = source_scout_mod.build_source_scout_report(
+        watchlist_path=watchlist_path,
+        now_ts=1_020.0,
+    )
+
+    assert fetch_calls["count"] == 2
+    assert third["recommended"]["url"] == "https://www.twitch.tv/videos/111"
+
+
 def test_build_source_scout_report_skips_chat_probe_without_multiple_candidates(tmp_path, monkeypatch):
     watchlist_path = tmp_path / "watchlist.local.yaml"
     watchlist_path.write_text(

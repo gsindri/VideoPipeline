@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -31,6 +32,9 @@ _TWITCH_TOKEN_LOCK = threading.Lock()
 _TWITCH_TOKEN_CACHE: dict[str, Any] = {"access_token": "", "expires_at": 0.0}
 _TWITCH_USER_CACHE: dict[str, dict[str, str]] = {}
 _SCOUT_PROBE_SCHEMA_VERSION = 1
+_SCOUT_REPORT_CACHE_TTL_S = 45.0
+_SCOUT_REPORT_CACHE_LOCK = threading.Lock()
+_SCOUT_REPORT_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -60,6 +64,40 @@ def _normalize_url(url: str) -> str:
     if parsed.query:
         return f"{parsed.scheme.lower()}://{host}{path}?{parsed.query}"
     return f"{parsed.scheme.lower()}://{host}{path}"
+
+
+def _cacheable_scout_report(report: Dict[str, Any]) -> Dict[str, Any]:
+    return copy.deepcopy(report)
+
+
+def clear_source_scout_cache() -> None:
+    with _SCOUT_REPORT_CACHE_LOCK:
+        _SCOUT_REPORT_CACHE.clear()
+
+
+def _scout_report_cache_key(*, watchlist_path: Optional[Path], per_source: int, limit: int) -> str:
+    resolved = str(watchlist_path.resolve()) if watchlist_path is not None else "<none>"
+    return f"{resolved}|per_source={int(per_source)}|limit={int(limit)}"
+
+
+def _load_cached_scout_report(cache_key: str, *, now_ts: float) -> Optional[Dict[str, Any]]:
+    with _SCOUT_REPORT_CACHE_LOCK:
+        entry = _SCOUT_REPORT_CACHE.get(cache_key)
+        if not entry:
+            return None
+        age_s = max(0.0, now_ts - _safe_float(entry.get("stored_at"), 0.0))
+        if age_s > _SCOUT_REPORT_CACHE_TTL_S:
+            _SCOUT_REPORT_CACHE.pop(cache_key, None)
+            return None
+        return _cacheable_scout_report(entry.get("report") or {})
+
+
+def _save_cached_scout_report(cache_key: str, report: Dict[str, Any], *, now_ts: float) -> None:
+    with _SCOUT_REPORT_CACHE_LOCK:
+        _SCOUT_REPORT_CACHE[cache_key] = {
+            "stored_at": float(now_ts),
+            "report": _cacheable_scout_report(report),
+        }
 
 
 def extract_content_key(url: str) -> str:
@@ -694,7 +732,7 @@ def _load_scout_probe_config(watchlist: Dict[str, Any]) -> Dict[str, Any]:
         raw = {}
     return {
         "enabled": bool(raw.get("enabled", True)),
-        "shortlist": max(2, _safe_int(raw.get("shortlist"), 30)),
+        "shortlist": max(2, _safe_int(raw.get("shortlist"), 6)),
         "min_candidates": max(2, _safe_int(raw.get("min_candidates"), 2)),
         "rerank_weight": max(0.0, min(0.5, _safe_float(raw.get("rerank_weight"), 0.24))),
         "ttl_hours": max(1.0, _safe_float(raw.get("ttl_hours"), 18.0)),
@@ -1341,11 +1379,23 @@ def build_source_scout_report(
 ) -> Dict[str, Any]:
     resolved_path, watchlist = load_source_watchlist(watchlist_path)
     now_ts = float(now_ts if now_ts is not None else time.time())
+    per_source = max(1, int(per_source))
+    limit = max(1, int(limit))
+
+    use_cache = fetch_entries_fn is None and probe_candidates_fn is None
+    cache_key = _scout_report_cache_key(
+        watchlist_path=resolved_path,
+        per_source=per_source,
+        limit=limit,
+    )
+    if use_cache:
+        cached = _load_cached_scout_report(cache_key, now_ts=now_ts)
+        if cached is not None:
+            return cached
+
     history = build_project_history()
     inbox_path, inbox_entries = list_source_inbox_entries(status="pending")
 
-    per_source = max(1, int(per_source))
-    limit = max(1, int(limit))
     fetch_entries_fn = fetch_entries_fn or fetch_source_entries
 
     enabled_sources = [
@@ -1523,7 +1573,7 @@ def build_source_scout_report(
     for idx, item in enumerate(candidates[:limit], start=1):
         ranked.append({"rank": idx, **item})
 
-    return {
+    report = {
         "meta": {
             "generated_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
             "watchlist_path": str(resolved_path) if resolved_path is not None else None,
@@ -1573,3 +1623,6 @@ def build_source_scout_report(
         "recommended": ranked[0] if ranked else None,
         "candidates": ranked,
     }
+    if use_cache:
+        _save_cached_scout_report(cache_key, report, now_ts=now_ts)
+    return report
