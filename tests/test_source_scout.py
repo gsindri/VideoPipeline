@@ -599,6 +599,77 @@ sources:
     assert report["meta"]["chat_probe"]["used_count"] == 2
 
 
+def test_build_source_scout_report_caps_probe_shortlist_to_effective_budget(tmp_path, monkeypatch):
+    watchlist_path = tmp_path / "watchlist.local.yaml"
+    watchlist_path.write_text(
+        """
+shadow_mode: true
+scout_probe:
+  enabled: true
+  shortlist: 30
+  min_candidates: 2
+sources:
+  - id: ludwig
+    label: Ludwig Twitch VODs
+    platform: twitch
+    provider: twitch_helix
+    enabled: true
+    priority: 2
+        """.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        source_scout_mod,
+        "build_project_history",
+        lambda projects_root=None: {
+            "processed_urls": set(),
+            "processed_content_keys": set(),
+            "source_stats": {},
+        },
+    )
+    monkeypatch.setattr(
+        source_scout_mod,
+        "list_source_inbox_entries",
+        lambda status="pending": (None, []),
+    )
+
+    probed_urls = []
+
+    def fake_probe_candidates(selected, *, probe_config, now_ts):
+        probed_urls.extend(item["url"] for item in selected)
+        return {
+            item["url"]: {"status": "ok", "score": 0.6, "peak_count": 2, "laugh_peak_count": 1}
+            for item in selected
+        }
+
+    report = source_scout_mod.build_source_scout_report(
+        watchlist_path=watchlist_path,
+        per_source=12,
+        limit=18,
+        now_ts=1742061600.0,
+        fetch_entries_fn=lambda source, limit: [
+            {
+                "url": f"https://www.twitch.tv/videos/{100 + idx}",
+                "title": f"Candidate {idx}",
+                "duration_seconds": 7200,
+                "published_at": "2026-03-15T14:00:00Z",
+                "platform": "twitch",
+                "channel_name": "Ludwig",
+                "video_id": str(100 + idx),
+            }
+            for idx in range(12)
+        ],
+        probe_candidates_fn=fake_probe_candidates,
+    )
+
+    assert len(probed_urls) == 8
+    assert report["meta"]["chat_probe"]["configured_shortlist"] == 30
+    assert report["meta"]["chat_probe"]["effective_shortlist_cap"] == 8
+    assert report["meta"]["chat_probe"]["shortlist_count"] == 8
+
+
 def test_probe_single_candidate_chat_replaces_existing_probe_files(tmp_path, monkeypatch):
     import videopipeline.chat.downloader as chat_downloader_mod
 

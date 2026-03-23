@@ -994,15 +994,21 @@ def _apply_chat_probe_rerank(
     *,
     watchlist: Dict[str, Any],
     now_ts: float,
+    report_limit: Optional[int] = None,
     probe_candidates_fn: Optional[Callable[..., Dict[str, Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     probe_config = _load_scout_probe_config(watchlist)
+    configured_shortlist = max(2, _safe_int(probe_config.get("shortlist"), 4))
+    requested_limit = max(1, _safe_int(report_limit, len(candidates) or 1))
+    effective_shortlist_cap = max(2, min(configured_shortlist, max(6, min(requested_limit, 8))))
     meta = {
         "enabled": bool(probe_config.get("enabled", True)),
         "eligible_candidates": 0,
         "shortlist_count": 0,
         "used_count": 0,
         "status": "disabled",
+        "configured_shortlist": configured_shortlist,
+        "effective_shortlist_cap": effective_shortlist_cap,
     }
 
     for item in candidates:
@@ -1017,7 +1023,7 @@ def _apply_chat_probe_rerank(
         meta["status"] = "not_enough_candidates"
         return meta
 
-    shortlist_limit = max(2, _safe_int(probe_config.get("shortlist"), 4))
+    shortlist_limit = effective_shortlist_cap
     shortlist: list[Dict[str, Any]] = []
     seen_probe_keys: set[str] = set()
     for item in eligible:
@@ -1557,6 +1563,7 @@ def build_source_scout_report(
         candidates,
         watchlist=watchlist,
         now_ts=now_ts,
+        report_limit=limit,
         probe_candidates_fn=probe_candidates_fn,
     )
 
