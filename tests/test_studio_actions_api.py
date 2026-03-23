@@ -1009,8 +1009,8 @@ def test_actions_publish_accounts_reports_readiness(tmp_path, monkeypatch):
     hdr = {"Authorization": "Bearer secret"}
 
     import videopipeline.studio.actions_api as actions_api
-    from videopipeline.publisher.accounts import AccountStore
     from videopipeline.publisher.account_auth import PublishAccountAuthStatus
+    from videopipeline.publisher.accounts import AccountStore
 
     store = AccountStore()
     ready = store.add(platform="youtube", label="Ready Channel")
@@ -1048,8 +1048,8 @@ def test_actions_publish_accounts_reports_reconnect_required(tmp_path, monkeypat
     hdr = {"Authorization": "Bearer secret"}
 
     import videopipeline.studio.actions_api as actions_api
-    from videopipeline.publisher.accounts import AccountStore
     from videopipeline.publisher.account_auth import PublishAccountAuthStatus
+    from videopipeline.publisher.accounts import AccountStore
 
     account = AccountStore().add(platform="youtube", label="Rebbi")
     monkeypatch.setattr(
@@ -1127,8 +1127,8 @@ def test_actions_publish_queue_requires_public_release_approval(tmp_path, monkey
     hdr = {"Authorization": "Bearer secret"}
 
     import videopipeline.studio.actions_api as actions_api
-    from videopipeline.publisher.accounts import AccountStore
     from videopipeline.publisher.account_auth import PublishAccountAuthStatus
+    from videopipeline.publisher.accounts import AccountStore
 
     store = AccountStore()
     account = store.add(platform="youtube", label="Main Channel")
@@ -1185,8 +1185,8 @@ def test_actions_publish_queue_creates_jobs_and_lists_them(tmp_path, monkeypatch
     hdr = {"Authorization": "Bearer secret"}
 
     import videopipeline.studio.actions_api as actions_api
-    from videopipeline.publisher.accounts import AccountStore
     from videopipeline.publisher.account_auth import PublishAccountAuthStatus
+    from videopipeline.publisher.accounts import AccountStore
     from videopipeline.publisher.jobs import PublishJobStore
 
     store = AccountStore()
@@ -1259,8 +1259,8 @@ def test_actions_publish_queue_rejects_accounts_that_need_reauth(tmp_path, monke
     hdr = {"Authorization": "Bearer secret"}
 
     import videopipeline.studio.actions_api as actions_api
-    from videopipeline.publisher.accounts import AccountStore
     from videopipeline.publisher.account_auth import PublishAccountAuthStatus
+    from videopipeline.publisher.accounts import AccountStore
 
     account = AccountStore().add(platform="youtube", label="Main Channel")
     monkeypatch.setattr(
