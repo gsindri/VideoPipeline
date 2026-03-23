@@ -1681,6 +1681,109 @@ def test_actions_ai_clip_review_recommends_weekly_awards_for_multi_clip_shortlis
     assert second["show_format_recommendations"][1]["show_format_id"] == "clip_court"
 
 
+def test_actions_ai_clip_review_includes_visual_frames_when_requested(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    pid = hashlib.sha256("twitch_clip_review_visual".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "video").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    video_path = proj_dir / "video" / "video.mp4"
+    video_path.write_bytes(b"fake mp4 bytes")
+
+    (proj_dir / "project.json").write_text(
+        json.dumps(
+            {
+                "project_id": pid,
+                "created_at": "now",
+                "video": {"path": str(video_path), "duration_seconds": 90.0},
+                "analysis": {
+                    "highlights": {
+                        "candidates": [
+                            {
+                                "rank": 1,
+                                "candidate_id": "cid-visual",
+                                "score": 0.99,
+                                "start_s": 12.0,
+                                "end_s": 27.0,
+                                "peak_time_s": 21.0,
+                                "title": "Visual beat",
+                            }
+                        ]
+                    }
+                },
+                "layout": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (proj_dir / "analysis" / "variants.json").write_text(
+        json.dumps(
+            {
+                "created_at": "now",
+                "candidates": [
+                    {
+                        "candidate_rank": 1,
+                        "candidate_id": "cid-visual",
+                        "candidate_peak_time_s": 21.0,
+                        "variants": [
+                            {"variant_id": "tight", "start_s": 12.0, "end_s": 27.0, "duration_s": 15.0}
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (proj_dir / "analysis" / "chapters.json").write_text(
+        json.dumps(
+            {
+                "generated_at": "now",
+                "chapters": [
+                    {"id": 0, "start_s": 0.0, "end_s": 90.0, "title": "Main segment", "summary": "", "keywords": []}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _fake_extract_video_frame_jpeg(video_path, *, output_path, time_seconds, width=None, quality=4):
+        del video_path, time_seconds, width, quality
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"\xff\xd8\xff\xdbfake-jpeg")
+        return output_path
+
+    monkeypatch.setattr(
+        "videopipeline.studio.actions_api.extract_video_frame_jpeg",
+        _fake_extract_video_frame_jpeg,
+    )
+
+    r = client.get(
+        (
+            f"/api/actions/ai/clip_review?project_id={pid}&top_n=1&chat_top_n=0"
+            "&chapter_limit=10&frame_clip_limit=1&frames_per_clip=3"
+        ),
+        headers=hdr,
+    )
+    assert r.status_code == 200
+    data = r.json()
+    clip = data["clips"][0]
+    assert clip["status"]["has_visual_frames"] is True
+    assert clip["visual_review"]["frame_source"] == "source_video"
+    assert clip["visual_review"]["frame_count"] == 3
+    assert len(clip["visual_review"]["frames"]) == 3
+    first_frame = clip["visual_review"]["frames"][0]
+    assert first_frame["mime_type"] == "image/jpeg"
+    assert first_frame["file_name"].endswith(".jpg")
+    assert first_frame["relative_path"].replace("\\", "/").startswith(
+        "analysis/clip_review_frames/cid-visual/"
+    )
+    assert first_frame["content_base64"] == " /9j/22Zha2UtanBlZw==".strip()
+    assert data["limits"]["visual_review"]["frame_clip_limit"] == 1
+    assert data["limits"]["visual_review"]["frames_per_clip"] == 3
+
+
 def test_actions_ai_candidates_returns_transcript_excerpt(tmp_path, monkeypatch):
     client = _make_client(tmp_path, monkeypatch, token="secret")
     hdr = {"Authorization": "Bearer secret"}

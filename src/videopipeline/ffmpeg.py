@@ -5,7 +5,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Iterator
+from typing import BinaryIO, Iterator, Optional
 
 import numpy as np
 
@@ -167,6 +167,51 @@ def _read_exact(stream: BinaryIO, nbytes: int) -> bytes:
         chunks.append(chunk)
         total += len(chunk)
     return b"".join(chunks)
+
+
+def extract_video_frame_jpeg(
+    video_path: Path,
+    *,
+    output_path: Path,
+    time_seconds: float,
+    width: Optional[int] = None,
+    quality: int = 4,
+) -> Path:
+    """Extract a single video frame to a JPEG file."""
+    _require_cmd("ffmpeg")
+    video_path = Path(video_path)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if quality < 2:
+        quality = 2
+    elif quality > 31:
+        quality = 31
+
+    time_seconds = max(0.0, float(time_seconds))
+
+    vf_parts: list[str] = []
+    if width is not None:
+        vf_parts.append(f"scale={int(width)}:-2")
+
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-ss",
+        f"{time_seconds:.3f}",
+        "-i",
+        str(video_path),
+        "-frames:v",
+        "1",
+        "-q:v",
+        str(quality),
+    ]
+    if vf_parts:
+        cmd.extend(["-vf", ",".join(vf_parts)])
+    cmd.extend(["-y", str(output_path)])
+    subprocess.run(cmd, check=True, **_subprocess_flags())
+    return output_path
 
 
 @dataclass(frozen=True)

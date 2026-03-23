@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
@@ -21,6 +22,7 @@ from ..ai.helpers import get_llm_complete_fn
 from ..analysis import run_analysis
 from ..analysis_director import DirectorConfig
 from ..analysis_highlights import CONTENT_TYPE_GUIDANCE
+from ..ffmpeg import extract_video_frame_jpeg
 from ..ingest import IngestRequest, QualityCap, SpeedMode
 from ..ingest.ytdlp_runner import DownloadCancelled, download_url
 from ..project import (
@@ -58,6 +60,11 @@ from .publisher_api import is_safe_export_path, scan_project_exports
 _PROJECT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _YOUTUBE_ID_RE = re.compile(r"(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]+)")
 _TWITCH_VOD_ID_RE = re.compile(r"twitch\.tv/videos/(\d+)")
+_CLIP_REVIEW_FRAME_DIR = "clip_review_frames"
+_CLIP_REVIEW_MAX_FRAME_CLIPS = 5
+_CLIP_REVIEW_MAX_FRAMES_PER_CLIP = 6
+_CLIP_REVIEW_FRAME_WIDTH = 320
+_CLIP_REVIEW_FRAME_QUALITY = 6
 
 
 def _hash_key(value: str) -> str:
@@ -132,6 +139,133 @@ def _load_project(project_id: str) -> Tuple[Project, Dict[str, Any]]:
         video_path = candidate if candidate.exists() else (project_dir / "video_pending")
 
     return Project(project_dir=project_dir, video_path=video_path), data
+
+
+def _sanitize_clip_review_token(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(value or "").strip()).strip("-")
+    return cleaned or "clip"
+
+
+def _resolve_clip_review_video_path(proj: Project) -> Tuple[Optional[Path], Optional[str]]:
+    preview_path = proj.preview_video_path
+    if preview_path.exists():
+        return preview_path, "preview_video"
+    if proj.video_path.exists():
+        return proj.video_path, "source_video"
+    return None, None
+
+
+def _clip_review_frame_times(
+    *,
+    start_s: float,
+    end_s: float,
+    peak_time_s: Optional[float],
+    frame_count: int,
+) -> list[float]:
+    if frame_count <= 0:
+        return []
+    duration = max(0.05, end_s - start_s)
+    if frame_count == 1:
+        return [max(start_s, min(end_s, peak_time_s if peak_time_s is not None else start_s + duration * 0.5))]
+
+    times: list[float] = []
+    for idx in range(frame_count):
+        ratio = 0.12 + (0.76 * idx / max(1, frame_count - 1))
+        times.append(start_s + duration * ratio)
+
+    if peak_time_s is not None and start_s <= peak_time_s <= end_s:
+        times[len(times) // 2] = peak_time_s
+
+    unique: list[float] = []
+    seen = set()
+    for value in times:
+        clamped = max(start_s, min(end_s, value))
+        key = int(round(clamped * 1000.0))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(clamped)
+    return unique
+
+
+def _build_clip_review_frame_payload(
+    *,
+    proj: Project,
+    candidate: Dict[str, Any],
+    review_id: str,
+    frames_per_clip: int,
+) -> Dict[str, Any]:
+    video_path, source_label = _resolve_clip_review_video_path(proj)
+    if video_path is None or not source_label:
+        return {
+            "frame_source": None,
+            "frame_count": 0,
+            "frames": [],
+        }
+
+    try:
+        start_s = float(candidate.get("start_s"))
+    except Exception:
+        start_s = 0.0
+    try:
+        end_s = float(candidate.get("end_s"))
+    except Exception:
+        end_s = start_s
+    if end_s <= start_s:
+        end_s = start_s + 0.1
+    try:
+        peak_time_s = float(candidate.get("peak_time_s"))
+    except Exception:
+        peak_time_s = None
+
+    frame_times = _clip_review_frame_times(
+        start_s=start_s,
+        end_s=end_s,
+        peak_time_s=peak_time_s,
+        frame_count=frames_per_clip,
+    )
+    if not frame_times:
+        return {
+            "frame_source": source_label,
+            "frame_count": 0,
+            "frames": [],
+        }
+
+    review_token = _sanitize_clip_review_token(review_id)
+    frames_dir = proj.analysis_dir / _CLIP_REVIEW_FRAME_DIR / review_token
+    labels = ["opening", "setup", "midpoint", "payoff", "ending", "button"]
+    frame_items: list[Dict[str, Any]] = []
+    for idx, time_s in enumerate(frame_times):
+        output_path = frames_dir / f"{review_token}-{idx + 1:02d}.jpg"
+        try:
+            if not output_path.exists():
+                extract_video_frame_jpeg(
+                    video_path,
+                    output_path=output_path,
+                    time_seconds=time_s,
+                    width=_CLIP_REVIEW_FRAME_WIDTH,
+                    quality=_CLIP_REVIEW_FRAME_QUALITY,
+                )
+            encoded = base64.b64encode(output_path.read_bytes()).decode("ascii")
+        except Exception:
+            continue
+        frame_items.append(
+            {
+                "frame_id": f"{review_token}-frame-{idx + 1}",
+                "label": labels[idx] if idx < len(labels) else f"frame_{idx + 1}",
+                "time_s": round(time_s, 3),
+                "file_name": output_path.name,
+                "mime_type": "image/jpeg",
+                "relative_path": str(output_path.relative_to(proj.project_dir)),
+                "content_base64": encoded,
+            }
+        )
+
+    return {
+        "frame_source": source_label,
+        "frame_count": len(frame_items),
+        "frames": frame_items,
+    }
 
 
 def _is_private_ip(hostname: str) -> bool:
@@ -4886,6 +5020,8 @@ def create_actions_router(
         candidates_payload: Dict[str, Any],
         variants_payload: Dict[str, Any],
         chapters_payload: Dict[str, Any],
+        frame_clip_limit: int = 0,
+        frames_per_clip: int = 0,
         proj: Optional[Project] = None,
         proj_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -4896,6 +5032,18 @@ def create_actions_router(
         candidate_items = [
             item for item in (candidates_payload.get("candidates") or []) if isinstance(item, dict)
         ]
+        frame_clip_limit = _clamp_int(
+            frame_clip_limit,
+            default=0,
+            min_v=0,
+            max_v=_CLIP_REVIEW_MAX_FRAME_CLIPS,
+        )
+        frames_per_clip = _clamp_int(
+            frames_per_clip,
+            default=0,
+            min_v=0,
+            max_v=_CLIP_REVIEW_MAX_FRAMES_PER_CLIP,
+        )
         variant_rows = [item for item in (variants_payload.get("candidates") or []) if isinstance(item, dict)]
         chapter_rows = [item for item in (chapters_payload.get("chapters") or []) if isinstance(item, dict)]
 
@@ -5123,7 +5271,7 @@ def create_actions_router(
             }
 
         clips: list[Dict[str, Any]] = []
-        for candidate in candidate_items:
+        for clip_idx, candidate in enumerate(candidate_items):
             candidate_rank = _norm_rank(candidate.get("rank"))
             candidate_id = str(candidate.get("candidate_id") or "").strip()
             variant_row = (
@@ -5248,6 +5396,16 @@ def create_actions_router(
                 review_focus.append("No export exists yet; decide keep/reject and packaging before export.")
 
             review_id = candidate_id or (f"candidate-rank-{candidate_rank}" if candidate_rank is not None else "candidate")
+            visual_review = (
+                _build_clip_review_frame_payload(
+                    proj=proj,
+                    candidate=candidate,
+                    review_id=review_id,
+                    frames_per_clip=frames_per_clip,
+                )
+                if frame_clip_limit > 0 and frames_per_clip > 0 and clip_idx < frame_clip_limit
+                else {"frame_source": None, "frame_count": 0, "frames": []}
+            )
             clips.append(
                 {
                     "review_id": review_id,
@@ -5276,11 +5434,13 @@ def create_actions_router(
                     "status": {
                         "has_transcript_excerpt": bool(candidate.get("transcript_excerpt")),
                         "has_chat_excerpt": bool(candidate.get("chat_excerpt")),
+                        "has_visual_frames": bool(visual_review.get("frames")),
                         "has_variants": bool(variant_options),
                         "has_director_pick": director_pick_out is not None,
                         "has_selection": bool(matching_selections),
                         "has_export": bool(matching_exports),
                     },
+                    "visual_review": visual_review,
                     "review_focus": review_focus,
                 }
             )
@@ -5310,6 +5470,10 @@ def create_actions_router(
                 "candidates": candidates_payload.get("limits") or {},
                 "variants": variants_payload.get("limits") or {},
                 "chapters": chapters_payload.get("limits") or {},
+                "visual_review": {
+                    "frame_clip_limit": frame_clip_limit,
+                    "frames_per_clip": frames_per_clip,
+                },
             },
             "channel_format_spec": _channel_format_playbook(),
             "review_rubric": {
@@ -5341,6 +5505,8 @@ def create_actions_router(
         max_variants: int = 8,
         chapter_limit: int = 50,
         chapter_max_chars: int = 1200,
+        frame_clip_limit: int = 0,
+        frames_per_clip: int = 0,
     ):
         """Fetch joined shortlist review packets for final bot judgment."""
         _rate_limit(request)
@@ -5387,6 +5553,8 @@ def create_actions_router(
                 candidates_payload=candidates_payload,
                 variants_payload=variants_payload,
                 chapters_payload=chapters_payload,
+                frame_clip_limit=frame_clip_limit,
+                frames_per_clip=frames_per_clip,
                 proj=proj,
                 proj_data=proj_data,
             )
@@ -5404,6 +5572,8 @@ def create_actions_router(
         max_variants: int = 8,
         chapter_limit: int = 50,
         chapter_max_chars: int = 1200,
+        frame_clip_limit: int = 0,
+        frames_per_clip: int = 0,
     ):
         """Fetch a single external-AI work bundle for Gondull/Actions workflows."""
         _rate_limit(request)
@@ -5456,6 +5626,8 @@ def create_actions_router(
             candidates_payload=candidates_payload,
             variants_payload=variants_payload,
             chapters_payload=chapters_payload,
+            frame_clip_limit=frame_clip_limit,
+            frames_per_clip=frames_per_clip,
             proj=proj,
             proj_data=proj_data,
         )
