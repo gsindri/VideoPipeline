@@ -1010,6 +1010,7 @@ def test_actions_publish_accounts_reports_readiness(tmp_path, monkeypatch):
 
     import videopipeline.studio.actions_api as actions_api
     from videopipeline.publisher.accounts import AccountStore
+    from videopipeline.publisher.account_auth import PublishAccountAuthStatus
 
     store = AccountStore()
     ready = store.add(platform="youtube", label="Ready Channel")
@@ -1017,8 +1018,17 @@ def test_actions_publish_accounts_reports_readiness(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         actions_api,
-        "load_tokens",
-        lambda platform, account_id: {"access_token": "token"} if account_id == ready.id else None,
+        "get_publish_account_auth",
+        lambda account: (
+            PublishAccountAuthStatus(ready=True, has_tokens=True, auth_state="ready")
+            if account.id == ready.id
+            else PublishAccountAuthStatus(
+                ready=False,
+                has_tokens=False,
+                auth_state="missing_tokens",
+                auth_error="No stored credentials are available for this account.",
+            )
+        ),
     )
 
     r = client.get("/api/actions/publish/accounts", headers=hdr)
@@ -1030,6 +1040,37 @@ def test_actions_publish_accounts_reports_readiness(tmp_path, monkeypatch):
     assert data["summary"]["accounts_total"] == 2
     assert data["summary"]["ready_accounts"] == 1
     assert data["policy"]["default_privacy"] == "private"
+    client.close()
+
+
+def test_actions_publish_accounts_reports_reconnect_required(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    import videopipeline.studio.actions_api as actions_api
+    from videopipeline.publisher.accounts import AccountStore
+    from videopipeline.publisher.account_auth import PublishAccountAuthStatus
+
+    account = AccountStore().add(platform="youtube", label="Rebbi")
+    monkeypatch.setattr(
+        actions_api,
+        "get_publish_account_auth",
+        lambda _account: PublishAccountAuthStatus(
+            ready=False,
+            has_tokens=True,
+            auth_state="needs_reauth",
+            auth_error="Google refresh token was rejected (invalid_grant). Reconnect the YouTube account.",
+        ),
+    )
+
+    r = client.get("/api/actions/publish/accounts", headers=hdr)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["accounts"][0]["id"] == account.id
+    assert data["accounts"][0]["ready"] is False
+    assert data["accounts"][0]["auth_state"] == "needs_reauth"
+    assert "Reconnect the YouTube account" in data["accounts"][0]["auth_error"]
+    assert data["summary"]["ready_accounts"] == 0
     client.close()
 
 
@@ -1087,10 +1128,15 @@ def test_actions_publish_queue_requires_public_release_approval(tmp_path, monkey
 
     import videopipeline.studio.actions_api as actions_api
     from videopipeline.publisher.accounts import AccountStore
+    from videopipeline.publisher.account_auth import PublishAccountAuthStatus
 
     store = AccountStore()
     account = store.add(platform="youtube", label="Main Channel")
-    monkeypatch.setattr(actions_api, "load_tokens", lambda platform, account_id: {"access_token": "token"})
+    monkeypatch.setattr(
+        actions_api,
+        "get_publish_account_auth",
+        lambda _account: PublishAccountAuthStatus(ready=True, has_tokens=True, auth_state="ready"),
+    )
 
     pid = hashlib.sha256("twitch_publish_approval".encode("utf-8")).hexdigest()
     proj_dir = tmp_path / "outputs" / "projects" / pid
@@ -1140,11 +1186,16 @@ def test_actions_publish_queue_creates_jobs_and_lists_them(tmp_path, monkeypatch
 
     import videopipeline.studio.actions_api as actions_api
     from videopipeline.publisher.accounts import AccountStore
+    from videopipeline.publisher.account_auth import PublishAccountAuthStatus
     from videopipeline.publisher.jobs import PublishJobStore
 
     store = AccountStore()
     account = store.add(platform="youtube", label="Main Channel")
-    monkeypatch.setattr(actions_api, "load_tokens", lambda platform, account_id: {"access_token": "token"})
+    monkeypatch.setattr(
+        actions_api,
+        "get_publish_account_auth",
+        lambda _account: PublishAccountAuthStatus(ready=True, has_tokens=True, auth_state="ready"),
+    )
 
     pid = hashlib.sha256("twitch_publish_queue".encode("utf-8")).hexdigest()
     proj_dir = tmp_path / "outputs" / "projects" / pid
@@ -1200,6 +1251,71 @@ def test_actions_publish_queue_creates_jobs_and_lists_them(tmp_path, monkeypatch
     jobs_data = jobs_r.json()
     assert jobs_data["project_id"] == pid
     assert any(item["id"] == job_id for item in jobs_data["jobs"])
+    client.close()
+
+
+def test_actions_publish_queue_rejects_accounts_that_need_reauth(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    import videopipeline.studio.actions_api as actions_api
+    from videopipeline.publisher.accounts import AccountStore
+    from videopipeline.publisher.account_auth import PublishAccountAuthStatus
+
+    account = AccountStore().add(platform="youtube", label="Main Channel")
+    monkeypatch.setattr(
+        actions_api,
+        "get_publish_account_auth",
+        lambda _account: PublishAccountAuthStatus(
+            ready=False,
+            has_tokens=True,
+            auth_state="needs_reauth",
+            auth_error="Google refresh token was rejected (invalid_grant). Reconnect the YouTube account.",
+        ),
+    )
+
+    pid = hashlib.sha256("twitch_publish_reauth".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "video").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "exports").mkdir(parents=True, exist_ok=True)
+    video_path = proj_dir / "video" / "video.mp4"
+    video_path.write_bytes(b"")
+    (proj_dir / "project.json").write_text(
+        json.dumps(
+            {
+                "project_id": pid,
+                "created_at": "now",
+                "video": {"path": str(video_path), "duration_seconds": 90.0},
+                "analysis": {"highlights": {"candidates": []}},
+                "layout": {},
+                "selections": [],
+                "exports": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (proj_dir / "exports" / "clip1.mp4").write_bytes(b"fake video")
+    (proj_dir / "exports" / "clip1.json").write_text(json.dumps({"title": "Clip 1"}), encoding="utf-8")
+
+    r = client.post(
+        "/api/actions/publish/queue",
+        headers=hdr,
+        json={
+            "project_id": pid,
+            "account_ids": [account.id],
+            "export_ids": ["clip1"],
+            "client_request_id": "publish-needs-reauth",
+        },
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"] == {
+        "code": "account_needs_reauth",
+        "account_id": account.id,
+        "platform": "youtube",
+        "auth_state": "needs_reauth",
+        "auth_error": "Google refresh token was rejected (invalid_grant). Reconnect the YouTube account.",
+    }
     client.close()
 
 

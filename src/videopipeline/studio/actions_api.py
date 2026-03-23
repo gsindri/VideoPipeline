@@ -34,8 +34,8 @@ from ..project import (
     set_source_url,
 )
 from ..publisher.accounts import AccountStore
+from ..publisher.account_auth import get_publish_account_auth
 from ..publisher.jobs import PublishJobStore
-from ..publisher.secrets import load_tokens
 from .dag_config import (
     apply_llm_mode_to_dag_config,
     build_dag_config,
@@ -692,23 +692,18 @@ def create_actions_router(
             "requires_explicit_approval_for": ["public", "scheduled_release"],
         }
 
-    def _account_has_tokens(platform: str, account_id: str) -> bool:
-        try:
-            payload = load_tokens(platform, account_id)
-        except Exception:
-            return False
-        return bool(payload)
-
     def _build_publish_accounts_payload() -> Dict[str, Any]:
         accounts = []
         ready_total = 0
         for acct in account_store.list():
-            ready = _account_has_tokens(acct.platform, acct.id)
-            if ready:
+            auth = get_publish_account_auth(acct)
+            if auth.ready:
                 ready_total += 1
             item = acct.to_dict()
-            item["ready"] = ready
-            item["has_tokens"] = ready
+            item["ready"] = auth.ready
+            item["has_tokens"] = auth.has_tokens
+            item["auth_state"] = auth.auth_state
+            item["auth_error"] = auth.auth_error
             accounts.append(item)
         accounts.sort(key=lambda item: (str(item.get("platform") or ""), str(item.get("label") or "")))
         return {
@@ -3409,10 +3404,17 @@ def create_actions_router(
             account = account_store.get(aid)
             if not account:
                 raise HTTPException(status_code=404, detail=f"account_not_found:{aid}")
-            if not _account_has_tokens(account.platform, account.id):
+            auth = get_publish_account_auth(account)
+            if not auth.ready:
                 raise HTTPException(
                     status_code=409,
-                    detail={"code": "account_not_ready", "account_id": account.id, "platform": account.platform},
+                    detail={
+                        "code": "account_needs_reauth" if auth.auth_state == "needs_reauth" else "account_not_ready",
+                        "account_id": account.id,
+                        "platform": account.platform,
+                        "auth_state": auth.auth_state,
+                        "auth_error": auth.auth_error,
+                    },
                 )
             accounts.append(account)
 

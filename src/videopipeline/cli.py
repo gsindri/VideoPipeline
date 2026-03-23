@@ -26,7 +26,7 @@ from .publisher.accounts import AccountStore
 from .publisher.connectors.tiktok import build_authorize_url, build_pkce_pair, exchange_code
 from .publisher.presets import AccountPreset
 from .publisher.queue import PublishWorker
-from .publisher.secrets import delete_tokens, store_tokens
+from .publisher.secrets import delete_tokens, load_tokens, store_tokens
 from .publisher.state import accounts_path
 from .transcribe import TranscribeConfig, load_transcript_json, save_transcript_json, transcribe_segment
 
@@ -341,6 +341,69 @@ def cmd_accounts_add_youtube(args: argparse.Namespace) -> None:
     print(f"Accounts file: {accounts_path()}")
 
 
+def cmd_accounts_reconnect_youtube(args: argparse.Namespace) -> None:
+    from google_auth_oauthlib.flow import InstalledAppFlow
+
+    store = AccountStore()
+    account = store.get(args.account_id)
+    if not account:
+        raise UserFacingError(f"account_not_found: {args.account_id}")
+    if account.platform != "youtube":
+        raise UserFacingError(f"account_platform_not_supported: {account.platform}")
+
+    existing = load_tokens("youtube", account.id) or {}
+    client_id = str(existing.get("client_id") or "").strip()
+    client_secret = str(existing.get("client_secret") or "").strip()
+    if not client_id or not client_secret:
+        raise UserFacingError("youtube_client_credentials_missing")
+
+    scopes = existing.get("scopes") or ["https://www.googleapis.com/auth/youtube.upload"]
+    client_config = {
+        "installed": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": existing.get("token_uri", "https://oauth2.googleapis.com/token"),
+            "redirect_uris": ["http://localhost", "http://127.0.0.1"],
+        }
+    }
+    flow = InstalledAppFlow.from_client_config(client_config, scopes=scopes)
+    creds = flow.run_local_server(
+        host="127.0.0.1",
+        port=args.redirect_port,
+        open_browser=not args.no_browser,
+        access_type="offline",
+        prompt="consent",
+    )
+    store_tokens(
+        "youtube",
+        account.id,
+        {
+            "access_token": creds.token,
+            "refresh_token": creds.refresh_token or existing.get("refresh_token"),
+            "token_uri": creds.token_uri,
+            "client_id": creds.client_id,
+            "client_secret": creds.client_secret,
+            "scopes": list(creds.scopes or scopes),
+        },
+    )
+    print(f"Reconnected YouTube account: {account.id}")
+
+    retry_job_id = str(args.retry_job_id or "").strip()
+    if not retry_job_id:
+        return
+
+    worker = PublishWorker()
+    worker.job_store.retry(retry_job_id)
+    result = worker.run_once(retry_job_id)
+    if result is None:
+        raise UserFacingError(f"publish_job_not_found: {retry_job_id}")
+    print(f"Retried publish job: {result.id}")
+    print(f"Status: {result.status}")
+    if result.remote_url:
+        print(f"Remote URL: {result.remote_url}")
+
+
 def cmd_accounts_add_tiktok(args: argparse.Namespace) -> None:
     verifier, challenge = build_pkce_pair()
     state = uuid.uuid4().hex
@@ -584,6 +647,18 @@ def main(argv: Optional[List[str]] = None) -> None:
     youtube_add.add_argument("--scopes", type=str, default=None)
     youtube_add.add_argument("--redirect-port", type=int, default=8080)
     youtube_add.set_defaults(func=cmd_accounts_add_youtube)
+
+    accounts_reconnect = accounts_sub.add_parser("reconnect", help="Reconnect an existing publishing account.")
+    accounts_reconnect_sub = accounts_reconnect.add_subparsers(dest="platform", required=True)
+
+    youtube_reconnect = accounts_reconnect_sub.add_parser(
+        "youtube", help="Reconnect an existing YouTube account via OAuth."
+    )
+    youtube_reconnect.add_argument("--account-id", type=str, required=True)
+    youtube_reconnect.add_argument("--redirect-port", type=int, default=8765)
+    youtube_reconnect.add_argument("--retry-job-id", type=str, default=None)
+    youtube_reconnect.add_argument("--no-browser", action="store_true")
+    youtube_reconnect.set_defaults(func=cmd_accounts_reconnect_youtube)
 
     tiktok_add = accounts_add_sub.add_parser("tiktok", help="Add a TikTok account via OAuth.")
     tiktok_add.add_argument("--client-key", type=str, required=True)
