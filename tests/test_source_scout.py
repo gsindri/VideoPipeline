@@ -679,6 +679,7 @@ def test_probe_single_candidate_chat_replaces_existing_probe_files(tmp_path, mon
     raw_path = cache_root / "chat.json"
     db_path = cache_root / "chat.sqlite"
     summary_path = cache_root / "summary.json"
+    lock_path = cache_root / "probe.lock"
     cache_root.mkdir(parents=True, exist_ok=True)
     raw_path.write_text("old raw", encoding="utf-8")
     db_path.write_text("old db", encoding="utf-8")
@@ -691,6 +692,7 @@ def test_probe_single_candidate_chat_replaces_existing_probe_files(tmp_path, mon
             "summary": summary_path,
             "raw": raw_path,
             "db": db_path,
+            "lock": lock_path,
         },
     )
     monkeypatch.setattr(source_scout_mod, "_load_cached_probe_summary", lambda *a, **k: None)
@@ -736,6 +738,7 @@ def test_probe_single_candidate_chat_replaces_existing_probe_files(tmp_path, mon
     assert raw_path.read_text(encoding="utf-8") == "new raw"
     assert db_path.read_text(encoding="utf-8") == "new db"
     assert summary_path.exists()
+    assert not lock_path.exists()
     assert summary["status"] == "ok"
 
 
@@ -770,6 +773,7 @@ def test_probe_single_candidate_chat_reuses_inflight_probe(tmp_path, monkeypatch
         "selection_mode": "watchlist",
         "duration_seconds": 7200,
     }
+    now_ts = time.time()
     results: list[dict[str, object]] = []
 
     def worker():
@@ -777,7 +781,7 @@ def test_probe_single_candidate_chat_reuses_inflight_probe(tmp_path, monkeypatch
             source_scout_mod._probe_single_candidate_chat(
                 candidate,
                 probe_config={"ttl_hours": 18.0},
-                now_ts=1_742_779_200.0,
+                now_ts=now_ts,
             )
         )
 
@@ -796,3 +800,17 @@ def test_probe_single_candidate_chat_reuses_inflight_probe(tmp_path, monkeypatch
     assert any(item.get("cached") is False for item in results)
     assert any(item.get("cached") is True for item in results)
     assert all(item.get("status") == "ok" for item in results)
+
+
+def test_try_acquire_probe_file_lock_reclaims_stale_lock(tmp_path):
+    lock_path = tmp_path / "probe.lock"
+    lock_path.write_text('{"pid": 123, "created_at": 1.0}', encoding="utf-8")
+
+    acquired = source_scout_mod._try_acquire_probe_file_lock(lock_path, now_ts=1.0 + 601.0)
+
+    assert acquired is True
+    payload = source_scout_mod._load_probe_lock(lock_path)
+    assert payload is not None
+    assert payload["pid"] != 123
+    source_scout_mod._release_probe_file_lock(lock_path)
+    assert not lock_path.exists()

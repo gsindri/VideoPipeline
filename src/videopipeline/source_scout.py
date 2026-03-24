@@ -37,6 +37,8 @@ _SCOUT_REPORT_CACHE_LOCK = threading.Lock()
 _SCOUT_REPORT_CACHE: dict[str, dict[str, Any]] = {}
 _SCOUT_PROBE_INFLIGHT_LOCK = threading.Lock()
 _SCOUT_PROBE_INFLIGHT: dict[str, threading.Event] = {}
+_SCOUT_PROBE_LOCK_STALE_S = 600.0
+_SCOUT_PROBE_LOCK_POLL_S = 0.25
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -721,6 +723,7 @@ def _probe_cache_paths(url: str, *, content_key: Optional[str] = None) -> Dict[s
         "summary": cache_root / "summary.json",
         "raw": cache_root / "chat.json",
         "db": cache_root / "chat.sqlite",
+        "lock": cache_root / "probe.lock",
     }
 
 
@@ -774,6 +777,56 @@ def _save_probe_summary(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
     serializable["cached"] = False
     path.write_text(json.dumps(serializable, indent=2, ensure_ascii=False), encoding="utf-8")
     return serializable
+
+
+def _load_probe_lock(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _try_acquire_probe_file_lock(path: Path, *, now_ts: float) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pid": os.getpid(),
+        "created_at": float(now_ts),
+    }
+    while True:
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            existing = _load_probe_lock(path) or {}
+            created_at = _safe_float(existing.get("created_at"), 0.0)
+            age_s = max(0.0, now_ts - created_at) if created_at > 0 else _SCOUT_PROBE_LOCK_STALE_S + 1.0
+            if age_s <= _SCOUT_PROBE_LOCK_STALE_S:
+                return False
+            _safe_unlink(path)
+            continue
+
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            return True
+        except Exception:
+            _safe_unlink(path)
+            raise
+
+
+def _release_probe_file_lock(path: Path) -> None:
+    _safe_unlink(path)
 
 
 def _acquire_probe_inflight_slot(cache_key: str) -> tuple[threading.Event, bool]:
@@ -946,19 +999,23 @@ def _probe_single_candidate_chat(
         str(candidate.get("url") or "").strip(),
         content_key=str(candidate.get("content_key") or "").strip() or None,
     )
-    cache_key = str(paths["summary"])
     inflight_wait_s = max(30.0, min(ttl_s, 300.0))
+    wait_deadline = time.time() + inflight_wait_s
 
     while True:
-        cached = _load_cached_probe_summary(paths["summary"], now_ts=now_ts, max_age_s=ttl_s)
+        loop_now_ts = time.time()
+        cached = _load_cached_probe_summary(paths["summary"], now_ts=loop_now_ts, max_age_s=ttl_s)
         if cached is not None:
             return cached
 
-        inflight_event, is_owner = _acquire_probe_inflight_slot(cache_key)
-        if is_owner:
+        if _try_acquire_probe_file_lock(paths["lock"], now_ts=loop_now_ts):
             break
 
-        inflight_event.wait(timeout=inflight_wait_s)
+        remaining_s = wait_deadline - time.time()
+        if remaining_s <= 0:
+            time.sleep(_SCOUT_PROBE_LOCK_POLL_S)
+            continue
+        time.sleep(min(_SCOUT_PROBE_LOCK_POLL_S, remaining_s))
 
     try:
         from .chat.downloader import download_chat, is_chat_download_available
@@ -1011,7 +1068,7 @@ def _probe_single_candidate_chat(
         }
         return _save_probe_summary(paths["summary"], payload)
     finally:
-        _release_probe_inflight_slot(cache_key, inflight_event)
+        _release_probe_file_lock(paths["lock"])
         for temp_path in (temp_raw_path, temp_db_path):
             try:
                 if temp_path is not None and temp_path.exists():
