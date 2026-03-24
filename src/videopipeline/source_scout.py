@@ -35,6 +35,8 @@ _SCOUT_PROBE_SCHEMA_VERSION = 1
 _SCOUT_REPORT_CACHE_TTL_S = 45.0
 _SCOUT_REPORT_CACHE_LOCK = threading.Lock()
 _SCOUT_REPORT_CACHE: dict[str, dict[str, Any]] = {}
+_SCOUT_PROBE_INFLIGHT_LOCK = threading.Lock()
+_SCOUT_PROBE_INFLIGHT: dict[str, threading.Event] = {}
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -774,6 +776,24 @@ def _save_probe_summary(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
     return serializable
 
 
+def _acquire_probe_inflight_slot(cache_key: str) -> tuple[threading.Event, bool]:
+    with _SCOUT_PROBE_INFLIGHT_LOCK:
+        existing = _SCOUT_PROBE_INFLIGHT.get(cache_key)
+        if existing is not None:
+            return existing, False
+        created = threading.Event()
+        _SCOUT_PROBE_INFLIGHT[cache_key] = created
+        return created, True
+
+
+def _release_probe_inflight_slot(cache_key: str, event: threading.Event) -> None:
+    with _SCOUT_PROBE_INFLIGHT_LOCK:
+        current = _SCOUT_PROBE_INFLIGHT.get(cache_key)
+        if current is event:
+            _SCOUT_PROBE_INFLIGHT.pop(cache_key, None)
+    event.set()
+
+
 def _candidate_supports_chat_probe(candidate: Dict[str, Any]) -> bool:
     url = str(candidate.get("url") or "").strip()
     if not url.startswith("http"):
@@ -926,9 +946,19 @@ def _probe_single_candidate_chat(
         str(candidate.get("url") or "").strip(),
         content_key=str(candidate.get("content_key") or "").strip() or None,
     )
-    cached = _load_cached_probe_summary(paths["summary"], now_ts=now_ts, max_age_s=ttl_s)
-    if cached is not None:
-        return cached
+    cache_key = str(paths["summary"])
+    inflight_wait_s = max(30.0, min(ttl_s, 300.0))
+
+    while True:
+        cached = _load_cached_probe_summary(paths["summary"], now_ts=now_ts, max_age_s=ttl_s)
+        if cached is not None:
+            return cached
+
+        inflight_event, is_owner = _acquire_probe_inflight_slot(cache_key)
+        if is_owner:
+            break
+
+        inflight_event.wait(timeout=inflight_wait_s)
 
     try:
         from .chat.downloader import download_chat, is_chat_download_available
@@ -981,6 +1011,7 @@ def _probe_single_candidate_chat(
         }
         return _save_probe_summary(paths["summary"], payload)
     finally:
+        _release_probe_inflight_slot(cache_key, inflight_event)
         for temp_path in (temp_raw_path, temp_db_path):
             try:
                 if temp_path is not None and temp_path.exists():

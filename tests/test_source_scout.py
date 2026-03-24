@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 import videopipeline.source_scout as source_scout_mod
@@ -735,3 +737,62 @@ def test_probe_single_candidate_chat_replaces_existing_probe_files(tmp_path, mon
     assert db_path.read_text(encoding="utf-8") == "new db"
     assert summary_path.exists()
     assert summary["status"] == "ok"
+
+
+def test_probe_single_candidate_chat_reuses_inflight_probe(tmp_path, monkeypatch):
+    import videopipeline.chat.downloader as chat_downloader_mod
+
+    source_scout_mod._SCOUT_PROBE_INFLIGHT.clear()
+    monkeypatch.setattr(source_scout_mod, "_probe_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(chat_downloader_mod, "is_chat_download_available", lambda: True)
+
+    probe_started = threading.Event()
+    call_count = {"count": 0}
+
+    def fake_download_chat(url, output_path, **kwargs):
+        call_count["count"] += 1
+        probe_started.set()
+        time.sleep(0.15)
+        Path(output_path).write_text("{}", encoding="utf-8")
+        return object()
+
+    monkeypatch.setattr(chat_downloader_mod, "download_chat", fake_download_chat)
+    monkeypatch.setattr(
+        source_scout_mod,
+        "_compute_chat_probe_summary",
+        lambda **kwargs: {"status": "ok", "score": 0.82},
+    )
+
+    candidate = {
+        "url": "https://www.twitch.tv/videos/2720805491",
+        "content_key": "twitch_2720805491",
+        "platform": "twitch",
+        "selection_mode": "watchlist",
+        "duration_seconds": 7200,
+    }
+    results: list[dict[str, object]] = []
+
+    def worker():
+        results.append(
+            source_scout_mod._probe_single_candidate_chat(
+                candidate,
+                probe_config={"ttl_hours": 18.0},
+                now_ts=1_742_779_200.0,
+            )
+        )
+
+    first = threading.Thread(target=worker)
+    second = threading.Thread(target=worker)
+
+    first.start()
+    assert probe_started.wait(timeout=2.0)
+    second.start()
+
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+
+    assert call_count["count"] == 1
+    assert len(results) == 2
+    assert any(item.get("cached") is False for item in results)
+    assert any(item.get("cached") is True for item in results)
+    assert all(item.get("status") == "ok" for item in results)
