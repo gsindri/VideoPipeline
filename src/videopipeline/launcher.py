@@ -57,6 +57,9 @@ DEFAULT_PORT = 8765  # used only if --port specified; otherwise we auto-pick
 STUDIO_PORT_ENV = "VP_STUDIO_PORT"
 STUDIO_PROFILE_ENV = "VP_STUDIO_PROFILE"
 STUDIO_ENV_FILE_ENV = "VP_STUDIO_ENV_FILE"
+STARTUP_LOCK_STALE_S = 90.0
+STARTUP_LOCK_WAIT_S = 30.0
+STARTUP_LOCK_POLL_S = 0.25
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +238,11 @@ def _runtime_file() -> Path:
     return _state_dir() / "runtime.json"
 
 
+def _startup_lock_file() -> Path:
+    """Get the path to the transient startup lock file."""
+    return _state_dir() / "startup.lock"
+
+
 def _log_file() -> Path:
     """Get the path to the launcher log file."""
     logs = _state_dir() / "logs"
@@ -282,6 +290,99 @@ def _http_ok(url: str, timeout: float = 0.25) -> bool:
         return r.status_code == 200
     except Exception:
         return False
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except TypeError:
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+
+
+def _load_startup_lock(path: Path) -> Optional[dict]:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _try_acquire_startup_lock(now_ts: Optional[float] = None) -> Optional[Path]:
+    lock_path = _startup_lock_file()
+    attempt_ts = float(time.time() if now_ts is None else now_ts)
+
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            payload = _load_startup_lock(lock_path)
+            started_at = None
+            if isinstance(payload, dict):
+                try:
+                    started_at = float(payload.get("started_at"))
+                except Exception:
+                    started_at = None
+            if started_at is None or (attempt_ts - started_at) >= STARTUP_LOCK_STALE_S:
+                _safe_unlink(lock_path)
+                continue
+            return None
+
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"pid": os.getpid(), "started_at": attempt_ts}, handle)
+        return lock_path
+
+
+def _release_startup_lock(lock_path: Optional[Path]) -> None:
+    if lock_path is None:
+        return
+    _safe_unlink(lock_path)
+
+
+def _await_running_instance_or_startup_slot(
+    *,
+    requested_profile: Optional[Path] = None,
+    requested_bind_host: Optional[str] = None,
+    max_wait_s: float = STARTUP_LOCK_WAIT_S,
+    poll_s: float = STARTUP_LOCK_POLL_S,
+) -> tuple[Optional[Path], Optional[str]]:
+    deadline = time.time() + max(0.0, float(max_wait_s))
+
+    while True:
+        existing = _reuse_existing_if_running(
+            requested_profile=requested_profile,
+            requested_bind_host=requested_bind_host,
+        )
+        if existing:
+            return None, existing
+
+        lock_path = _try_acquire_startup_lock()
+        if lock_path is not None:
+            return lock_path, None
+
+        if time.time() >= deadline:
+            return None, None
+        time.sleep(max(0.05, float(poll_s)))
+
+
+def _release_startup_lock_when_ready(lock_path: Optional[Path], url: str) -> None:
+    if lock_path is None:
+        return
+
+    def _watch_startup() -> None:
+        deadline = time.time() + STARTUP_LOCK_WAIT_S
+        while time.time() < deadline:
+            if _http_ok(url + "/api/health", timeout=0.2):
+                break
+            time.sleep(0.1)
+        _release_startup_lock(lock_path)
+
+    threading.Thread(target=_watch_startup, daemon=True).start()
 
 
 def _reuse_existing_if_running(
@@ -427,7 +528,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     if profile_path is not None and not profile_path.exists():
         raise FileNotFoundError(f"Profile not found: {profile_path}")
 
-    # If already running, reuse (perfect UX)
+    startup_lock: Optional[Path] = None
+
+    # If already running, reuse (perfect UX) and avoid duplicate launches
+    # while a sibling launcher is still bringing the runtime up.
     if args.reuse:
         existing = _reuse_existing_if_running(
             requested_profile=profile_path,
@@ -440,6 +544,22 @@ def main(argv: Optional[List[str]] = None) -> None:
                 except Exception as exc:
                     logger.warning("Failed to open browser to %s: %s", existing, exc)
             return
+        startup_lock, existing = _await_running_instance_or_startup_slot(
+            requested_profile=profile_path,
+            requested_bind_host=args.host,
+        )
+        if existing:
+            if not args.no_browser:
+                try:
+                    webbrowser.open(existing)
+                except Exception as exc:
+                    logger.warning("Failed to open browser to %s: %s", existing, exc)
+            return
+        if startup_lock is None:
+            logger.info("VideoPipeline startup is already in progress; skipping duplicate launch.")
+            return
+    else:
+        startup_lock = _try_acquire_startup_lock()
 
     # When frozen, run from a stable workspace folder so outputs don't end up in System32
     if _is_frozen():
@@ -458,6 +578,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     app = create_app(video_path=None, profile_path=profile_path)
 
     _write_runtime(runtime_host, port, bind_host=args.host, profile_path=profile_path)
+    _release_startup_lock_when_ready(startup_lock, url)
 
     if not args.no_browser:
         threading.Thread(target=_open_browser_when_ready, args=(url,), daemon=True).start()
@@ -474,6 +595,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         server = uvicorn.Server(config)
         server.run()
     finally:
+        _release_startup_lock(startup_lock)
         _clear_runtime()
 
 

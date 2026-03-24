@@ -113,3 +113,54 @@ def test_load_local_env_file_sets_missing_values_only(monkeypatch, tmp_path):
     assert loaded == env_file
     assert launcher.os.environ["TWITCH_CLIENT_ID"] == "client-id"
     assert launcher.os.environ["TWITCH_CLIENT_SECRET"] == "already-set"
+
+
+def test_try_acquire_startup_lock_skips_recent_existing_lock(monkeypatch, tmp_path):
+    lock_path = tmp_path / "startup.lock"
+    lock_path.write_text(json.dumps({"pid": 111, "started_at": 100.0}), encoding="utf-8")
+
+    monkeypatch.setattr(launcher, "_startup_lock_file", lambda: lock_path)
+
+    assert launcher._try_acquire_startup_lock(now_ts=120.0) is None
+    assert lock_path.exists()
+
+
+def test_try_acquire_startup_lock_reclaims_stale_lock(monkeypatch, tmp_path):
+    lock_path = tmp_path / "startup.lock"
+    lock_path.write_text(json.dumps({"pid": 111, "started_at": 0.0}), encoding="utf-8")
+
+    monkeypatch.setattr(launcher, "_startup_lock_file", lambda: lock_path)
+
+    acquired = launcher._try_acquire_startup_lock(now_ts=launcher.STARTUP_LOCK_STALE_S + 5.0)
+
+    assert acquired == lock_path
+    payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    assert payload["pid"] == launcher.os.getpid()
+
+
+def test_await_running_instance_or_startup_slot_reuses_pending_start(monkeypatch):
+    sleep_calls = {"count": 0}
+
+    def fake_reuse_existing_if_running(**kwargs):
+        if sleep_calls["count"] < 2:
+            return None
+        return "http://127.0.0.1:57820"
+
+    monkeypatch.setattr(launcher, "_reuse_existing_if_running", fake_reuse_existing_if_running)
+    monkeypatch.setattr(launcher, "_try_acquire_startup_lock", lambda now_ts=None: None)
+    monkeypatch.setattr(launcher.time, "time", lambda: float(sleep_calls["count"]))
+
+    def fake_sleep(seconds):
+        sleep_calls["count"] += 1
+
+    monkeypatch.setattr(launcher.time, "sleep", fake_sleep)
+
+    lock_path, existing = launcher._await_running_instance_or_startup_slot(
+        requested_bind_host="127.0.0.1",
+        max_wait_s=5.0,
+        poll_s=0.1,
+    )
+
+    assert lock_path is None
+    assert existing == "http://127.0.0.1:57820"
+    assert sleep_calls["count"] == 2
