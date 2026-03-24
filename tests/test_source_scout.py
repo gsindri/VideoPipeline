@@ -366,6 +366,7 @@ def test_load_scout_probe_config_defaults_to_smaller_shortlist():
     config = source_scout_mod._load_scout_probe_config({})
 
     assert config["shortlist"] == 6
+    assert config["request_budget_s"] == 6.0
     assert config["download_timeout_s"] == 45.0
     assert config["download_max_retries"] == 0
 
@@ -745,7 +746,58 @@ def test_probe_single_candidate_chat_replaces_existing_probe_files(tmp_path, mon
     assert not lock_path.exists()
     assert seen_kwargs["twitch_timeout_s"] == 45.0
     assert seen_kwargs["twitch_max_retries"] == 0
+    assert seen_kwargs["twitch_allow_fallback"] is False
     assert summary["status"] == "ok"
+
+
+def test_probe_single_candidate_chat_skips_when_request_budget_is_exhausted(tmp_path, monkeypatch):
+    import videopipeline.chat.downloader as chat_downloader_mod
+
+    cache_root = tmp_path / "probe"
+    summary_path = cache_root / "summary.json"
+    raw_path = cache_root / "chat.json"
+    db_path = cache_root / "chat.sqlite"
+    lock_path = cache_root / "probe.lock"
+
+    monkeypatch.setattr(
+        source_scout_mod,
+        "_probe_cache_paths",
+        lambda url, *, content_key=None: {
+            "root": cache_root,
+            "summary": summary_path,
+            "raw": raw_path,
+            "db": db_path,
+            "lock": lock_path,
+        },
+    )
+    monkeypatch.setattr(source_scout_mod, "_load_cached_probe_summary", lambda *a, **k: None)
+    monkeypatch.setattr(source_scout_mod.time, "time", lambda: 100.0)
+    monkeypatch.setattr(chat_downloader_mod, "is_chat_download_available", lambda: True)
+
+    download_calls = {"count": 0}
+
+    def fake_download_chat(*args, **kwargs):
+        download_calls["count"] += 1
+        raise AssertionError("download_chat should not be called after budget exhaustion")
+
+    monkeypatch.setattr(chat_downloader_mod, "download_chat", fake_download_chat)
+
+    summary = source_scout_mod._probe_single_candidate_chat(
+        {
+            "url": "https://www.twitch.tv/videos/111",
+            "content_key": "twitch_111",
+            "platform": "twitch",
+        },
+        probe_config={"ttl_hours": 18.0},
+        now_ts=1742061600.0,
+        request_deadline_ts=100.0,
+    )
+
+    assert download_calls["count"] == 0
+    assert summary["status"] == "skipped"
+    assert summary["transient"] is True
+    assert not summary_path.exists()
+    assert not lock_path.exists()
 
 
 def test_probe_single_candidate_chat_reuses_inflight_probe(tmp_path, monkeypatch):
@@ -820,3 +872,87 @@ def test_try_acquire_probe_file_lock_reclaims_stale_lock(tmp_path):
     assert payload["pid"] != 123
     source_scout_mod._release_probe_file_lock(lock_path)
     assert not lock_path.exists()
+
+
+def test_build_source_scout_report_limits_probe_work_to_request_budget(tmp_path, monkeypatch):
+    watchlist_path = tmp_path / "watchlist.local.yaml"
+    watchlist_path.write_text(
+        """
+shadow_mode: true
+scout_probe:
+  enabled: true
+  shortlist: 6
+  min_candidates: 2
+  request_budget_s: 6
+sources:
+  - id: squeex
+    label: Squeex Twitch VODs
+    platform: twitch
+    provider: twitch_helix
+    enabled: true
+    priority: 4
+        """.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        source_scout_mod,
+        "build_project_history",
+        lambda projects_root=None: {
+            "processed_urls": set(),
+            "processed_content_keys": set(),
+            "source_stats": {},
+        },
+    )
+    monkeypatch.setattr(
+        source_scout_mod,
+        "list_source_inbox_entries",
+        lambda status="pending": (None, []),
+    )
+
+    fake_clock = {"now": 100.0}
+    monkeypatch.setattr(source_scout_mod.time, "time", lambda: fake_clock["now"])
+
+    probe_calls = []
+
+    def fake_probe_single(candidate, *, probe_config, now_ts, request_deadline_ts=None):
+        probe_calls.append(
+            {
+                "url": candidate["url"],
+                "deadline": request_deadline_ts,
+            }
+        )
+        fake_clock["now"] += 7.0
+        return {
+            "status": "ok",
+            "score": 0.9,
+            "peak_count": 3,
+            "laugh_peak_count": 1,
+        }
+
+    monkeypatch.setattr(source_scout_mod, "_probe_single_candidate_chat", fake_probe_single)
+
+    report = source_scout_mod.build_source_scout_report(
+        watchlist_path=watchlist_path,
+        per_source=6,
+        limit=18,
+        now_ts=1742061600.0,
+        fetch_entries_fn=lambda source, limit: [
+            {
+                "url": f"https://www.twitch.tv/videos/{200 + idx}",
+                "title": f"Candidate {idx}",
+                "duration_seconds": 7200,
+                "published_at": "2026-03-15T14:00:00Z",
+                "platform": "twitch",
+                "channel_name": "Squeex",
+                "video_id": str(200 + idx),
+            }
+            for idx in range(6)
+        ],
+    )
+
+    assert len(probe_calls) == 1
+    assert report["meta"]["chat_probe"]["shortlist_count"] == 6
+    assert report["meta"]["chat_probe"]["used_count"] == 1
+    assert report["meta"]["chat_probe"]["status"] == "partial"

@@ -753,6 +753,7 @@ def _download_twitch_with_retry(
     max_retries: int = 2,
     retry_delay_base: float = 5.0,
     timeout: int = 1800,
+    allow_fallback: bool = True,
 ) -> ChatDownloadResult:
     """Download Twitch chat with retry logic and fallback.
 
@@ -827,6 +828,11 @@ def _download_twitch_with_retry(
     else:
         log.warning("[CHAT] TwitchDownloaderCLI not found, trying fallback")
 
+    if not allow_fallback:
+        if last_error is not None:
+            raise last_error
+        raise ChatDownloadError("Twitch chat download failed without fallback")
+
     # Try chat-downloader fallback
     try:
         return _download_twitch_with_chat_downloader_fallback(
@@ -857,6 +863,7 @@ def download_chat(
     twitch_timeout_s: Optional[float] = None,
     twitch_max_retries: Optional[int] = None,
     twitch_retry_delay_base: Optional[float] = None,
+    twitch_allow_fallback: bool = True,
 ) -> ChatDownloadResult:
     """Download chat replay from URL.
 
@@ -904,6 +911,7 @@ def download_chat(
             max_retries=resolved_max_retries,
             retry_delay_base=resolved_retry_delay_base,
             timeout=resolved_timeout,
+            allow_fallback=bool(twitch_allow_fallback),
         )
 
     # Try chat-downloader for other platforms (YouTube, etc.)

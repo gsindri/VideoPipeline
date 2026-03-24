@@ -741,6 +741,7 @@ def _load_scout_probe_config(watchlist: Dict[str, Any]) -> Dict[str, Any]:
         "min_candidates": max(2, _safe_int(raw.get("min_candidates"), 2)),
         "rerank_weight": max(0.0, min(0.5, _safe_float(raw.get("rerank_weight"), 0.24))),
         "ttl_hours": max(1.0, _safe_float(raw.get("ttl_hours"), 18.0)),
+        "request_budget_s": max(1.0, _safe_float(raw.get("request_budget_s"), 6.0)),
         "download_timeout_s": max(5.0, _safe_float(raw.get("download_timeout_s"), 45.0)),
         "download_max_retries": max(0, _safe_int(raw.get("download_max_retries"), 0)),
         "download_retry_delay_base_s": max(0.0, _safe_float(raw.get("download_retry_delay_base_s"), 2.0)),
@@ -996,7 +997,16 @@ def _probe_single_candidate_chat(
     *,
     probe_config: Dict[str, Any],
     now_ts: float,
+    request_deadline_ts: Optional[float] = None,
 ) -> Dict[str, Any]:
+    def _transient_payload(*, error: str, status: str = "skipped") -> Dict[str, Any]:
+        return {
+            "status": status,
+            "generated_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
+            "error": error,
+            "transient": True,
+        }
+
     ttl_s = max(3600.0, _safe_float(probe_config.get("ttl_hours"), 18.0) * 3600.0)
     paths = _probe_cache_paths(
         str(candidate.get("url") or "").strip(),
@@ -1004,6 +1014,8 @@ def _probe_single_candidate_chat(
     )
     inflight_wait_s = max(30.0, min(ttl_s, 300.0))
     wait_deadline = time.time() + inflight_wait_s
+    if request_deadline_ts is not None:
+        wait_deadline = min(wait_deadline, request_deadline_ts)
 
     while True:
         loop_now_ts = time.time()
@@ -1016,9 +1028,15 @@ def _probe_single_candidate_chat(
 
         remaining_s = wait_deadline - time.time()
         if remaining_s <= 0:
-            time.sleep(_SCOUT_PROBE_LOCK_POLL_S)
-            continue
+            return _transient_payload(error="chat probe budget exhausted while waiting for shared probe")
         time.sleep(min(_SCOUT_PROBE_LOCK_POLL_S, remaining_s))
+
+    remaining_budget_s = None
+    if request_deadline_ts is not None:
+        remaining_budget_s = request_deadline_ts - time.time()
+        if remaining_budget_s <= 0.25:
+            _release_probe_file_lock(paths["lock"])
+            return _transient_payload(error="chat probe budget exhausted before download start")
 
     try:
         from .chat.downloader import download_chat, is_chat_download_available
@@ -1050,15 +1068,19 @@ def _probe_single_candidate_chat(
         probe_run_id = uuid.uuid4().hex
         temp_raw_path = paths["root"] / f"chat-{probe_run_id}.json"
         temp_db_path = paths["root"] / f"chat-{probe_run_id}.sqlite"
+        twitch_timeout_s = _safe_float(probe_config.get("download_timeout_s"), 45.0)
+        if remaining_budget_s is not None:
+            twitch_timeout_s = min(twitch_timeout_s, max(1.0, remaining_budget_s - 0.25))
         download_chat(
             str(candidate.get("url") or "").strip(),
             temp_raw_path,
-            twitch_timeout_s=_safe_float(probe_config.get("download_timeout_s"), 45.0),
+            twitch_timeout_s=twitch_timeout_s,
             twitch_max_retries=_safe_int(probe_config.get("download_max_retries"), 0),
             twitch_retry_delay_base=_safe_float(
                 probe_config.get("download_retry_delay_base_s"),
                 2.0,
             ),
+            twitch_allow_fallback=False,
         )
         summary = _compute_chat_probe_summary(
             candidate=candidate,
@@ -1073,10 +1095,13 @@ def _probe_single_candidate_chat(
         summary["generated_at"] = datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat()
         return _save_probe_summary(paths["summary"], summary)
     except Exception as exc:
+        error_msg = f"{type(exc).__name__}: {exc}"
+        if remaining_budget_s is not None and "timed out after" in str(exc).lower():
+            return _transient_payload(error=error_msg)
         payload = {
             "status": "error",
             "generated_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": error_msg,
         }
         return _save_probe_summary(paths["summary"], payload)
     finally:
@@ -1101,6 +1126,7 @@ def _apply_chat_probe_rerank(
     configured_shortlist = max(2, _safe_int(probe_config.get("shortlist"), 4))
     requested_limit = max(1, _safe_int(report_limit, len(candidates) or 1))
     effective_shortlist_cap = max(2, min(configured_shortlist, max(6, min(requested_limit, 8))))
+    request_budget_s = max(1.0, _safe_float(probe_config.get("request_budget_s"), 6.0))
     meta = {
         "enabled": bool(probe_config.get("enabled", True)),
         "eligible_candidates": 0,
@@ -1109,6 +1135,7 @@ def _apply_chat_probe_rerank(
         "status": "disabled",
         "configured_shortlist": configured_shortlist,
         "effective_shortlist_cap": effective_shortlist_cap,
+        "request_budget_s": round(request_budget_s, 2),
     }
 
     for item in candidates:
@@ -1146,26 +1173,36 @@ def _apply_chat_probe_rerank(
             probe_config: Dict[str, Any],
             now_ts: float,
         ) -> Dict[str, Dict[str, Any]]:
-            return {
-                str(item.get("url") or "").strip(): _probe_single_candidate_chat(
+            results: Dict[str, Dict[str, Any]] = {}
+            request_deadline_ts = time.time() + request_budget_s
+            for item in selected:
+                key = str(item.get("url") or "").strip()
+                if not key:
+                    continue
+                if (request_deadline_ts - time.time()) <= 0.0:
+                    break
+                results[key] = _probe_single_candidate_chat(
                     item,
                     probe_config=probe_config,
                     now_ts=now_ts,
+                    request_deadline_ts=request_deadline_ts,
                 )
-                for item in selected
-            }
+            return results
 
         probe_candidates_fn = _default_probe
 
     probe_results = probe_candidates_fn(shortlist, probe_config=probe_config, now_ts=now_ts) or {}
     rerank_weight = _safe_float(probe_config.get("rerank_weight"), 0.24)
     used_count = 0
+    transient_count = 0
     for item in shortlist:
         key = str(item.get("url") or "").strip()
         probe = probe_results.get(key)
         if not isinstance(probe, dict):
             continue
         item["chat_probe"] = probe
+        if bool(probe.get("transient")):
+            transient_count += 1
         if str(probe.get("status") or "").strip().lower() != "ok":
             error = str(probe.get("error") or "").strip()
             if error:
@@ -1186,7 +1223,14 @@ def _apply_chat_probe_rerank(
         used_count += 1
 
     meta["used_count"] = used_count
-    meta["status"] = "applied" if used_count > 0 else "unavailable"
+    if used_count > 0 and (used_count < len(shortlist) or transient_count > 0):
+        meta["status"] = "partial"
+    elif used_count > 0:
+        meta["status"] = "applied"
+    elif transient_count > 0:
+        meta["status"] = "budget_limited"
+    else:
+        meta["status"] = "unavailable"
     return meta
 
 
