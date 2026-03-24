@@ -366,6 +366,8 @@ def test_load_scout_probe_config_defaults_to_smaller_shortlist():
     config = source_scout_mod._load_scout_probe_config({})
 
     assert config["shortlist"] == 6
+    assert config["download_timeout_s"] == 45.0
+    assert config["download_max_retries"] == 0
 
 
 def test_build_source_scout_report_reuses_short_lived_cache(tmp_path, monkeypatch):
@@ -700,9 +702,11 @@ def test_probe_single_candidate_chat_replaces_existing_probe_files(tmp_path, mon
 
     download_calls = {"count": 0}
     compute_calls = {"count": 0}
+    seen_kwargs = {}
 
     def fake_download_chat(url, output_path, **kwargs):
         download_calls["count"] += 1
+        seen_kwargs.update(kwargs)
         assert Path(output_path) != raw_path
         assert output_path.name.startswith("chat-")
         Path(output_path).write_text("new raw", encoding="utf-8")
@@ -739,6 +743,8 @@ def test_probe_single_candidate_chat_replaces_existing_probe_files(tmp_path, mon
     assert db_path.read_text(encoding="utf-8") == "new db"
     assert summary_path.exists()
     assert not lock_path.exists()
+    assert seen_kwargs["twitch_timeout_s"] == 45.0
+    assert seen_kwargs["twitch_max_retries"] == 0
     assert summary["status"] == "ok"
 
 

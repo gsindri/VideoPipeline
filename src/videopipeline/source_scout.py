@@ -741,6 +741,9 @@ def _load_scout_probe_config(watchlist: Dict[str, Any]) -> Dict[str, Any]:
         "min_candidates": max(2, _safe_int(raw.get("min_candidates"), 2)),
         "rerank_weight": max(0.0, min(0.5, _safe_float(raw.get("rerank_weight"), 0.24))),
         "ttl_hours": max(1.0, _safe_float(raw.get("ttl_hours"), 18.0)),
+        "download_timeout_s": max(5.0, _safe_float(raw.get("download_timeout_s"), 45.0)),
+        "download_max_retries": max(0, _safe_int(raw.get("download_max_retries"), 0)),
+        "download_retry_delay_base_s": max(0.0, _safe_float(raw.get("download_retry_delay_base_s"), 2.0)),
         "hop_s": max(2.0, _safe_float(raw.get("hop_s"), 15.0)),
         "smooth_s": max(4.0, _safe_float(raw.get("smooth_s"), 45.0)),
         "peak_threshold": max(0.5, _safe_float(raw.get("peak_threshold"), 2.25)),
@@ -1047,7 +1050,16 @@ def _probe_single_candidate_chat(
         probe_run_id = uuid.uuid4().hex
         temp_raw_path = paths["root"] / f"chat-{probe_run_id}.json"
         temp_db_path = paths["root"] / f"chat-{probe_run_id}.sqlite"
-        download_chat(str(candidate.get("url") or "").strip(), temp_raw_path)
+        download_chat(
+            str(candidate.get("url") or "").strip(),
+            temp_raw_path,
+            twitch_timeout_s=_safe_float(probe_config.get("download_timeout_s"), 45.0),
+            twitch_max_retries=_safe_int(probe_config.get("download_max_retries"), 0),
+            twitch_retry_delay_base=_safe_float(
+                probe_config.get("download_retry_delay_base_s"),
+                2.0,
+            ),
+        )
         summary = _compute_chat_probe_summary(
             candidate=candidate,
             probe_config=probe_config,

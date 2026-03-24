@@ -752,6 +752,7 @@ def _download_twitch_with_retry(
     check_cancel: Optional[Callable[[], bool]] = None,
     max_retries: int = 2,
     retry_delay_base: float = 5.0,
+    timeout: int = 1800,
 ) -> ChatDownloadResult:
     """Download Twitch chat with retry logic and fallback.
 
@@ -798,6 +799,7 @@ def _download_twitch_with_retry(
                     url, output_path, video_id,
                     on_progress=on_progress,
                     check_cancel=check_cancel,
+                    timeout=timeout,
                 )
 
             except ChatDownloadCancelled:
@@ -852,6 +854,9 @@ def download_chat(
     *,
     on_progress: Optional[Callable[[float, str], None]] = None,
     check_cancel: Optional[Callable[[], bool]] = None,
+    twitch_timeout_s: Optional[float] = None,
+    twitch_max_retries: Optional[int] = None,
+    twitch_retry_delay_base: Optional[float] = None,
 ) -> ChatDownloadResult:
     """Download chat replay from URL.
 
@@ -881,7 +886,25 @@ def download_chat(
 
     # Use TwitchDownloaderCLI for Twitch (with retry and fallback)
     if platform == "twitch":
-        return _download_twitch_with_retry(url, output_path, video_id, on_progress=on_progress, check_cancel=check_cancel)
+        resolved_timeout = int(max(1.0, float(twitch_timeout_s))) if twitch_timeout_s is not None else 1800
+        resolved_max_retries = (
+            max(0, int(twitch_max_retries)) if twitch_max_retries is not None else 2
+        )
+        resolved_retry_delay_base = (
+            max(0.0, float(twitch_retry_delay_base))
+            if twitch_retry_delay_base is not None
+            else 5.0
+        )
+        return _download_twitch_with_retry(
+            url,
+            output_path,
+            video_id,
+            on_progress=on_progress,
+            check_cancel=check_cancel,
+            max_retries=resolved_max_retries,
+            retry_delay_base=resolved_retry_delay_base,
+            timeout=resolved_timeout,
+        )
 
     # Try chat-downloader for other platforms (YouTube, etc.)
     crd = _find_chat_downloader()
