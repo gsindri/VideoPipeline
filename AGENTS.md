@@ -15,6 +15,8 @@
 - When `Gondull` is asked to operate `VideoPipeline` end-to-end, prefer the OpenClaw skill `videopipeline-operator` at `/home/sindri/.openclaw/workspace/skills/videopipeline-operator/SKILL.md`.
 - Direct Studio use is secondary and mainly for manual review, debugging, and fallback operation.
 - When integration work spans both codebases, it is acceptable to update both `VideoPipeline` and `Gondull_Platform` together.
+- If work also touches `Gondull_Platform`, treat it as incomplete until `npm run app:refresh:installed` and `npm run deploy:up` have been run there, then verify the installed desktop app and localhost runtime are in sync and `http://localhost:3000/login` returns HTTP 200.
+- Be aware that `Gondull_Platform` `deploy:up` can sometimes exit nonzero because of a Docker recreate race even when the rebuild succeeded; check actual container/runtime health before treating the deploy as failed.
 - See `docs/gondull-control-plane.md` for the intended operating model.
 
 ## Cross-Machine Context
