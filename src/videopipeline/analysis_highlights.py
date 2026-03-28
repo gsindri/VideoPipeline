@@ -2452,6 +2452,104 @@ def _merge_candidate_extras(
     return candidates
 
 
+def _safe_track_value(track: Any, idx: int, *, default: float = 0.0) -> float:
+    try:
+        arr = np.asarray(track, dtype=np.float64).reshape(-1)
+    except Exception:
+        return float(default)
+    if arr.size == 0:
+        return float(default)
+    idx = max(0, min(int(idx), arr.size - 1))
+    value = float(arr[idx])
+    return value if np.isfinite(value) else float(default)
+
+
+def _safe_track_mean(track: Any, start_idx: int, end_idx: int, *, default: float = 0.0) -> float:
+    try:
+        arr = np.asarray(track, dtype=np.float64).reshape(-1)
+    except Exception:
+        return float(default)
+    if arr.size == 0:
+        return float(default)
+
+    lo = max(0, int(start_idx))
+    hi = min(arr.size, int(end_idx))
+    if hi <= lo:
+        hi = min(arr.size, lo + 1)
+
+    window = arr[lo:hi]
+    window = window[np.isfinite(window)]
+    if window.size == 0:
+        return float(default)
+    return float(np.mean(window))
+
+
+def _trim_candidate_text(text: Any, *, max_chars: int = 600) -> tuple[str, bool]:
+    cleaned = _re.sub(r"\s+", " ", str(text or "")).strip()
+    if not cleaned:
+        return "", False
+    if max_chars <= 0 or len(cleaned) <= max_chars:
+        return cleaned, False
+
+    cut = cleaned[:max_chars]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return (cut or cleaned[:max_chars]).strip(), True
+
+
+def _build_candidate_director_context(
+    *,
+    start_s: float,
+    end_s: float,
+    peak_idx: int,
+    hop_s: float,
+    reaction_scores: Any,
+    audio_events_scores: Any,
+    turn_rate_scores: Any,
+    overlap_scores: Any,
+    speech_fraction: Any,
+    transcript: Optional[Any] = None,
+    transcript_padding_s: float = 0.0,
+    transcript_max_chars: int = 600,
+) -> Dict[str, Any]:
+    start_s = float(start_s)
+    end_s = max(start_s, float(end_s))
+    hop_s = max(float(hop_s), 1e-6)
+    start_idx = int(np.floor(start_s / hop_s))
+    end_idx = int(np.ceil(end_s / hop_s)) + 1
+
+    meta = {
+        "reaction_audio_z": _safe_track_value(reaction_scores, peak_idx, default=0.0),
+        "audio_events_z": _safe_track_value(audio_events_scores, peak_idx, default=0.0),
+        "turn_rate_z": _safe_track_value(turn_rate_scores, peak_idx, default=0.0),
+        "overlap_z": _safe_track_value(overlap_scores, peak_idx, default=0.0),
+        "speech_fraction": _safe_track_mean(speech_fraction, start_idx, end_idx, default=0.0),
+    }
+
+    out: Dict[str, Any] = {"meta": meta}
+    if transcript is None:
+        return out
+
+    excerpt_start = max(0.0, start_s - float(transcript_padding_s))
+    excerpt_end = max(excerpt_start, end_s + float(transcript_padding_s))
+    try:
+        raw_text = transcript.get_text_in_range(excerpt_start, excerpt_end)
+    except Exception:
+        raw_text = ""
+
+    transcript_text, truncated = _trim_candidate_text(raw_text, max_chars=int(transcript_max_chars))
+    if transcript_text:
+        out["transcript"] = transcript_text
+        out["transcript_excerpt"] = {
+            "start_s": round(excerpt_start, 3),
+            "end_s": round(excerpt_end, 3),
+            "text": transcript_text,
+            "truncated": truncated,
+        }
+
+    return out
+
+
 def compute_highlights_candidates(
     proj: Project,
     *,
@@ -2544,6 +2642,8 @@ def compute_highlights_candidates(
     term_audio_events = features.get("term_audio_events", np.zeros_like(combined_smoothed))
     term_speech = features.get("term_speech", np.zeros_like(combined_smoothed))
     term_reaction = features.get("term_reaction", np.zeros_like(combined_smoothed))
+    term_turn_rate = features.get("term_turn_rate", np.zeros_like(combined_smoothed))
+    term_overlap = features.get("term_overlap", np.zeros_like(combined_smoothed))
 
     # Load raw signals for debugging
     audio_scores = features.get("audio_scores", np.zeros_like(combined_smoothed))
@@ -2552,6 +2652,9 @@ def compute_highlights_candidates(
     audio_events_scores = features.get("audio_events_scores", np.zeros_like(combined_smoothed))
     speech_scores = features.get("speech_scores", np.zeros_like(combined_smoothed))
     reaction_scores = features.get("reaction_scores", np.zeros_like(combined_smoothed))
+    turn_rate_scores = features.get("turn_rate_scores", np.zeros_like(combined_smoothed))
+    overlap_scores = features.get("overlap_scores", np.zeros_like(combined_smoothed))
+    speech_fraction_track = features.get("speech_fraction", np.ones_like(combined_smoothed))
 
     _report_progress(on_progress, 0.15, "Loading scene cuts")
 
@@ -2602,11 +2705,27 @@ def compute_highlights_candidates(
     max_overlap_ratio = float(highlights_cfg.get("max_overlap_ratio", 0.0))
     max_overlap_seconds = float(highlights_cfg.get("max_overlap_seconds", 0.0))
     overlap_denom = str(highlights_cfg.get("overlap_denominator", "shorter"))
+    transcript_padding_s = float(highlights_cfg.get("candidate_transcript_padding_s", 0.0))
+    transcript_max_chars = int(highlights_cfg.get("candidate_transcript_max_chars", 600))
+
+    transcript = None
+    try:
+        from .analysis_transcript import load_transcript
+
+        transcript = load_transcript(proj)
+    except Exception:
+        transcript = None
 
     _report_progress(on_progress, 0.30, "Shaping clip boundaries")
 
     # Build raw candidates
     raw_candidates: List[Dict[str, Any]] = []
+    chat_used = bool(np.any(term_chat != 0))
+    audio_events_used = bool(np.any(term_audio_events != 0))
+    speech_used = bool(np.any(term_speech != 0))
+    reaction_used = bool(np.any(term_reaction != 0))
+    turn_rate_used = bool(np.any(term_turn_rate != 0))
+    overlap_used = bool(np.any(term_overlap != 0))
 
     for rank, idx in enumerate(peak_idxs, start=1):
         if idx < 0 or idx >= len(combined_smoothed):
@@ -2627,11 +2746,20 @@ def compute_highlights_candidates(
         if end_s - start_s < max(1.0, clip_cfg.min_seconds * 0.5):
             continue
 
-        # Check signals_used (based on non-zero term arrays)
-        chat_used = bool(np.any(term_chat != 0))
-        audio_events_used = bool(np.any(term_audio_events != 0))
-        speech_used = bool(np.any(term_speech != 0))
-        reaction_used = bool(np.any(term_reaction != 0))
+        director_context = _build_candidate_director_context(
+            start_s=start_s,
+            end_s=end_s,
+            peak_idx=idx,
+            hop_s=hop_s,
+            reaction_scores=reaction_scores,
+            audio_events_scores=audio_events_scores,
+            turn_rate_scores=turn_rate_scores,
+            overlap_scores=overlap_scores,
+            speech_fraction=speech_fraction_track,
+            transcript=transcript,
+            transcript_padding_s=transcript_padding_s,
+            transcript_max_chars=transcript_max_chars,
+        )
 
         raw_candidates.append({
             "rank": rank,
@@ -2647,6 +2775,8 @@ def compute_highlights_candidates(
                 "audio_events": float(term_audio_events[idx]) if audio_events_used else 0.0,
                 "speech": float(term_speech[idx]) if speech_used else 0.0,
                 "reaction": float(term_reaction[idx]) if reaction_used else 0.0,
+                "turn_rate": float(term_turn_rate[idx]) if turn_rate_used else 0.0,
+                "overlap": float(term_overlap[idx]) if overlap_used else 0.0,
             },
             "raw_signals": {
                 "audio": float(audio_scores[idx]),
@@ -2655,7 +2785,10 @@ def compute_highlights_candidates(
                 "audio_events": float(audio_events_scores[idx]) if audio_events_used else 0.0,
                 "speech": float(speech_scores[idx]) if speech_used else 0.0,
                 "reaction": float(reaction_scores[idx]) if reaction_used else 0.0,
+                "turn_rate": float(turn_rate_scores[idx]) if turn_rate_used else 0.0,
+                "overlap": float(overlap_scores[idx]) if overlap_used else 0.0,
             },
+            **director_context,
         })
 
     _report_progress(on_progress, 0.50, "Filtering overlapping candidates")
