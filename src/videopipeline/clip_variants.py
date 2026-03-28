@@ -532,6 +532,34 @@ def _generate_clean_cut_variant(
     )
 
 
+def _generate_candidate_base_variant(
+    candidate: Dict[str, Any],
+    *,
+    duration_s: float,
+) -> Optional[ClipVariant]:
+    """Preserve the current shaped candidate bounds as a baseline variant."""
+    try:
+        start_s = float(candidate.get("start_s"))
+        end_s = float(candidate.get("end_s"))
+    except Exception:
+        return None
+
+    start_s = max(0.0, start_s)
+    if duration_s > 0:
+        end_s = min(float(duration_s), end_s)
+
+    if end_s <= start_s:
+        return None
+
+    return ClipVariant(
+        variant_id="shaped_base",
+        start_s=start_s,
+        end_s=end_s,
+        duration_s=end_s - start_s,
+        description="Pipeline-shaped candidate bounds (baseline cut)",
+    )
+
+
 def _generate_duration_variant(
     peak_time_s: float,
     duration_s: float,
@@ -774,6 +802,12 @@ def generate_variants_for_candidate(
     rank = int(candidate.get("rank", 0))
 
     variants: List[ClipVariant] = []
+
+    # 0. Preserve the already-shaped candidate cut so downstream selection can
+    # keep the pipeline's best-known bounds when they beat regenerated variants.
+    base_var = _generate_candidate_base_variant(candidate, duration_s=duration_s)
+    if base_var:
+        variants.append(base_var)
 
     # 1. Short variant (16-24s)
     short = _generate_duration_variant(

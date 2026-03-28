@@ -1,10 +1,68 @@
 import hashlib
 import json
+import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+
+
+def _install_google_stubs() -> None:
+    """Tests don't need real google-auth just to import publisher code."""
+    if "google.auth.transport.requests" not in sys.modules:
+        google_mod = sys.modules.setdefault("google", types.ModuleType("google"))
+        auth_mod = sys.modules.setdefault("google.auth", types.ModuleType("google.auth"))
+        transport_mod = sys.modules.setdefault("google.auth.transport", types.ModuleType("google.auth.transport"))
+        requests_mod = types.ModuleType("google.auth.transport.requests")
+        exceptions_mod = types.ModuleType("google.auth.exceptions")
+
+        class Request:  # noqa: D401 - tiny stub for imports
+            """Stub request transport."""
+
+        class AuthorizedSession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+        class RefreshError(Exception):
+            pass
+
+        requests_mod.Request = Request
+        requests_mod.AuthorizedSession = AuthorizedSession
+        exceptions_mod.RefreshError = RefreshError
+        sys.modules["google.auth.transport.requests"] = requests_mod
+        sys.modules["google.auth.exceptions"] = exceptions_mod
+        setattr(transport_mod, "requests", requests_mod)
+        setattr(auth_mod, "exceptions", exceptions_mod)
+        setattr(auth_mod, "transport", transport_mod)
+        setattr(google_mod, "auth", auth_mod)
+
+    if "google.oauth2.credentials" not in sys.modules:
+        google_mod = sys.modules.setdefault("google", types.ModuleType("google"))
+        oauth2_mod = sys.modules.setdefault("google.oauth2", types.ModuleType("google.oauth2"))
+        credentials_mod = types.ModuleType("google.oauth2.credentials")
+
+        class Credentials:
+            def __init__(self, *args, **kwargs):
+                self.token = kwargs.get("token")
+                self.refresh_token = kwargs.get("refresh_token")
+                self.expired = False
+                self.token_uri = kwargs.get("token_uri")
+                self.client_id = kwargs.get("client_id")
+                self.client_secret = kwargs.get("client_secret")
+                self.scopes = kwargs.get("scopes")
+
+            def refresh(self, request):
+                self.expired = False
+
+        credentials_mod.Credentials = Credentials
+        sys.modules["google.oauth2.credentials"] = credentials_mod
+        setattr(oauth2_mod, "credentials", credentials_mod)
+        setattr(google_mod, "oauth2", oauth2_mod)
+
+
+_install_google_stubs()
 
 
 @pytest.fixture(autouse=True)
@@ -2058,12 +2116,21 @@ def test_actions_ai_variants_supports_candidate_ids_param(tmp_path, monkeypatch)
 
 
 def test_actions_ai_apply_semantic_updates_project(tmp_path, monkeypatch):
-    client = _make_client(tmp_path, monkeypatch, token="secret")
+    profile_path = tmp_path / "semantic_weight.yaml"
+    profile_path.write_text(
+        """
+analysis:
+  highlights:
+    llm_semantic_weight: 0.5
+""".strip(),
+        encoding="utf-8",
+    )
+    client = _make_client(tmp_path, monkeypatch, token="secret", profile_path=profile_path)
     hdr = {"Authorization": "Bearer secret"}
 
     pid = hashlib.sha256("twitch_236".encode("utf-8")).hexdigest()
     proj_dir = tmp_path / "outputs" / "projects" / pid
-    proj_dir.mkdir(parents=True, exist_ok=True)
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
 
     project_json = {
         "project_id": pid,
@@ -2082,6 +2149,19 @@ def test_actions_ai_apply_semantic_updates_project(tmp_path, monkeypatch):
         "exports": [],
     }
     (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+    (proj_dir / "analysis" / "highlights.json").write_text(
+        json.dumps(
+            {
+                "created_at": "now",
+                "signals_used": {"speech": True},
+                "candidates": [
+                    {"rank": 1, "candidate_id": "c1", "score": 1.0, "start_s": 10.0, "end_s": 20.0},
+                    {"rank": 2, "candidate_id": "c2", "score": 0.9, "start_s": 30.0, "end_s": 40.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     r = client.post(
         "/api/actions/ai/apply_semantic",
@@ -2096,14 +2176,77 @@ def test_actions_ai_apply_semantic_updates_project(tmp_path, monkeypatch):
     data = r.json()
     assert data["ok"] is True
     assert data["updated_count"] == 1
+    assert data["candidate_count_before"] == 2
+    assert data["candidate_count_after"] == 2
+    assert data["dropped_count"] == 0
+    assert data["semantic_scored_count"] == 1
 
     updated = json.loads((proj_dir / "project.json").read_text(encoding="utf-8"))
-    c2 = updated["analysis"]["highlights"]["candidates"][1]
-    assert c2["rank"] == 2
+    candidates = updated["analysis"]["highlights"]["candidates"]
+    c2 = candidates[0]
+    assert c2["candidate_id"] == "c2"
+    assert c2["rank"] == 1
+    assert c2["score_signal"] == 0.9
     assert c2["score_semantic"] == 0.8
+    assert c2["score"] == pytest.approx(1.05)
     assert c2["llm_reason"] == "Good moment"
     assert c2["llm_quote"] == "wow"
     assert c2["ai"]["semantic_score"] == 0.8
+    assert updated["analysis"]["highlights"]["signals_used"]["llm_semantic"] is True
+    assert updated["analysis"]["actions"]["semantic_stats"]["semantic_scored_count"] == 1
+
+    highlights = json.loads((proj_dir / "analysis" / "highlights.json").read_text(encoding="utf-8"))
+    assert highlights["candidates"][0]["candidate_id"] == "c2"
+    assert highlights["signals_used"]["llm_semantic"] is True
+
+
+def test_actions_ai_apply_semantic_filters_rejected_candidates(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    pid = hashlib.sha256("twitch_sem_filter".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    proj_dir.mkdir(parents=True, exist_ok=True)
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(proj_dir / "video" / "video.mp4"), "duration_seconds": 60.0},
+        "analysis": {
+            "highlights": {
+                "candidates": [
+                    {"rank": 1, "candidate_id": "c1", "score": 1.2, "start_s": 10.0, "end_s": 20.0},
+                    {"rank": 2, "candidate_id": "c2", "score": 0.9, "start_s": 30.0, "end_s": 40.0},
+                ]
+            }
+        },
+        "layout": {},
+        "selections": [],
+        "exports": [],
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+
+    r = client.post(
+        "/api/actions/ai/apply_semantic",
+        headers=hdr,
+        json={
+            "project_id": pid,
+            "client_request_id": "apply-sem-filter-1",
+            "items": [{"candidate_id": "c1", "semantic_score": 0.1, "reason": "no payoff", "keep": False}],
+        },
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["candidate_count_before"] == 2
+    assert data["candidate_count_after"] == 1
+    assert data["dropped_count"] == 1
+
+    updated = json.loads((proj_dir / "project.json").read_text(encoding="utf-8"))
+    candidates = updated["analysis"]["highlights"]["candidates"]
+    assert len(candidates) == 1
+    assert candidates[0]["candidate_id"] == "c2"
+    assert candidates[0]["rank"] == 1
+    assert updated["analysis"]["actions"]["semantic_stats"]["dropped_count"] == 1
 
 
 def test_actions_ai_apply_semantic_persists_provenance(tmp_path, monkeypatch):
@@ -2495,6 +2638,86 @@ def test_actions_export_director_picks_creates_job(tmp_path, monkeypatch):
     job = _wait_for_terminal_job_state(job_id)
     assert job is not None
     assert job.status == "succeeded"
+
+
+def test_actions_export_batch_external_strict_rejects_raw_top_candidates(tmp_path, monkeypatch):
+    profile_path = tmp_path / "strict_export_batch.yaml"
+    profile_path.write_text(
+        """
+analysis:
+  highlights:
+    llm_semantic_enabled: false
+    llm_filter_enabled: false
+  chapters:
+    enabled: false
+    llm_labeling: false
+ai:
+  director:
+    enabled: true
+""".strip(),
+        encoding="utf-8",
+    )
+    client = _make_client(tmp_path, monkeypatch, token="secret", profile_path=profile_path)
+    hdr = {"Authorization": "Bearer secret"}
+
+    pid = hashlib.sha256("twitch_export_batch_strict_gate".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "video").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "exports").mkdir(parents=True, exist_ok=True)
+    video_path = proj_dir / "video" / "video.mp4"
+    video_path.write_bytes(b"")
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(video_path), "duration_seconds": 60.0},
+        "analysis": {
+            "highlights": {
+                "candidates": [
+                    {"rank": 1, "candidate_id": "cid1", "score": 1.0, "start_s": 10.0, "end_s": 20.0, "peak_time_s": 15.0},
+                ]
+            }
+        },
+        "layout": {},
+        "selections": [],
+        "exports": [],
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+    (proj_dir / "analysis" / "director.json").write_text(
+        json.dumps(
+            {
+                "created_at": "now",
+                "pick_count": 1,
+                "provenance": {"source": "chatgpt_actions", "agent": "gondull"},
+                "config": {"source": "chatgpt_actions"},
+                "picks": [
+                    {
+                        "rank": 1,
+                        "candidate_rank": 1,
+                        "variant_id": "medium",
+                        "start_s": 10.0,
+                        "end_s": 30.0,
+                        "duration_s": 20.0,
+                        "title": "t",
+                        "hook": "h",
+                        "description": "d",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    r = client.post(
+        "/api/actions/export_batch",
+        headers=hdr,
+        json={"project_id": pid, "top": 1, "llm_mode": "external_strict", "client_request_id": "export-batch-strict-1"},
+    )
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "external_strict_requires_director_picks"
+    assert any("raw selections" in issue for issue in detail["issues"])
 
 
 @pytest.mark.parametrize("path", ["/api/actions/run_full_export_top", "/api/actions/run_full_export_top_unattended"])

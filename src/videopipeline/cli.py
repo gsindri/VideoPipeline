@@ -13,8 +13,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, List, Optional
 
+from .analysis import run_analysis
 from .analysis_chat import compute_chat_analysis
-from .analysis_highlights import compute_highlights_analysis
 from .doctor import run_doctor
 from .exporter import ExportSpec, HookTextSpec, LayoutPipSpec, run_ffmpeg_export
 from .layouts import get_facecam_rect
@@ -51,19 +51,28 @@ def _default_out_path(video_path: Path) -> Path:
     return Path("outputs") / video_path.stem / "candidates_highlights.json"
 
 
+def _compute_highlights_candidates_payload(proj: Any, analysis_cfg: dict[str, Any]) -> dict[str, Any]:
+    from .studio.dag_config import apply_llm_mode_to_dag_config, build_dag_config
+
+    dag_config = build_dag_config(analysis_cfg, include_chat=True)
+    dag_config = apply_llm_mode_to_dag_config(dag_config, llm_mode="external")
+    result = run_analysis(proj, targets={"highlights_candidates"}, config=dag_config)
+    if not result.success:
+        raise UserFacingError(result.error or "DAG highlights analysis failed.")
+
+    highlights = ((get_project_data(proj).get("analysis", {}) or {}).get("highlights", {}) or {})
+    candidates = highlights.get("candidates") or []
+    if not isinstance(candidates, list) or not candidates:
+        raise UserFacingError("No highlight candidates produced by DAG analysis.")
+    return highlights
+
+
 def cmd_suggest(args: argparse.Namespace) -> None:
     proj = create_or_load_project(args.video)
     profile = load_profile(args.profile)
     analysis_cfg = profile.get("analysis", {})
 
-    payload = compute_highlights_analysis(
-        proj,
-        audio_cfg=analysis_cfg.get("audio", {}),
-        motion_cfg=analysis_cfg.get("motion", {}),
-        scenes_cfg=analysis_cfg.get("scenes", {}),
-        highlights_cfg=analysis_cfg.get("highlights", {}),
-        include_chat=True,
-    )
+    payload = _compute_highlights_candidates_payload(proj, analysis_cfg)
 
     out_path = args.out or _default_out_path(args.video)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -152,14 +161,7 @@ def cmd_export_top(args: argparse.Namespace) -> None:
     candidates = highlights.get("candidates") or []
     if not candidates:
         analysis_cfg = profile.get("analysis", {})
-        payload = compute_highlights_analysis(
-            proj,
-            audio_cfg=analysis_cfg.get("audio", {}),
-            motion_cfg=analysis_cfg.get("motion", {}),
-            scenes_cfg=analysis_cfg.get("scenes", {}),
-            highlights_cfg=analysis_cfg.get("highlights", {}),
-            include_chat=True,
-        )
+        payload = _compute_highlights_candidates_payload(proj, analysis_cfg)
         candidates = payload.get("candidates", [])
 
     top_n = max(1, int(args.top))

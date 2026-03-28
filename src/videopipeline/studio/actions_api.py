@@ -4359,6 +4359,111 @@ def create_actions_router(
 
         return []
 
+    def _selection_matches_director_result(
+        selection: Dict[str, Any],
+        director_results: list[Dict[str, Any]],
+        *,
+        time_tolerance_s: float = 0.25,
+    ) -> bool:
+        """True when a selection lines up with a director-reviewed pick."""
+        try:
+            selection_rank = int(selection.get("candidate_rank") or selection.get("rank") or 0)
+        except Exception:
+            selection_rank = 0
+        selection_variant_id = str(
+            selection.get("variant_id")
+            or selection.get("best_variant_id")
+            or selection.get("chosen_variant_id")
+            or ""
+        ).strip()
+        selection_start = _safe_float(selection.get("start_s"), 0.0)
+        selection_end = _safe_float(selection.get("end_s"), selection_start)
+
+        for result in director_results:
+            if not isinstance(result, dict):
+                continue
+
+            try:
+                result_rank = int(result.get("candidate_rank") or result.get("rank") or 0)
+            except Exception:
+                result_rank = 0
+            if selection_rank > 0 and result_rank > 0 and selection_rank != result_rank:
+                continue
+
+            result_variant_id = str(
+                result.get("variant_id")
+                or result.get("best_variant_id")
+                or ""
+            ).strip()
+            if selection_variant_id and result_variant_id and selection_variant_id != result_variant_id:
+                continue
+            if selection_variant_id and result_variant_id and selection_rank > 0 and result_rank > 0:
+                return True
+
+            result_start = _safe_float(result.get("start_s"), 0.0)
+            result_end = _safe_float(result.get("end_s"), result_start)
+            if (
+                abs(selection_start - result_start) <= time_tolerance_s
+                and abs(selection_end - result_end) <= time_tolerance_s
+            ):
+                return True
+
+        return False
+
+    def _require_director_backed_export_batch(
+        *,
+        project_id: str,
+        proj: Project,
+        proj_data: Dict[str, Any],
+        llm_mode: str,
+        top_from_candidates: Any,
+        selections: list[Dict[str, Any]],
+        director_results: list[Dict[str, Any]],
+    ) -> None:
+        """Strict external mode must export director-backed picks, not raw tops."""
+        if not llm_mode_is_strict_external(llm_mode):
+            return
+
+        _require_external_ai_ready_for_export(
+            project_id=project_id,
+            proj=proj,
+            proj_data=proj_data,
+            llm_mode=llm_mode,
+        )
+
+        if top_from_candidates is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "external_strict_requires_director_picks",
+                    "project_id": project_id,
+                    "issues": [
+                        "external_strict batch export cannot create raw selections from top candidates",
+                        "use /api/actions/export_director_picks after director review",
+                    ],
+                },
+            )
+
+        missing_selection_ids = [
+            str(selection.get("id") or "")
+            for selection in selections
+            if not _selection_matches_director_result(selection, director_results)
+        ]
+        missing_selection_ids = [sid for sid in missing_selection_ids if sid]
+        if missing_selection_ids:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "external_strict_requires_director_picks",
+                    "project_id": project_id,
+                    "issues": [
+                        "external_strict batch export requires director-backed selections",
+                        "use /api/actions/export_director_picks or export selections created from director picks",
+                    ],
+                    "selection_ids": missing_selection_ids,
+                },
+            )
+
     def _build_ai_candidates_payload(
         *,
         project_id: str,
@@ -5726,6 +5831,12 @@ def create_actions_router(
         missing_ranks: list[int] = []
         missing_candidate_ids: list[str] = []
         updated_keys: set[str] = set()
+        semantic_stats: Dict[str, int] = {
+            "candidate_count_before": 0,
+            "candidate_count_after": 0,
+            "dropped_count": 0,
+            "semantic_scored_count": 0,
+        }
 
         updates_by_id: Dict[str, Dict[str, Any]] = {}
         updates_by_rank: Dict[int, Dict[str, Any]] = {}
@@ -5760,10 +5871,68 @@ def create_actions_router(
             c["llm_reason"] = upd.get("reason") or ""
             c["llm_quote"] = upd.get("best_quote") or ""
 
+        highlights_cfg = (profile.get("analysis", {}) or {}).get("highlights", {}) or {}
+        semantic_weight = float(highlights_cfg.get("llm_semantic_weight", 0.3))
+
+        def _materialize_semantic_shortlist(candidates: Any) -> tuple[list[Dict[str, Any]], Dict[str, int]]:
+            if not isinstance(candidates, list):
+                raise KeyError("analysis.highlights.candidates missing")
+
+            kept_candidates: list[Dict[str, Any]] = []
+            semantic_scored_count = 0
+
+            for cand in candidates:
+                if not isinstance(cand, dict):
+                    continue
+
+                ai = cand.get("ai")
+                ai_meta = ai if isinstance(ai, dict) else {}
+                if ai_meta.get("semantic_keep") is False:
+                    continue
+
+                try:
+                    signal_score = float(cand.get("score_signal", cand.get("score", 0.0)) or 0.0)
+                except Exception:
+                    signal_score = 0.0
+                cand["score_signal"] = signal_score
+
+                semantic_raw = ai_meta.get("semantic_score", cand.get("score_semantic"))
+                semantic_score: Optional[float]
+                if semantic_raw is None:
+                    semantic_score = None
+                else:
+                    try:
+                        semantic_score = float(semantic_raw)
+                    except Exception:
+                        semantic_score = None
+
+                if semantic_score is not None:
+                    semantic_score = max(0.0, min(1.0, semantic_score))
+                    semantic_z = (semantic_score - 0.5) * 4.0
+                    cand["score_semantic"] = semantic_score
+                    cand["score"] = (1.0 - semantic_weight) * signal_score + semantic_weight * semantic_z
+                    semantic_scored_count += 1
+
+                kept_candidates.append(cand)
+
+            kept_candidates.sort(key=lambda c: float(c.get("score", 0.0) or 0.0), reverse=True)
+            for idx, cand in enumerate(kept_candidates, start=1):
+                cand["rank"] = idx
+
+            candidate_count_before = len([c for c in candidates if isinstance(c, dict)])
+            candidate_count_after = len(kept_candidates)
+            return kept_candidates, {
+                "candidate_count_before": candidate_count_before,
+                "candidate_count_after": candidate_count_after,
+                "dropped_count": max(0, candidate_count_before - candidate_count_after),
+                "semantic_scored_count": semantic_scored_count,
+            }
+
         def _upd_project(d: Dict[str, Any]) -> None:
             nonlocal missing_ranks
             nonlocal missing_candidate_ids
             nonlocal updated_keys
+            nonlocal semantic_stats
             candidates = ((d.get("analysis", {}) or {}).get("highlights", {}) or {}).get("candidates") or []
             if not isinstance(candidates, list):
                 raise KeyError("analysis.highlights.candidates missing")
@@ -5804,9 +5973,21 @@ def create_actions_router(
                     updated_keys.add(key)
 
             d.setdefault("analysis", {})
+            analysis = d["analysis"]
+            highlights_meta = analysis.setdefault("highlights", {})
+            semantic_candidates, semantic_stats = _materialize_semantic_shortlist(candidates)
+            highlights_meta["candidates"] = semantic_candidates
+            signals_used = highlights_meta.get("signals_used")
+            if not isinstance(signals_used, dict):
+                signals_used = {}
+                highlights_meta["signals_used"] = signals_used
+            signals_used["llm_semantic"] = True
+            highlights_meta["llm_semantic_updated_at"] = now
+            highlights_meta["semantic_provenance"] = dict(semantic_provenance)
             d["analysis"].setdefault("actions", {})
             d["analysis"]["actions"]["semantic_applied_at"] = now
             d["analysis"]["actions"]["semantic_provenance"] = dict(semantic_provenance)
+            d["analysis"]["actions"]["semantic_stats"] = dict(semantic_stats)
 
         update_project(proj, _upd_project)
 
@@ -5827,6 +6008,16 @@ def create_actions_router(
                         r = int(c.get("rank") or 0)
                         if r in updates_by_rank:
                             _apply_to_candidate(c, updates_by_rank[r])
+                    semantic_candidates, file_stats = _materialize_semantic_shortlist(hcands)
+                    h["candidates"] = semantic_candidates
+                    signals_used = h.get("signals_used")
+                    if not isinstance(signals_used, dict):
+                        signals_used = {}
+                        h["signals_used"] = signals_used
+                    signals_used["llm_semantic"] = True
+                    h["llm_semantic_updated_at"] = now
+                    h["semantic_provenance"] = dict(semantic_provenance)
+                    h["semantic_stats"] = dict(file_stats)
                     save_json(highlights_path, h)
         except Exception:
             pass
@@ -5835,6 +6026,10 @@ def create_actions_router(
             "ok": True,
             "project_id": project_id,
             "updated_count": len(updated_keys) if updated_keys else 0,
+            "candidate_count_before": semantic_stats["candidate_count_before"],
+            "candidate_count_after": semantic_stats["candidate_count_after"],
+            "dropped_count": semantic_stats["dropped_count"],
+            "semantic_scored_count": semantic_stats["semantic_scored_count"],
             "missing_ranks": sorted(set(missing_ranks)),
             "missing_candidate_ids": sorted(set(missing_candidate_ids)),
             "provenance": semantic_provenance,
@@ -6541,6 +6736,7 @@ def create_actions_router(
             return JSONResponse(existing)
 
         project_id = _validate_project_id(str(body.get("project_id") or ""))
+        llm_mode = _resolve_llm_mode(body.get("llm_mode"))
         proj, proj_data = _load_project(project_id)
         if not Path(proj.video_path).exists():
             raise HTTPException(status_code=409, detail="video_not_ready")
@@ -6563,6 +6759,18 @@ def create_actions_router(
                 language=cap_cfg.get("language"),
                 device=str(cap_cfg.get("device", "cpu")),
                 compute_type=str(cap_cfg.get("compute_type", "int8")),
+            )
+
+        director_results = _load_export_director_results(proj=proj, proj_data=proj_data)
+        if top_from_candidates is not None and llm_mode_is_strict_external(llm_mode):
+            _require_director_backed_export_batch(
+                project_id=project_id,
+                proj=proj,
+                proj_data=proj_data,
+                llm_mode=llm_mode,
+                top_from_candidates=top_from_candidates,
+                selections=[],
+                director_results=director_results,
             )
 
         # Resolve selections list; optionally create from candidates.
@@ -6599,10 +6807,26 @@ def create_actions_router(
         if not selections:
             raise HTTPException(status_code=404, detail="no_selections")
 
-        director_results = _load_export_director_results(proj=proj, proj_data=proj_data)
+        _require_director_backed_export_batch(
+            project_id=project_id,
+            proj=proj,
+            proj_data=proj_data,
+            llm_mode=llm_mode,
+            top_from_candidates=None,
+            selections=selections,
+            director_results=director_results,
+        )
 
         job = JOB_MANAGER.create("export_batch")
-        JOB_MANAGER._set(job, message="queued", result={"project_id": project_id, "created_selection_ids": created_ids})
+        JOB_MANAGER._set(
+            job,
+            message="queued",
+            result={
+                "project_id": project_id,
+                "created_selection_ids": created_ids,
+                "llm_mode": llm_mode,
+            },
+        )
 
         @with_prevent_sleep("Exporting batch (Actions)")
         def runner() -> None:
@@ -6697,7 +6921,12 @@ def create_actions_router(
 
         threading.Thread(target=runner, daemon=True).start()
 
-        payload = {"job_id": job.id, "project_id": project_id, "created_selection_ids": created_ids}
+        payload = {
+            "job_id": job.id,
+            "project_id": project_id,
+            "created_selection_ids": created_ids,
+            "llm_mode": llm_mode,
+        }
         idem.set(actor_key, client_request_id, payload)
         return JSONResponse(payload)
 

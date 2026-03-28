@@ -6,6 +6,7 @@ from videopipeline.clip_variants import (
     ClipVariant,
     VariantDurationConfig,
     VariantGeneratorConfig,
+    generate_variants_for_candidate,
 )
 
 
@@ -119,3 +120,25 @@ class TestCandidateVariants:
         assert d["candidate_peak_time_s"] == 120.0
         assert len(d["variants"]) == 1
         assert d["variants"][0]["variant_id"] == "short_A"
+
+
+class TestVariantGeneration:
+    def test_generate_variants_preserves_shaped_candidate_bounds(self):
+        candidate = {
+            "rank": 1,
+            "peak_time_s": 20.0,
+            "start_s": 12.0,
+            "end_s": 31.5,
+        }
+
+        result = generate_variants_for_candidate(
+            candidate,
+            cfg=VariantGeneratorConfig(),
+            duration_s=120.0,
+        )
+
+        base = next((v for v in result.variants if v.variant_id == "shaped_base"), None)
+        assert base is not None
+        assert base.start_s == 12.0
+        assert base.end_s == 31.5
+        assert base.duration_s == 19.5
