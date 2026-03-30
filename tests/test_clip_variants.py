@@ -1,11 +1,13 @@
 """Tests for clip_variants module."""
 
 
+import videopipeline.clip_variants as clip_variants_mod
 from videopipeline.clip_variants import (
     CandidateVariants,
     ClipVariant,
     VariantDurationConfig,
     VariantGeneratorConfig,
+    compute_variants,
     generate_variants_for_candidate,
 )
 
@@ -142,3 +144,21 @@ class TestVariantGeneration:
         assert base.start_s == 12.0
         assert base.end_s == 31.5
         assert base.duration_s == 19.5
+
+    def test_compute_variants_defaults_top_n_to_12(self, monkeypatch):
+        captured = {}
+
+        def fake_compute_clip_variants(proj, *, cfg, top_n, on_progress=None):
+            captured["proj"] = proj
+            captured["cfg"] = cfg
+            captured["top_n"] = top_n
+            captured["on_progress"] = on_progress
+            return {"ok": True}
+
+        monkeypatch.setattr(clip_variants_mod, "compute_clip_variants", fake_compute_clip_variants)
+
+        result = compute_variants(object(), cfg={})
+
+        assert result == {"ok": True}
+        assert isinstance(captured["cfg"], VariantGeneratorConfig)
+        assert captured["top_n"] == 12

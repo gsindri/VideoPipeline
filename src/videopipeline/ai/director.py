@@ -528,7 +528,7 @@ def compute_director_analysis(
     proj: Project,
     *,
     cfg: DirectorConfig,
-    top_n: int = 25,
+    top_n: int = 12,
     on_progress: Optional[Callable[[float], None]] = None,
     on_status: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:

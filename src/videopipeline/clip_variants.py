@@ -906,7 +906,7 @@ def compute_clip_variants(
     proj: Project,
     *,
     cfg: VariantGeneratorConfig,
-    top_n: int = 25,
+    top_n: int = 12,
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Compute clip variants for top N candidates.
@@ -1102,7 +1102,7 @@ def compute_variants(
     """
     _ = llm_complete  # reserved for Step 6
     cfg_obj = VariantGeneratorConfig.from_dict(cfg or {})
-    top_n = int((cfg or {}).get("top_n", 25))
+    top_n = int((cfg or {}).get("top_n", 12))
     return compute_clip_variants(
         proj,
         cfg=cfg_obj,

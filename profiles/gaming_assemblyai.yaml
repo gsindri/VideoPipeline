@@ -195,7 +195,9 @@ captions:
 
 context:
   enabled: true
-  top_n: 25
+  # Keep the post-semantic working set tight so variants/director stay focused
+  # on the strongest moments instead of diluting quality with long tails.
+  top_n: 12
   silence_noise_db: -30.0
   silence_min_duration: 0.3
   max_sentence_words: 30

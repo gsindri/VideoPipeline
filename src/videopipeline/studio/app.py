@@ -4246,7 +4246,7 @@ def create_app(
                     chat_valley_window_s=float(boundary_prefs.get("chat_valley_window_s", 12.0)),
                 )
 
-                top_n = int(context_cfg.get("top_n", 25))
+                top_n = int(context_cfg.get("top_n", 12))
 
                 def on_variant_progress(frac: float) -> None:
                     JOB_MANAGER._set(job, progress=0.45 + 0.25 * frac, message="Generating clip variants...")
@@ -5164,7 +5164,7 @@ def create_app(
                         ),
                         chat_valley_window_s=float(boundary_prefs.get("chat_valley_window_s", 12.0)),
                     )
-                    top_n = int(context_cfg.get("top_n", 25))
+                    top_n = int(context_cfg.get("top_n", 12))
                     compute_clip_variants(proj, cfg=variant_cfg, top_n=top_n)
                     completed_stages.append("clip_variants")
                     stage_times["clip_variants"] = _time.time() - variants_start
@@ -5201,7 +5201,7 @@ def create_app(
                         startup_timeout_s=float(ai_cfg.get("startup_timeout_s", 120)),
                         auto_stop_idle_s=float(ai_cfg.get("auto_stop_idle_s", 600)),
                     )
-                    top_n = int(context_cfg.get("top_n", 25))
+                    top_n = int(context_cfg.get("top_n", 12))
 
                     def on_director_status(msg: str) -> None:
                         JOB_MANAGER._set(job, message=msg, result=update_timing_result())

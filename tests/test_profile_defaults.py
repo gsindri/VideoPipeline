@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from videopipeline.profile import load_profile, resolve_default_profile_path
 from videopipeline.studio.dag_config import profile_default_llm_mode, resolve_llm_mode
 
@@ -44,3 +46,11 @@ def test_load_profile_none_uses_env_profile(tmp_path, monkeypatch):
 def test_profile_default_llm_mode_defaults_to_external_strict():
     assert profile_default_llm_mode({}) == "external_strict"
     assert resolve_llm_mode(None, profile={}) == "external_strict"
+
+
+def test_gaming_profiles_use_tighter_context_top_n():
+    repo_root = Path(__file__).resolve().parents[1]
+
+    for profile_name in ("gaming.yaml", "gaming_assemblyai.yaml", "gaming_nvidia.yaml"):
+        profile = load_profile(repo_root / "profiles" / profile_name)
+        assert profile["context"]["top_n"] == 12
