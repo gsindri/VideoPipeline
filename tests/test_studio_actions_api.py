@@ -1312,6 +1312,113 @@ def test_actions_publish_queue_creates_jobs_and_lists_them(tmp_path, monkeypatch
     client.close()
 
 
+def test_actions_publish_delete_remote_requires_confirmation(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    from videopipeline.publisher.accounts import AccountStore
+    from videopipeline.publisher.jobs import PublishJobStore
+
+    account = AccountStore().add(platform="youtube", label="Main Channel")
+    video_path = tmp_path / "outputs" / "projects" / "project-a" / "exports" / "clip1.mp4"
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    video_path.write_bytes(b"fake video")
+    metadata_path = video_path.with_suffix(".json")
+    metadata_path.write_text(json.dumps({"title": "Clip 1"}), encoding="utf-8")
+
+    job = PublishJobStore().create_job(
+        job_id="job-delete-1",
+        platform="youtube",
+        account_id=account.id,
+        file_path=str(video_path),
+        metadata_path=str(metadata_path),
+    )
+    PublishJobStore().update_job(
+        job.id,
+        status="succeeded",
+        progress=1.0,
+        remote_id="video123",
+        remote_url="https://youtu.be/video123",
+    )
+
+    r = client.post(
+        f"/api/actions/publish/jobs/{job.id}/delete-remote",
+        headers=hdr,
+        json={"confirmed": False},
+    )
+    assert r.status_code == 400
+    assert r.json()["detail"] == "delete_remote_confirmation_required"
+    client.close()
+
+
+def test_actions_publish_delete_remote_marks_job_removed_and_clears_dedup(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    import videopipeline.studio.actions_api as actions_api
+    from videopipeline.publisher.accounts import AccountStore
+    from videopipeline.publisher.jobs import PublishJobStore
+
+    account = AccountStore().add(platform="youtube", label="Main Channel")
+    video_path = tmp_path / "outputs" / "projects" / "project-b" / "exports" / "clip1.mp4"
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    video_path.write_bytes(b"fake video")
+    metadata_path = video_path.with_suffix(".json")
+    metadata_path.write_text(json.dumps({"title": "Clip 1"}), encoding="utf-8")
+
+    store = PublishJobStore()
+    job = store.create_job(
+        job_id="job-delete-2",
+        platform="youtube",
+        account_id=account.id,
+        file_path=str(video_path),
+        metadata_path=str(metadata_path),
+    )
+    updated = store.update_job(
+        job.id,
+        status="succeeded",
+        progress=1.0,
+        remote_id="video456",
+        remote_url="https://youtu.be/video456",
+    )
+    sha = hashlib.sha256(video_path.read_bytes()).hexdigest()
+    store.mark_dedup("youtube", account.id, sha, "video456", "https://youtu.be/video456")
+
+    deleted = {}
+
+    class DummyConnector:
+        def delete_remote(self, *, remote_id: str) -> None:
+            deleted["remote_id"] = remote_id
+
+    monkeypatch.setattr(actions_api, "load_tokens", lambda platform, account_id: {"token": "x"})
+    monkeypatch.setattr(
+        actions_api,
+        "get_connector",
+        lambda platform, account, tokens: DummyConnector(),
+    )
+
+    r = client.post(
+        f"/api/actions/publish/jobs/{updated.id}/delete-remote",
+        headers=hdr,
+        json={"confirmed": True},
+    )
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["ok"] is True
+    assert payload["removed_remote_id"] == "video456"
+    assert payload["removed_remote_url"] == "https://youtu.be/video456"
+    assert payload["dedup_removed"] is True
+    assert deleted == {"remote_id": "video456"}
+
+    final_job = store.get_job(updated.id)
+    assert final_job.status == "removed"
+    assert final_job.remote_id == "video456"
+    assert final_job.remote_url is None
+    assert final_job.last_error == "Remote video removed from platform."
+    assert store.lookup_dedup("youtube", account.id, sha) is None
+    client.close()
+
+
 def test_actions_publish_queue_rejects_accounts_that_need_reauth(tmp_path, monkeypatch):
     client = _make_client(tmp_path, monkeypatch, token="secret")
     hdr = {"Authorization": "Bearer secret"}

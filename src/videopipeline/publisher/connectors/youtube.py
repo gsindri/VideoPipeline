@@ -142,3 +142,16 @@ class YouTubeConnector(Connector):
 
     def finalize_or_poll(self, *, session: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
         return {}
+
+    def delete_remote(self, *, remote_id: str) -> None:
+        video_id = str(remote_id or "").strip()
+        if not video_id:
+            raise ValueError("missing_remote_id")
+
+        resp = self._session().delete(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={"id": video_id},
+        )
+        if resp.status_code in {200, 204, 404}:
+            return
+        raise RuntimeError(f"youtube_delete_failed: {resp.status_code} {resp.text}")

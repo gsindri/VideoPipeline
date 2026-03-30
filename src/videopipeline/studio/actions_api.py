@@ -37,7 +37,9 @@ from ..project import (
 )
 from ..publisher.account_auth import get_publish_account_auth
 from ..publisher.accounts import AccountStore
+from ..publisher.connectors import get_connector
 from ..publisher.jobs import PublishJobStore
+from ..publisher.secrets import load_tokens
 from .dag_config import (
     apply_llm_mode_to_dag_config,
     build_dag_config,
@@ -69,6 +71,14 @@ _CLIP_REVIEW_FRAME_QUALITY = 6
 
 def _hash_key(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def _bearer_token_from_request(request: Request) -> Optional[str]:
@@ -3604,6 +3614,79 @@ def create_actions_router(
         _rate_limit(request)
         limit = _clamp_int(limit, default=50, min_v=1, max_v=200)
         return JSONResponse(_filter_publish_jobs_for_project(project_id=project_id, limit=limit))
+
+    @router.post(
+        "/publish/jobs/{job_id}/delete-remote",
+        openapi_extra={"x-openai-isConsequential": True},
+    )
+    def publish_delete_remote(
+        request: Request,
+        job_id: str,
+        body: Dict[str, Any] = Body(...),
+    ):  # type: ignore[valid-type]
+        _rate_limit(request)
+
+        if body.get("confirmed") is not True:
+            raise HTTPException(status_code=400, detail="delete_remote_confirmation_required")
+
+        target_job_id = str(job_id or "").strip()
+        if not target_job_id:
+            raise HTTPException(status_code=400, detail="job_id_required")
+
+        try:
+            job = job_store.get_job(target_job_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="publish_job_not_found")
+
+        remote_id = str(job.remote_id or "").strip()
+        if not remote_id:
+            raise HTTPException(status_code=409, detail="publish_job_remote_missing")
+        if job.status == "removed":
+            raise HTTPException(status_code=409, detail="publish_job_already_removed")
+
+        account = account_store.get(job.account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail=f"account_not_found:{job.account_id}")
+
+        tokens = load_tokens(job.platform, job.account_id)
+        if not tokens:
+            raise HTTPException(status_code=409, detail="missing_tokens")
+
+        try:
+            connector = get_connector(job.platform, account=account, tokens=tokens)
+            connector.delete_remote(remote_id=remote_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+
+        dedup_removed = False
+        file_path = Path(job.file_path)
+        if file_path.exists() and file_path.is_file():
+            dedup_removed = job_store.delete_dedup(
+                job.platform,
+                job.account_id,
+                _file_sha256(file_path),
+            )
+
+        deleted_remote_url = job.remote_url
+        updated_job = job_store.update_job(
+            job.id,
+            status="removed",
+            progress=1.0,
+            remote_url=None,
+            last_error="Remote video removed from platform.",
+            resume_json=None,
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "job": updated_job.to_dict(),
+                "removed_remote_id": remote_id,
+                "removed_remote_url": deleted_remote_url,
+                "dedup_removed": dedup_removed,
+            }
+        )
 
     @router.post("/ingest_url", openapi_extra={"x-openai-isConsequential": True})
     def ingest_url(request: Request, body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]

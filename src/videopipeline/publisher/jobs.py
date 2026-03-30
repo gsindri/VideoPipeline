@@ -176,8 +176,9 @@ class PublishJobStore:
         resume_json: Any = _UNSET,
     ) -> PublishJob:
         current = self.get_job(job_id)
-        if current.status in {"succeeded", "failed", "canceled"}:
+        if current.status in {"succeeded", "failed", "canceled", "removed"}:
             allowed_transition = (current.status, status) in {
+                ("succeeded", "removed"),
                 ("failed", "queued"),
                 ("canceled", "queued"),
             }
@@ -257,6 +258,16 @@ class PublishJobStore:
         if not row:
             return None
         return dict(row)
+
+    def delete_dedup(self, platform: str, account_id: str, sha256: str) -> bool:
+        with self._connect() as conn:
+            result = conn.execute(
+                """
+                DELETE FROM publish_dedup WHERE platform = ? AND account_id = ? AND sha256 = ?
+                """,
+                (platform, account_id, sha256),
+            )
+        return int(getattr(result, "rowcount", 0) or 0) > 0
 
     def retry(self, job_id: str) -> PublishJob:
         return self.update_job(job_id, status="queued", last_error=None, progress=0.0)

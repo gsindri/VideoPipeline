@@ -48,6 +48,9 @@ class Connector(Protocol):
     ) -> dict[str, Any]:
         ...
 
+    def delete_remote(self, *, remote_id: str) -> None:
+        raise NotImplementedError("delete_remote_not_supported")
+
     def publish(
         self,
         *,
