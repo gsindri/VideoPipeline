@@ -28,6 +28,11 @@ from .publisher.presets import AccountPreset
 from .publisher.queue import PublishWorker
 from .publisher.secrets import delete_tokens, load_tokens, store_tokens
 from .publisher.state import accounts_path
+from .publisher.youtube_oauth import (
+    default_youtube_oauth_scopes,
+    merge_google_oauth_scopes,
+    normalize_google_oauth_scopes,
+)
 from .transcribe import TranscribeConfig, load_transcript_json, save_transcript_json, transcribe_segment
 
 
@@ -325,7 +330,7 @@ def cmd_accounts_list(_: argparse.Namespace) -> None:
 def cmd_accounts_add_youtube(args: argparse.Namespace) -> None:
     from google_auth_oauthlib.flow import InstalledAppFlow
 
-    scopes = args.scopes.split(",") if args.scopes else ["https://www.googleapis.com/auth/youtube.upload"]
+    scopes = normalize_google_oauth_scopes(args.scopes) or default_youtube_oauth_scopes()
     flow = InstalledAppFlow.from_client_secrets_file(str(args.client_secrets), scopes=scopes)
     creds = flow.run_local_server(port=args.redirect_port)
     tokens = {
@@ -359,7 +364,12 @@ def cmd_accounts_reconnect_youtube(args: argparse.Namespace) -> None:
     if not client_id or not client_secret:
         raise UserFacingError("youtube_client_credentials_missing")
 
-    scopes = existing.get("scopes") or ["https://www.googleapis.com/auth/youtube.upload"]
+    requested_scopes = normalize_google_oauth_scopes(getattr(args, "scopes", None))
+    scopes = (
+        requested_scopes
+        if requested_scopes
+        else merge_google_oauth_scopes(existing.get("scopes"), default_youtube_oauth_scopes())
+    )
     client_config = {
         "installed": {
             "client_id": client_id,
@@ -659,6 +669,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     youtube_reconnect.add_argument("--account-id", type=str, required=True)
     youtube_reconnect.add_argument("--redirect-port", type=int, default=8765)
     youtube_reconnect.add_argument("--retry-job-id", type=str, default=None)
+    youtube_reconnect.add_argument("--scopes", type=str, default=None)
     youtube_reconnect.add_argument("--no-browser", action="store_true")
     youtube_reconnect.set_defaults(func=cmd_accounts_reconnect_youtube)
 

@@ -1,3 +1,4 @@
+import argparse
 import sys
 import types
 
@@ -59,6 +60,8 @@ def _install_google_stubs() -> None:
 _install_google_stubs()
 
 from videopipeline import cli
+from videopipeline.publisher.accounts import Account
+from videopipeline.publisher.youtube_oauth import YOUTUBE_FORCE_SSL_SCOPE, YOUTUBE_UPLOAD_SCOPE
 
 
 class DummyAnalysisResult:
@@ -114,3 +117,137 @@ def test_compute_highlights_candidates_payload_raises_when_no_candidates(monkeyp
 
     with pytest.raises(cli.UserFacingError, match="No highlight candidates produced by DAG analysis."):
         cli._compute_highlights_candidates_payload(object(), {})
+
+
+def test_cmd_accounts_add_youtube_uses_delete_capable_default_scopes(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class DummyFlow:
+        @classmethod
+        def from_client_secrets_file(cls, path, scopes):
+            captured["path"] = path
+            captured["scopes"] = list(scopes)
+            return cls()
+
+        def run_local_server(self, port):
+            return types.SimpleNamespace(
+                token="access-token",
+                refresh_token="refresh-token",
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id="client-id",
+                client_secret="client-secret",
+                scopes=list(captured["scopes"]),
+            )
+
+    google_auth_oauthlib = sys.modules.setdefault(
+        "google_auth_oauthlib", types.ModuleType("google_auth_oauthlib")
+    )
+    flow_mod = types.ModuleType("google_auth_oauthlib.flow")
+    flow_mod.InstalledAppFlow = DummyFlow
+    sys.modules["google_auth_oauthlib.flow"] = flow_mod
+    setattr(google_auth_oauthlib, "flow", flow_mod)
+
+    account = Account(id="acct-yt", platform="youtube", label="YT")
+
+    class DummyStore:
+        def add(self, *, platform: str, label: str):
+            captured["added"] = (platform, label)
+            return account
+
+    stored: dict[str, object] = {}
+    monkeypatch.setattr(cli, "AccountStore", lambda: DummyStore())
+    monkeypatch.setattr(
+        cli,
+        "store_tokens",
+        lambda platform, account_id, payload: stored.update(
+            {"platform": platform, "account_id": account_id, "payload": payload}
+        ),
+    )
+    monkeypatch.setattr(cli, "accounts_path", lambda: "accounts.json")
+
+    cli.cmd_accounts_add_youtube(
+        argparse.Namespace(
+            client_secrets="client-secret.json",
+            label="Rebbi",
+            scopes=None,
+            redirect_port=8080,
+        )
+    )
+
+    assert captured["scopes"] == [YOUTUBE_UPLOAD_SCOPE, YOUTUBE_FORCE_SSL_SCOPE]
+    assert captured["added"] == ("youtube", "Rebbi")
+    assert stored["platform"] == "youtube"
+    assert stored["account_id"] == "acct-yt"
+    assert stored["payload"]["scopes"] == [YOUTUBE_UPLOAD_SCOPE, YOUTUBE_FORCE_SSL_SCOPE]
+
+
+def test_cmd_accounts_reconnect_youtube_upgrades_legacy_upload_only_scope(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class DummyFlow:
+        @classmethod
+        def from_client_config(cls, config, scopes):
+            captured["config"] = config
+            captured["scopes"] = list(scopes)
+            return cls()
+
+        def run_local_server(self, **kwargs):
+            captured["run_local_server"] = kwargs
+            return types.SimpleNamespace(
+                token="new-access-token",
+                refresh_token="new-refresh-token",
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id="client-id",
+                client_secret="client-secret",
+                scopes=list(captured["scopes"]),
+            )
+
+    google_auth_oauthlib = sys.modules.setdefault(
+        "google_auth_oauthlib", types.ModuleType("google_auth_oauthlib")
+    )
+    flow_mod = types.ModuleType("google_auth_oauthlib.flow")
+    flow_mod.InstalledAppFlow = DummyFlow
+    sys.modules["google_auth_oauthlib.flow"] = flow_mod
+    setattr(google_auth_oauthlib, "flow", flow_mod)
+
+    account = Account(id="acct-legacy", platform="youtube", label="Legacy")
+
+    class DummyStore:
+        def get(self, account_id: str):
+            return account if account_id == account.id else None
+
+    stored: dict[str, object] = {}
+    monkeypatch.setattr(cli, "AccountStore", lambda: DummyStore())
+    monkeypatch.setattr(
+        cli,
+        "load_tokens",
+        lambda platform, account_id: {
+            "client_id": "client-id",
+            "client_secret": "client-secret",
+            "refresh_token": "old-refresh-token",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "scopes": [YOUTUBE_UPLOAD_SCOPE],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "store_tokens",
+        lambda platform, account_id, payload: stored.update(
+            {"platform": platform, "account_id": account_id, "payload": payload}
+        ),
+    )
+
+    cli.cmd_accounts_reconnect_youtube(
+        argparse.Namespace(
+            account_id=account.id,
+            redirect_port=8765,
+            retry_job_id=None,
+            scopes=None,
+            no_browser=True,
+        )
+    )
+
+    assert captured["scopes"] == [YOUTUBE_UPLOAD_SCOPE, YOUTUBE_FORCE_SSL_SCOPE]
+    assert stored["platform"] == "youtube"
+    assert stored["account_id"] == account.id
+    assert stored["payload"]["scopes"] == [YOUTUBE_UPLOAD_SCOPE, YOUTUBE_FORCE_SSL_SCOPE]

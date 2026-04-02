@@ -8,6 +8,7 @@ from google.auth.transport.requests import AuthorizedSession, Request
 from google.oauth2.credentials import Credentials
 
 from ..accounts import Account
+from ..youtube_oauth import normalize_google_oauth_scopes, youtube_scopes_allow_delete
 from .base import Connector
 
 
@@ -148,10 +149,22 @@ class YouTubeConnector(Connector):
         if not video_id:
             raise ValueError("missing_remote_id")
 
+        scopes = normalize_google_oauth_scopes(self.tokens.get("scopes"))
+        if scopes and not youtube_scopes_allow_delete(scopes):
+            raise ValueError(
+                "Stored YouTube token is missing delete permission. Reconnect the account to grant "
+                "`youtube.force-ssl`, then retry the removal."
+            )
+
         resp = self._session().delete(
             "https://www.googleapis.com/youtube/v3/videos",
             params={"id": video_id},
         )
         if resp.status_code in {200, 204, 404}:
             return
+        if resp.status_code in {401, 403}:
+            raise ValueError(
+                "Google rejected the delete request. Reconnect the YouTube account with delete "
+                "permission (`youtube.force-ssl`) and retry."
+            )
         raise RuntimeError(f"youtube_delete_failed: {resp.status_code} {resp.text}")

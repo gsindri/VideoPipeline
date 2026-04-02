@@ -62,6 +62,7 @@ from videopipeline.publisher.connectors.tiktok import TikTokConnector
 from videopipeline.publisher.connectors.youtube import YouTubeConnector
 from videopipeline.publisher.jobs import PublishJobStore
 from videopipeline.publisher.queue import PublishWorker
+from videopipeline.publisher.youtube_oauth import YOUTUBE_UPLOAD_SCOPE
 
 
 def test_job_store_create_update_and_dedup(tmp_path: Path):
@@ -208,3 +209,25 @@ def test_youtube_connector_delete_remote_accepts_success_and_not_found():
     assert session.calls == [
         ("https://www.googleapis.com/youtube/v3/videos", {"id": "video123"})
     ]
+
+
+def test_youtube_connector_delete_remote_rejects_upload_only_scope_without_call():
+    class DummySession:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def delete(self, url, params=None):
+            self.calls.append((url, params))
+            raise AssertionError("delete should not be called when scopes are known to be insufficient")
+
+    connector = YouTubeConnector(
+        account=Account(id="acct-yt", platform="youtube", label="YT"),
+        tokens={"scopes": [YOUTUBE_UPLOAD_SCOPE]},
+    )
+    session = DummySession()
+    connector._session = lambda: session  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="missing delete permission"):
+        connector.delete_remote(remote_id="video123")
+
+    assert session.calls == []
