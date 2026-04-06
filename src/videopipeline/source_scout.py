@@ -741,6 +741,10 @@ def _load_scout_probe_config(watchlist: Dict[str, Any]) -> Dict[str, Any]:
         "min_candidates": max(2, _safe_int(raw.get("min_candidates"), 2)),
         "rerank_weight": max(0.0, min(0.5, _safe_float(raw.get("rerank_weight"), 0.24))),
         "ttl_hours": max(1.0, _safe_float(raw.get("ttl_hours"), 18.0)),
+        "transient_ttl_minutes": max(
+            1.0,
+            _safe_float(raw.get("transient_ttl_minutes", raw.get("cooldown_minutes")), 15.0),
+        ),
         "request_budget_s": max(1.0, _safe_float(raw.get("request_budget_s"), 6.0)),
         "download_timeout_s": max(5.0, _safe_float(raw.get("download_timeout_s"), 45.0)),
         "download_max_retries": max(0, _safe_int(raw.get("download_max_retries"), 0)),
@@ -766,11 +770,20 @@ def _load_cached_probe_summary(path: Path, *, now_ts: float, max_age_s: float) -
     if generated_ts is None:
         return None
     age_s = max(0.0, now_ts - generated_ts)
-    if age_s > max_age_s:
+    effective_max_age_s = max_age_s
+    if bool(payload.get("transient")):
+        retry_after_s = _safe_float(payload.get("retry_after_s"), 0.0)
+        if retry_after_s > 0.0:
+            effective_max_age_s = min(effective_max_age_s, retry_after_s)
+    if age_s > effective_max_age_s:
         return None
     out = dict(payload)
     out["cached"] = True
     out["cache_age_hours"] = round(age_s / 3600.0, 2)
+    if bool(payload.get("transient")):
+        retry_after_s = _safe_float(payload.get("retry_after_s"), 0.0)
+        if retry_after_s > 0.0:
+            out["retry_after_seconds"] = max(0, int(round(retry_after_s - age_s)))
     return out
 
 
@@ -999,12 +1012,18 @@ def _probe_single_candidate_chat(
     now_ts: float,
     request_deadline_ts: Optional[float] = None,
 ) -> Dict[str, Any]:
-    def _transient_payload(*, error: str, status: str = "skipped") -> Dict[str, Any]:
+    transient_ttl_s = max(
+        60.0,
+        _safe_float(probe_config.get("transient_ttl_minutes"), 15.0) * 60.0,
+    )
+
+    def _transient_payload(*, error: str, status: str = "cooldown") -> Dict[str, Any]:
         return {
             "status": status,
             "generated_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
             "error": error,
             "transient": True,
+            "retry_after_s": int(round(transient_ttl_s)),
         }
 
     ttl_s = max(3600.0, _safe_float(probe_config.get("ttl_hours"), 18.0) * 3600.0)
@@ -1028,7 +1047,10 @@ def _probe_single_candidate_chat(
 
         remaining_s = wait_deadline - time.time()
         if remaining_s <= 0:
-            return _transient_payload(error="chat probe budget exhausted while waiting for shared probe")
+            return _save_probe_summary(
+                paths["summary"],
+                _transient_payload(error="chat probe cooling down after shared probe wait budget was exhausted"),
+            )
         time.sleep(min(_SCOUT_PROBE_LOCK_POLL_S, remaining_s))
 
     remaining_budget_s = None
@@ -1036,7 +1058,10 @@ def _probe_single_candidate_chat(
         remaining_budget_s = request_deadline_ts - time.time()
         if remaining_budget_s <= 0.25:
             _release_probe_file_lock(paths["lock"])
-            return _transient_payload(error="chat probe budget exhausted before download start")
+            return _save_probe_summary(
+                paths["summary"],
+                _transient_payload(error="chat probe cooling down after budget was exhausted before download start"),
+            )
 
     try:
         from .chat.downloader import download_chat, is_chat_download_available
@@ -1097,7 +1122,7 @@ def _probe_single_candidate_chat(
     except Exception as exc:
         error_msg = f"{type(exc).__name__}: {exc}"
         if remaining_budget_s is not None and "timed out after" in str(exc).lower():
-            return _transient_payload(error=error_msg)
+            return _save_probe_summary(paths["summary"], _transient_payload(error=error_msg))
         payload = {
             "status": "error",
             "generated_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),

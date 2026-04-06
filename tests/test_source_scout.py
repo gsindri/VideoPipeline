@@ -794,10 +794,82 @@ def test_probe_single_candidate_chat_skips_when_request_budget_is_exhausted(tmp_
     )
 
     assert download_calls["count"] == 0
-    assert summary["status"] == "skipped"
+    assert summary["status"] == "cooldown"
     assert summary["transient"] is True
-    assert not summary_path.exists()
+    assert summary["retry_after_s"] > 0
+    assert summary_path.exists()
     assert not lock_path.exists()
+
+
+def test_probe_single_candidate_chat_caches_transient_timeout_failures(tmp_path, monkeypatch):
+    import videopipeline.chat.downloader as chat_downloader_mod
+
+    cache_root = tmp_path / "probe"
+    summary_path = cache_root / "summary.json"
+    raw_path = cache_root / "chat.json"
+    db_path = cache_root / "chat.sqlite"
+    lock_path = cache_root / "probe.lock"
+
+    monkeypatch.setattr(
+        source_scout_mod,
+        "_probe_cache_paths",
+        lambda url, *, content_key=None: {
+            "root": cache_root,
+            "summary": summary_path,
+            "raw": raw_path,
+            "db": db_path,
+            "lock": lock_path,
+        },
+    )
+    real_load_cached_probe_summary = source_scout_mod._load_cached_probe_summary
+    monkeypatch.setattr(source_scout_mod, "_load_cached_probe_summary", lambda *a, **k: None)
+    monkeypatch.setattr(chat_downloader_mod, "is_chat_download_available", lambda: True)
+
+    def fake_download_chat(*args, **kwargs):
+        raise RuntimeError("TwitchDownloaderCLI timed out after 5 seconds")
+
+    monkeypatch.setattr(chat_downloader_mod, "download_chat", fake_download_chat)
+
+    now_ts = 1742061600.0
+    summary = source_scout_mod._probe_single_candidate_chat(
+        {
+            "url": "https://www.twitch.tv/videos/111",
+            "content_key": "twitch_111",
+            "platform": "twitch",
+        },
+        probe_config={"ttl_hours": 18.0, "transient_ttl_minutes": 10.0},
+        now_ts=now_ts,
+        request_deadline_ts=now_ts + 6.0,
+    )
+
+    assert summary["status"] == "cooldown"
+    assert summary["transient"] is True
+    assert summary["retry_after_s"] == 600
+    assert summary_path.exists()
+    assert not lock_path.exists()
+
+    monkeypatch.setattr(
+        source_scout_mod,
+        "_load_cached_probe_summary",
+        real_load_cached_probe_summary,
+    )
+
+    cached = source_scout_mod._load_cached_probe_summary(
+        summary_path,
+        now_ts=now_ts + 60.0,
+        max_age_s=18.0 * 3600.0,
+    )
+    assert cached is not None
+    assert cached["cached"] is True
+    assert cached["transient"] is True
+    assert cached["retry_after_seconds"] > 0
+
+    expired = source_scout_mod._load_cached_probe_summary(
+        summary_path,
+        now_ts=now_ts + 601.0,
+        max_age_s=18.0 * 3600.0,
+    )
+    assert expired is None
 
 
 def test_probe_single_candidate_chat_reuses_inflight_probe(tmp_path, monkeypatch):

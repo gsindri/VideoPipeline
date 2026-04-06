@@ -1633,7 +1633,7 @@ def test_actions_ai_bundle_reports_external_status(tmp_path, monkeypatch):
     assert data["clip_review"]["channel_format_spec"]["show_formats"][0]["show_format_id"] == "clip_court"
     assert (
         data["clip_review"]["review_rubric"]["preferred_outputs"]["director"]
-        == "variant_id + format_id + show_format_id + title + hook + description + hashtags + confidence"
+        == "variant_id + optional start_s/end_s override + format_id + show_format_id + title + hook + description + hashtags + confidence"
     )
     assert data["clip_review"]["clips"][0]["candidate"]["candidate_id"] == "cid1"
     assert data["clip_review"]["clips"][0]["format_recommendations"][0]["format_id"] == "commentary_breakdown"
@@ -2528,6 +2528,73 @@ def test_actions_ai_apply_director_picks_writes_director_json(tmp_path, monkeypa
     assert director["pick_count"] == 1
     assert director["picks"][0]["candidate_rank"] == 1
     assert director["picks"][0]["variant_id"] == "medium"
+
+
+def test_actions_ai_apply_director_picks_allows_exact_timing_overrides(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    pid = hashlib.sha256("twitch_237_custom_cut".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(proj_dir / "video" / "video.mp4"), "duration_seconds": 120.0},
+        "analysis": {
+            "highlights": {
+                "candidates": [
+                    {"rank": 1, "candidate_id": "cid1", "score": 1.0, "start_s": 10.0, "end_s": 20.0, "peak_time_s": 15.0},
+                ]
+            }
+        },
+        "layout": {},
+        "selections": [],
+        "exports": [],
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+
+    variants_json = {
+        "created_at": "now",
+        "candidates": [
+            {
+                "candidate_rank": 1,
+                "candidate_peak_time_s": 15.0,
+                "variants": [
+                    {"variant_id": "medium", "start_s": 10.0, "end_s": 30.0, "duration_s": 20.0},
+                ],
+            }
+        ],
+    }
+    (proj_dir / "analysis" / "variants.json").write_text(json.dumps(variants_json), encoding="utf-8")
+
+    r = client.post(
+        "/api/actions/ai/apply_director_picks",
+        headers=hdr,
+        json={
+            "project_id": pid,
+            "client_request_id": "apply-dir-custom-cut-1",
+            "picks": [
+                {
+                    "candidate_id": "cid1",
+                    "variant_id": "medium",
+                    "start_s": 12.0,
+                    "end_s": 36.0,
+                    "title": "t",
+                    "hook": "h",
+                    "description": "d",
+                }
+            ],
+        },
+    )
+    assert r.status_code == 200
+    director = json.loads((proj_dir / "analysis" / "director.json").read_text(encoding="utf-8"))
+    assert director["picks"][0]["variant_id"] == "medium"
+    assert director["picks"][0]["start_s"] == 12.0
+    assert director["picks"][0]["end_s"] == 36.0
+    assert director["picks"][0]["duration_s"] == 24.0
+    assert director["picks"][0]["timing_source"] == "custom_override"
 
 
 def test_actions_ai_apply_director_picks_enforces_overlap_and_normalizes_packaging(tmp_path, monkeypatch):

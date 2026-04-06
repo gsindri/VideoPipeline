@@ -5705,7 +5705,7 @@ def create_actions_router(
                 ],
                 "preferred_outputs": {
                     "semantic": "keep/reject + semantic_score + concise reason",
-                    "director": "variant_id + format_id + show_format_id + title + hook + description + hashtags + confidence",
+                    "director": "variant_id + optional start_s/end_s override + format_id + show_format_id + title + hook + description + hashtags + confidence",
                 },
             },
             "clips": clips,
@@ -6246,7 +6246,7 @@ def create_actions_router(
 
     @router.post("/ai/apply_director_picks", openapi_extra={"x-openai-isConsequential": False})
     def ai_apply_director_picks(request: Request, body: Dict[str, Any] = Body(...)):  # type: ignore[valid-type]
-        """Apply director picks (candidate_id or rank + variant_id + packaging) into analysis/director.json."""
+        """Apply director picks (candidate_id or rank + variant_id + optional timing override + packaging) into analysis/director.json."""
         actor_key = _rate_limit(request)
 
         client_request_id = str(body.get("client_request_id") or "").strip()
@@ -6294,6 +6294,11 @@ def create_actions_router(
         picks: list[Dict[str, Any]] = []
         missing: list[Dict[str, Any]] = []
         director_cfg = _director_config_from_profile()
+        custom_cut_max_s = 75.0
+        try:
+            video_duration_s = float(((proj_data.get("video") or {}).get("duration_seconds")) or 0.0)
+        except Exception:
+            video_duration_s = 0.0
         allowed_templates = set(str(x) for x in list(director_cfg.allowed_templates or []) if str(x).strip())
         template_default = _director_default_template(director_cfg)
         chapter_ranges = _load_chapter_ranges(proj)
@@ -6366,6 +6371,82 @@ def create_actions_router(
             peak_time = float(cand.get("peak_time_s") or getattr(cv, "candidate_peak_time_s", 0.0) or ((start_s + end_s) / 2.0))
             if not cand_id:
                 cand_id = str(cand.get("candidate_id") or getattr(cv, "candidate_id", "") or "").strip()
+
+            raw_override_start = p.get("start_s")
+            if raw_override_start is None:
+                raw_override_start = p.get("startSeconds")
+            raw_override_end = p.get("end_s")
+            if raw_override_end is None:
+                raw_override_end = p.get("endSeconds")
+            has_override_start = raw_override_start is not None
+            has_override_end = raw_override_end is not None
+            timing_source = "variant"
+            if has_override_start != has_override_end:
+                missing.append(
+                    {
+                        "candidate_rank": cand_rank,
+                        "candidate_id": cand_id or None,
+                        "variant_id": variant_id,
+                        "error": "custom_range_requires_start_and_end",
+                    }
+                )
+                continue
+            if has_override_start and has_override_end:
+                try:
+                    start_s = float(raw_override_start)
+                    end_s = float(raw_override_end)
+                except Exception:
+                    missing.append(
+                        {
+                            "candidate_rank": cand_rank,
+                            "candidate_id": cand_id or None,
+                            "variant_id": variant_id,
+                            "error": "invalid_custom_range",
+                        }
+                    )
+                    continue
+                if start_s < 0.0 or end_s <= start_s:
+                    missing.append(
+                        {
+                            "candidate_rank": cand_rank,
+                            "candidate_id": cand_id or None,
+                            "variant_id": variant_id,
+                            "error": "invalid_custom_range",
+                        }
+                    )
+                    continue
+                if video_duration_s > 0.0 and end_s > (video_duration_s + 0.25):
+                    missing.append(
+                        {
+                            "candidate_rank": cand_rank,
+                            "candidate_id": cand_id or None,
+                            "variant_id": variant_id,
+                            "error": "custom_range_out_of_bounds",
+                        }
+                    )
+                    continue
+                duration_s = max(1e-6, end_s - start_s)
+                if duration_s > custom_cut_max_s:
+                    missing.append(
+                        {
+                            "candidate_rank": cand_rank,
+                            "candidate_id": cand_id or None,
+                            "variant_id": variant_id,
+                            "error": "custom_duration_out_of_bounds",
+                        }
+                    )
+                    continue
+                if peak_time < start_s or peak_time > end_s:
+                    missing.append(
+                        {
+                            "candidate_rank": cand_rank,
+                            "candidate_id": cand_id or None,
+                            "variant_id": variant_id,
+                            "error": "peak_outside_custom_range",
+                        }
+                    )
+                    continue
+                timing_source = "custom_override"
 
             too_close = False
             too_close_error = ""
@@ -6459,7 +6540,8 @@ def create_actions_router(
                 "variant_id": variant_id,
                 "start_s": start_s,
                 "end_s": end_s,
-                "duration_s": float(getattr(v, "duration_s", duration_s) or duration_s),
+                "duration_s": float(duration_s),
+                "timing_source": timing_source,
                 "title": title,
                 "hook": hook,
                 "description": description,
