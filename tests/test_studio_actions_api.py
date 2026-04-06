@@ -891,6 +891,77 @@ def test_actions_run_ingest_analyze_returns_run_id_and_project_id(tmp_path, monk
     assert data["run_id"] == data["job_id"]
 
 
+def test_actions_run_ingest_analyze_fresh_project_creates_new_project_for_same_url(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    import videopipeline.studio.actions_api as actions_api
+    from videopipeline.ingest.models import IngestResult
+
+    dummy_src = tmp_path / "dummy.mp4"
+    dummy_src.write_bytes(b"")
+
+    def fake_download_url(url: str, *args, **kwargs):
+        on_progress = kwargs.get("on_progress")
+        if on_progress:
+            on_progress(1.0, "done")
+        return IngestResult(video_path=dummy_src, url=url, title="dummy")
+
+    class DummyAnalysisResult:
+        success = True
+        error = None
+        tasks_run = []
+        total_elapsed_seconds = 0.0
+        missing_targets = set()
+
+    monkeypatch.setattr(actions_api, "download_url", fake_download_url)
+    monkeypatch.setattr(actions_api, "run_analysis", lambda *a, **k: DummyAnalysisResult())
+
+    import videopipeline.chat.downloader as chat_downloader
+
+    monkeypatch.setattr(
+        chat_downloader,
+        "download_chat",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no chat")),
+    )
+
+    first = client.post(
+        "/api/actions/run_ingest_analyze",
+        headers=hdr,
+        json={"url": "https://www.twitch.tv/videos/123", "client_request_id": "run-req-base"},
+    )
+    assert first.status_code == 200
+    first_project_id = first.json()["project_id"]
+
+    second = client.post(
+        "/api/actions/run_ingest_analyze",
+        headers=hdr,
+        json={
+            "url": "https://www.twitch.tv/videos/123",
+            "client_request_id": "run-req-fresh-1",
+            "fresh_project": True,
+        },
+    )
+    assert second.status_code == 200
+    second_project_id = second.json()["project_id"]
+
+    third = client.post(
+        "/api/actions/run_ingest_analyze",
+        headers=hdr,
+        json={
+            "url": "https://www.twitch.tv/videos/123",
+            "client_request_id": "run-req-fresh-2",
+            "fresh_project": True,
+        },
+    )
+    assert third.status_code == 200
+    third_project_id = third.json()["project_id"]
+
+    assert second_project_id != first_project_id
+    assert third_project_id != first_project_id
+    assert third_project_id != second_project_id
+
+
 def test_actions_openapi_run_full_export_top_is_consequential(tmp_path, monkeypatch):
     client = _make_client(tmp_path, monkeypatch, token="secret")
     hdr = {"Authorization": "Bearer secret"}

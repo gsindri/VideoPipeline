@@ -124,6 +124,19 @@ def _extract_content_id(url: str) -> str:
     return u
 
 
+def _build_project_content_key(
+    url: str,
+    *,
+    fresh_project: bool = False,
+    client_request_id: str = "",
+) -> str:
+    base_content_id = _extract_content_id(url)
+    if not fresh_project:
+        return base_content_id
+    fresh_nonce = client_request_id.strip() or uuid.uuid4().hex
+    return f"{base_content_id}::fresh::{fresh_nonce}"
+
+
 def _validate_project_id(project_id: str) -> str:
     pid = (project_id or "").strip().lower()
     if not _PROJECT_ID_RE.match(pid):
@@ -3208,8 +3221,13 @@ def create_actions_router(
         if analyze_overrides and not isinstance(analyze_overrides, dict):
             raise HTTPException(status_code=400, detail="invalid_analyze_overrides")
         llm_mode = _resolve_llm_mode(body.get("llm_mode"))
+        fresh_project = bool(body.get("fresh_project"))
 
-        content_id = _extract_content_id(url)
+        content_id = _build_project_content_key(
+            url,
+            fresh_project=fresh_project,
+            client_request_id=client_request_id,
+        )
         proj = create_project_early(content_id, source_url=url)
         _persist_project_scout_metadata(proj=proj, url=url, body=body)
         project_id = proj.project_dir.name
@@ -3242,6 +3260,7 @@ def create_actions_router(
         if analyze_overrides and not isinstance(analyze_overrides, dict):
             raise HTTPException(status_code=400, detail="invalid_analyze_overrides")
         llm_mode = _resolve_llm_mode(body.get("llm_mode"))
+        fresh_project = bool(body.get("fresh_project"))
 
         top_n = _clamp_int(body.get("top"), default=5, min_v=1, max_v=30)
 
@@ -3252,7 +3271,11 @@ def create_actions_router(
         if not isinstance(export_cfg, dict) or not isinstance(cap_cfg, dict) or not isinstance(hook_cfg, dict) or not isinstance(pip_cfg, dict):
             raise HTTPException(status_code=400, detail="invalid_export_config")
 
-        content_id = _extract_content_id(url)
+        content_id = _build_project_content_key(
+            url,
+            fresh_project=fresh_project,
+            client_request_id=client_request_id,
+        )
         proj = create_project_early(content_id, source_url=url)
         _persist_project_scout_metadata(proj=proj, url=url, body=body)
         project_id = proj.project_dir.name
@@ -3294,6 +3317,7 @@ def create_actions_router(
         if analyze_overrides and not isinstance(analyze_overrides, dict):
             raise HTTPException(status_code=400, detail="invalid_analyze_overrides")
         llm_mode = _resolve_llm_mode(body.get("llm_mode"))
+        fresh_project = bool(body.get("fresh_project"))
 
         top_n = _clamp_int(body.get("top"), default=5, min_v=1, max_v=30)
 
@@ -3304,7 +3328,11 @@ def create_actions_router(
         if not isinstance(export_cfg, dict) or not isinstance(cap_cfg, dict) or not isinstance(hook_cfg, dict) or not isinstance(pip_cfg, dict):
             raise HTTPException(status_code=400, detail="invalid_export_config")
 
-        content_id = _extract_content_id(url)
+        content_id = _build_project_content_key(
+            url,
+            fresh_project=fresh_project,
+            client_request_id=client_request_id,
+        )
         proj = create_project_early(content_id, source_url=url)
         _persist_project_scout_metadata(proj=proj, url=url, body=body)
         project_id = proj.project_dir.name
