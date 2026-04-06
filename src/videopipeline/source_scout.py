@@ -39,6 +39,9 @@ _SCOUT_PROBE_INFLIGHT_LOCK = threading.Lock()
 _SCOUT_PROBE_INFLIGHT: dict[str, threading.Event] = {}
 _SCOUT_PROBE_LOCK_STALE_S = 600.0
 _SCOUT_PROBE_LOCK_POLL_S = 0.25
+_SCOUT_PROBE_FAILURE_GUARD_WINDOW_S = 15.0 * 60.0
+_SCOUT_PROBE_FAILURE_GUARD_THRESHOLD = 3
+_SCOUT_PROBE_TEMP_FILE_STALE_S = 5.0 * 60.0
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -864,6 +867,41 @@ def _release_probe_inflight_slot(cache_key: str, event: threading.Event) -> None
     event.set()
 
 
+def _iter_probe_temp_artifacts(root: Path) -> list[tuple[float, int, Path]]:
+    entries: list[tuple[float, int, Path]] = []
+    if not root.exists():
+        return entries
+    for pattern in ("chat-*.json", "chat-*.sqlite"):
+        for path in root.glob(pattern):
+            try:
+                stat = path.stat()
+            except Exception:
+                continue
+            entries.append((float(stat.st_mtime), int(stat.st_size), path))
+    return entries
+
+
+def _cleanup_stale_probe_temp_artifacts(root: Path, *, now_ts: float) -> None:
+    for modified_ts, size_bytes, path in _iter_probe_temp_artifacts(root):
+        if size_bytes > 0:
+            continue
+        age_s = max(0.0, now_ts - modified_ts)
+        if age_s <= _SCOUT_PROBE_TEMP_FILE_STALE_S:
+            continue
+        _safe_unlink(path)
+
+
+def _recent_failed_probe_artifact_count(root: Path, *, now_ts: float) -> int:
+    count = 0
+    for modified_ts, size_bytes, _path in _iter_probe_temp_artifacts(root):
+        if size_bytes > 0:
+            continue
+        age_s = max(0.0, now_ts - modified_ts)
+        if age_s <= _SCOUT_PROBE_FAILURE_GUARD_WINDOW_S:
+            count += 1
+    return count
+
+
 def _candidate_supports_chat_probe(candidate: Dict[str, Any]) -> bool:
     url = str(candidate.get("url") or "").strip()
     if not url.startswith("http"):
@@ -1038,9 +1076,22 @@ def _probe_single_candidate_chat(
 
     while True:
         loop_now_ts = time.time()
+        _cleanup_stale_probe_temp_artifacts(paths["root"], now_ts=loop_now_ts)
         cached = _load_cached_probe_summary(paths["summary"], now_ts=loop_now_ts, max_age_s=ttl_s)
         if cached is not None:
             return cached
+
+        recent_failures = _recent_failed_probe_artifact_count(paths["root"], now_ts=loop_now_ts)
+        if recent_failures >= _SCOUT_PROBE_FAILURE_GUARD_THRESHOLD:
+            return _save_probe_summary(
+                paths["summary"],
+                _transient_payload(
+                    error=(
+                        "chat probe cooling down after "
+                        f"{recent_failures} recent failed download attempts"
+                    )
+                ),
+            )
 
         if _try_acquire_probe_file_lock(paths["lock"], now_ts=loop_now_ts):
             break
@@ -1121,7 +1172,8 @@ def _probe_single_candidate_chat(
         return _save_probe_summary(paths["summary"], summary)
     except Exception as exc:
         error_msg = f"{type(exc).__name__}: {exc}"
-        if remaining_budget_s is not None and "timed out after" in str(exc).lower():
+        lowered_error = error_msg.lower()
+        if "timed out after" in lowered_error or "timed out" in lowered_error:
             return _save_probe_summary(paths["summary"], _transient_payload(error=error_msg))
         payload = {
             "status": "error",

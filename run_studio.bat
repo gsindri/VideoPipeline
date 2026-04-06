@@ -5,6 +5,7 @@ REM === Repo location ===
 set "VP_REPO=C:\Users\gsind\Documents\GitHub\VideoPipeline"
 set "TOKEN_HELPER=%VP_REPO%\tools\vp_api_token.ps1"
 set "VENV_PY=%VP_REPO%\.venv\Scripts\python.exe"
+set "VENV_PYW=%VP_REPO%\.venv\Scripts\pythonw.exe"
 
 REM === Basic checks ===
 if not exist "%VP_REPO%" (
@@ -27,6 +28,9 @@ if not exist "%VENV_PY%" (
   pause
   exit /b 1
 )
+
+set "VENV_LAUNCH_PY=%VENV_PY%"
+if exist "%VENV_PYW%" set "VENV_LAUNCH_PY=%VENV_PYW%"
 
 REM === Use repo-local Windows venv explicitly ===
 cd /d "%VP_REPO%"
@@ -59,4 +63,4 @@ if not defined VP_RUNTIME_HOST set "VP_RUNTIME_HOST=127.0.0.1"
 if not defined VP_STUDIO_HOST set "VP_STUDIO_HOST=0.0.0.0"
 
 REM === Launch Studio ===
-start "" /min "%VENV_PY%" -m videopipeline.launcher --host "%VP_STUDIO_HOST%" --runtime-host "%VP_RUNTIME_HOST%"
+start "" /min "%VENV_LAUNCH_PY%" -m videopipeline.launcher --host "%VP_STUDIO_HOST%" --runtime-host "%VP_RUNTIME_HOST%"

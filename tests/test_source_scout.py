@@ -872,6 +872,107 @@ def test_probe_single_candidate_chat_caches_transient_timeout_failures(tmp_path,
     assert expired is None
 
 
+def test_probe_single_candidate_chat_marks_timeout_transient_without_budget(tmp_path, monkeypatch):
+    import videopipeline.chat.downloader as chat_downloader_mod
+
+    cache_root = tmp_path / "probe"
+    summary_path = cache_root / "summary.json"
+    lock_path = cache_root / "probe.lock"
+
+    monkeypatch.setattr(
+        source_scout_mod,
+        "_probe_cache_paths",
+        lambda url, *, content_key=None: {
+            "root": cache_root,
+            "summary": summary_path,
+            "raw": cache_root / "chat.json",
+            "db": cache_root / "chat.sqlite",
+            "lock": lock_path,
+        },
+    )
+    monkeypatch.setattr(source_scout_mod, "_load_cached_probe_summary", lambda *a, **k: None)
+    monkeypatch.setattr(chat_downloader_mod, "is_chat_download_available", lambda: True)
+
+    def fake_download_chat(*args, **kwargs):
+        raise RuntimeError("TwitchDownloaderCLI timed out after 45 seconds")
+
+    monkeypatch.setattr(chat_downloader_mod, "download_chat", fake_download_chat)
+
+    summary = source_scout_mod._probe_single_candidate_chat(
+        {
+            "url": "https://www.twitch.tv/videos/111",
+            "content_key": "twitch_111",
+            "platform": "twitch",
+        },
+        probe_config={"ttl_hours": 18.0, "transient_ttl_minutes": 12.0},
+        now_ts=1742061600.0,
+        request_deadline_ts=None,
+    )
+
+    assert summary["status"] == "cooldown"
+    assert summary["transient"] is True
+    assert summary["retry_after_s"] == 720
+    assert summary_path.exists()
+    assert not lock_path.exists()
+
+
+def test_probe_single_candidate_chat_cools_down_after_recent_failed_temp_artifacts(tmp_path, monkeypatch):
+    import videopipeline.chat.downloader as chat_downloader_mod
+
+    cache_root = tmp_path / "probe"
+    summary_path = cache_root / "summary.json"
+    lock_path = cache_root / "probe.lock"
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    now_ts = 1742061600.0
+    for index in range(3):
+        temp_path = cache_root / f"chat-failed-{index}.json"
+        temp_path.write_text("", encoding="utf-8")
+        modified_ts = now_ts - (index * 30.0)
+        source_scout_mod.os.utime(temp_path, (modified_ts, modified_ts))
+
+    monkeypatch.setattr(
+        source_scout_mod,
+        "_probe_cache_paths",
+        lambda url, *, content_key=None: {
+            "root": cache_root,
+            "summary": summary_path,
+            "raw": cache_root / "chat.json",
+            "db": cache_root / "chat.sqlite",
+            "lock": lock_path,
+        },
+    )
+    monkeypatch.setattr(source_scout_mod, "_load_cached_probe_summary", lambda *a, **k: None)
+    monkeypatch.setattr(source_scout_mod.time, "time", lambda: now_ts)
+    monkeypatch.setattr(chat_downloader_mod, "is_chat_download_available", lambda: True)
+
+    download_calls = {"count": 0}
+
+    def fake_download_chat(*args, **kwargs):
+        download_calls["count"] += 1
+        raise AssertionError("download_chat should not run while cooldown guard is active")
+
+    monkeypatch.setattr(chat_downloader_mod, "download_chat", fake_download_chat)
+
+    summary = source_scout_mod._probe_single_candidate_chat(
+        {
+            "url": "https://www.twitch.tv/videos/111",
+            "content_key": "twitch_111",
+            "platform": "twitch",
+        },
+        probe_config={"ttl_hours": 18.0, "transient_ttl_minutes": 10.0},
+        now_ts=now_ts,
+        request_deadline_ts=now_ts + 6.0,
+    )
+
+    assert download_calls["count"] == 0
+    assert summary["status"] == "cooldown"
+    assert summary["transient"] is True
+    assert "recent failed download attempts" in summary["error"]
+    assert summary_path.exists()
+    assert not lock_path.exists()
+
+
 def test_probe_single_candidate_chat_reuses_inflight_probe(tmp_path, monkeypatch):
     import videopipeline.chat.downloader as chat_downloader_mod
 
