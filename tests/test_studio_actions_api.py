@@ -2530,6 +2530,74 @@ def test_actions_ai_apply_director_picks_writes_director_json(tmp_path, monkeypa
     assert director["picks"][0]["variant_id"] == "medium"
 
 
+def test_actions_ai_apply_director_picks_persists_camera_plan(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    pid = hashlib.sha256("twitch_237_camera_plan".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(proj_dir / "video" / "video.mp4"), "duration_seconds": 60.0},
+        "analysis": {
+            "highlights": {
+                "candidates": [
+                    {"rank": 1, "candidate_id": "cid1", "score": 1.0, "start_s": 10.0, "end_s": 20.0, "peak_time_s": 15.0},
+                ]
+            }
+        },
+        "layout": {},
+        "selections": [],
+        "exports": [],
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+
+    variants_json = {
+        "created_at": "now",
+        "candidates": [
+            {
+                "candidate_rank": 1,
+                "candidate_peak_time_s": 15.0,
+                "variants": [
+                    {"variant_id": "medium", "start_s": 10.0, "end_s": 30.0, "duration_s": 20.0},
+                ],
+            }
+        ],
+    }
+    (proj_dir / "analysis" / "variants.json").write_text(json.dumps(variants_json), encoding="utf-8")
+
+    r = client.post(
+        "/api/actions/ai/apply_director_picks",
+        headers=hdr,
+        json={
+            "project_id": pid,
+            "client_request_id": "apply-dir-camera-plan-1",
+            "picks": [
+                {
+                    "candidate_id": "cid1",
+                    "variant_id": "medium",
+                    "title": "t",
+                    "hook": "h",
+                    "description": "d",
+                    "camera_plan": [
+                        {"at_s": 0.0, "focus_x": 0.45, "focus_y": 0.35, "zoom": 1.0},
+                        {"at_s": 3.0, "focus_x": 0.66, "focus_y": 0.52, "zoom": 1.8},
+                    ],
+                }
+            ],
+        },
+    )
+    assert r.status_code == 200
+    director = json.loads((proj_dir / "analysis" / "director.json").read_text(encoding="utf-8"))
+    assert director["picks"][0]["camera_plan"] == [
+        {"at_s": 0.0, "focus_x": 0.45, "focus_y": 0.35, "zoom": 1.0},
+        {"at_s": 3.0, "focus_x": 0.66, "focus_y": 0.52, "zoom": 1.8},
+    ]
+
+
 def test_actions_ai_apply_director_picks_allows_exact_timing_overrides(tmp_path, monkeypatch):
     client = _make_client(tmp_path, monkeypatch, token="secret")
     hdr = {"Authorization": "Bearer secret"}
@@ -2893,6 +2961,79 @@ def test_actions_export_director_picks_creates_job(tmp_path, monkeypatch):
     job = _wait_for_terminal_job_state(job_id)
     assert job is not None
     assert job.status == "succeeded"
+
+
+def test_actions_export_director_picks_passes_camera_plan_to_export(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    from videopipeline.studio.jobs import JOB_MANAGER
+
+    pid = hashlib.sha256("twitch_238_camera_plan".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "video").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "exports").mkdir(parents=True, exist_ok=True)
+    video_path = proj_dir / "video" / "video.mp4"
+    video_path.write_bytes(b"")
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(video_path), "duration_seconds": 60.0},
+        "analysis": {"highlights": {"candidates": []}},
+        "layout": {},
+        "selections": [],
+        "exports": [],
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+
+    director_json = {
+        "created_at": "now",
+        "pick_count": 1,
+        "picks": [
+            {
+                "rank": 1,
+                "candidate_rank": 1,
+                "variant_id": "medium",
+                "start_s": 10.0,
+                "end_s": 30.0,
+                "duration_s": 20.0,
+                "title": "t",
+                "hook": "h",
+                "confidence": 0.7,
+                "camera_plan": [
+                    {"at_s": 0.0, "focus_x": 0.4, "focus_y": 0.33, "zoom": 1.0},
+                    {"at_s": 2.0, "focus_x": 0.58, "focus_y": 0.48, "zoom": 1.6},
+                ],
+            },
+        ],
+    }
+    (proj_dir / "analysis" / "director.json").write_text(json.dumps(director_json), encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    def fake_start_export(*, proj, selection, export_dir, **kwargs):
+        captured["selection"] = selection
+        job = JOB_MANAGER.create("export")
+        JOB_MANAGER._set(job, status="succeeded", progress=1.0, message="done", result={"output": str(export_dir / "dummy.mp4")})
+        return job
+
+    monkeypatch.setattr(JOB_MANAGER, "start_export", fake_start_export)
+
+    r = client.post(
+        "/api/actions/export_director_picks",
+        headers=hdr,
+        json={"project_id": pid, "limit": 1, "llm_mode": "local", "client_request_id": "export-dir-camera-plan-1"},
+    )
+    assert r.status_code == 200
+    job = _wait_for_terminal_job_state(r.json()["job_id"])
+    assert job is not None
+    assert job.status == "succeeded"
+    assert captured["selection"]["camera_plan"] == [
+        {"at_s": 0.0, "focus_x": 0.4, "focus_y": 0.33, "zoom": 1.0},
+        {"at_s": 2.0, "focus_x": 0.58, "focus_y": 0.48, "zoom": 1.6},
+    ]
 
 
 def test_actions_export_batch_external_strict_rejects_raw_top_candidates(tmp_path, monkeypatch):

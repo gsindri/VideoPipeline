@@ -8,7 +8,7 @@ import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 from .ffmpeg import _require_cmd, ffprobe_video_stream_info
 from .layouts import RectNorm
@@ -79,6 +79,14 @@ class LayoutPipSpec:
 
 
 @dataclass(frozen=True)
+class CameraPlanKeyframe:
+    at_s: float
+    focus_x: float = 0.5
+    focus_y: float = 0.5
+    zoom: float = 1.0
+
+
+@dataclass(frozen=True)
 class ExportSpec:
     video_path: Path
     start_s: float
@@ -105,6 +113,7 @@ class ExportSpec:
     normalize_audio: bool = False
     layout_facecam: Optional[RectNorm] = None
     layout_pip: Optional[LayoutPipSpec] = None
+    camera_plan: Optional[Sequence[CameraPlanKeyframe]] = None
     hook_text: Optional[HookTextSpec] = None
 
 
@@ -199,6 +208,7 @@ def filtergraph_for_template(
     source_width: Optional[int] = None,
     source_height: Optional[int] = None,
     pip_spec: Optional[LayoutPipSpec] = None,
+    camera_plan: Optional[Sequence[CameraPlanKeyframe]] = None,
 ) -> str:
     """Return ffmpeg filtergraph for a given layout template."""
     template = layout_preset_to_template(template)
@@ -208,17 +218,28 @@ def filtergraph_for_template(
         return "null"
 
     if template == "vertical_blur":
+        fg_chain = "[0:v]"
+        if camera_plan:
+            fg_chain += f"{_camera_plan_crop_filter(camera_plan, mode='source_aspect', target_width=width, target_height=height)},"
         # Gaming-friendly vertical: blurred background + full-width 16:9 foreground.
         # Background fills 9:16, then we overlay the 16:9 gameplay centered.
         # Note: boxblur values are intentionally modest for speed.
         return (
             f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
             f"crop={width}:{height},boxblur=20:1[bg];"
-            f"[0:v]scale={width}:-2:force_original_aspect_ratio=decrease[fg];"
+            f"{fg_chain}scale={width}:-2:force_original_aspect_ratio=decrease[fg];"
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1"
         )
 
     if template == "vertical_crop_center":
+        if camera_plan:
+            crop_filter = _camera_plan_crop_filter(
+                camera_plan,
+                mode="target_aspect",
+                target_width=width,
+                target_height=height,
+            )
+            return f"[0:v]{crop_filter},scale={width}:{height}"
         # Aggressive: crop center to 9:16 (can cut off HUD/text in many games).
         return (
             f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
@@ -256,10 +277,14 @@ def filtergraph_for_template(
             face_chain += f",pad=iw+{border_px * 2}:ih+{border_px * 2}:{border_px}:{border_px}:color=black@0.75"
         face_chain += f"[{face_label}]"
 
+        fg_chain = "[0:v]"
+        if camera_plan:
+            fg_chain += f"{_camera_plan_crop_filter(camera_plan, mode='source_aspect', target_width=width, target_height=height)},"
+
         return (
             f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
             f"crop={width}:{height},boxblur=20:1[bg];"
-            f"[0:v]scale={width}:-2:force_original_aspect_ratio=decrease[fg];"
+            f"{fg_chain}scale={width}:-2:force_original_aspect_ratio=decrease[fg];"
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1[base];"
             f"{face_chain};"
             f"[base][{face_label}]overlay={x}:{y}:shortest=1"
@@ -274,8 +299,11 @@ def filtergraph_for_template(
         face_px = layout_facecam.to_pixels(width=source_width, height=source_height)
         top_h = max(1, int(round(height * 0.72)))
         bottom_h = max(1, height - top_h)
+        game_chain = "[0:v]"
+        if camera_plan:
+            game_chain += f"{_camera_plan_crop_filter(camera_plan, mode='source_aspect', target_width=width, target_height=height)},"
         return (
-            f"[0:v]scale={width}:-2:force_original_aspect_ratio=decrease,"
+            f"{game_chain}scale={width}:-2:force_original_aspect_ratio=decrease,"
             f"crop={width}:{top_h}[game];"
             f"[0:v]crop={face_px.w}:{face_px.h}:{face_px.x}:{face_px.y},"
             f"scale={width}:{bottom_h}:force_original_aspect_ratio=increase,"
@@ -321,6 +349,144 @@ def _resolve_hook_font(font: str) -> Optional[Path]:
     return p if p.exists() else None
 
 
+def _parse_numeric(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not value == value:
+            return None
+        return float(value)
+    try:
+        return float(str(value).strip())
+    except Exception:
+        return None
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, float(value)))
+
+
+def _first_numeric(raw_item: dict[str, Any], keys: Sequence[str]) -> Optional[float]:
+    for key in keys:
+        if key not in raw_item:
+            continue
+        parsed = _parse_numeric(raw_item.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def normalize_camera_plan(
+    value: Any,
+    *,
+    duration_s: float | None = None,
+    max_keyframes: int = 8,
+) -> tuple[CameraPlanKeyframe, ...]:
+    if not isinstance(value, list):
+        return ()
+
+    normalized: dict[int, CameraPlanKeyframe] = {}
+    clip_duration = max(0.0, float(duration_s)) if duration_s is not None else None
+
+    for raw_item in value:
+        if not isinstance(raw_item, dict):
+            continue
+
+        at_s = _first_numeric(raw_item, ("at_s", "atSeconds", "at", "time_s", "timeSeconds", "t"))
+        if at_s is None or at_s < 0.0:
+            continue
+        if clip_duration is not None:
+            at_s = min(at_s, clip_duration)
+
+        focus_x = _first_numeric(raw_item, ("focus_x", "focusX", "center_x", "centerX", "x"))
+        focus_y = _first_numeric(raw_item, ("focus_y", "focusY", "center_y", "centerY", "y"))
+        zoom = _first_numeric(raw_item, ("zoom", "scale"))
+
+        key = int(round(at_s * 1000.0))
+        normalized[key] = CameraPlanKeyframe(
+            at_s=float(at_s),
+            focus_x=_clamp(0.5 if focus_x is None else focus_x, 0.0, 1.0),
+            focus_y=_clamp(0.5 if focus_y is None else focus_y, 0.0, 1.0),
+            zoom=_clamp(1.0 if zoom is None else zoom, 1.0, 4.0),
+        )
+
+    ordered = [normalized[key] for key in sorted(normalized.keys())[:max_keyframes]]
+    return tuple(ordered)
+
+
+def camera_plan_to_dicts(
+    value: Optional[Sequence[CameraPlanKeyframe] | Iterable[CameraPlanKeyframe]],
+) -> list[dict[str, float]]:
+    if not value:
+        return []
+    return [
+        {
+            "at_s": float(frame.at_s),
+            "focus_x": float(frame.focus_x),
+            "focus_y": float(frame.focus_y),
+            "zoom": float(frame.zoom),
+        }
+        for frame in value
+    ]
+
+
+def _fmt_expr_number(value: float) -> str:
+    text = f"{float(value):.6f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _camera_plan_value_expr(camera_plan: Sequence[CameraPlanKeyframe], field: str) -> str:
+    frames = list(camera_plan)
+    if not frames:
+        raise ValueError("camera plan is empty")
+    if len(frames) == 1:
+        return _fmt_expr_number(float(getattr(frames[0], field)))
+
+    expr = _fmt_expr_number(float(getattr(frames[-1], field)))
+    for idx in range(len(frames) - 2, -1, -1):
+        left = frames[idx]
+        right = frames[idx + 1]
+        left_value = _fmt_expr_number(float(getattr(left, field)))
+        right_value = _fmt_expr_number(float(getattr(right, field)))
+        left_at = _fmt_expr_number(left.at_s)
+        right_at = _fmt_expr_number(right.at_s)
+        delta = max(1e-6, float(right.at_s - left.at_s))
+        interp = (
+            f"({left_value}+({right_value}-{left_value})*clip((t-{left_at})/{_fmt_expr_number(delta)},0,1))"
+        )
+        expr = f"if(lte(t,{right_at}),{interp},{expr})"
+    return expr
+
+
+def _camera_plan_crop_filter(
+    camera_plan: Sequence[CameraPlanKeyframe],
+    *,
+    mode: str,
+    target_width: int,
+    target_height: int,
+) -> str:
+    if not camera_plan:
+        return ""
+
+    focus_x_expr = _camera_plan_value_expr(camera_plan, "focus_x")
+    focus_y_expr = _camera_plan_value_expr(camera_plan, "focus_y")
+    zoom_expr = _camera_plan_value_expr(camera_plan, "zoom")
+
+    if mode == "source_aspect":
+        crop_w_expr = f"(iw/({zoom_expr}))"
+        crop_h_expr = f"(ih/({zoom_expr}))"
+    elif mode == "target_aspect":
+        target_ar = _fmt_expr_number(float(target_width) / max(1.0, float(target_height)))
+        crop_w_expr = f"if(gte(iw/ih,{target_ar}),ih*{target_ar}/({zoom_expr}),iw/({zoom_expr}))"
+        crop_h_expr = f"if(gte(iw/ih,{target_ar}),ih/({zoom_expr}),iw/{target_ar}/({zoom_expr}))"
+    else:
+        raise ValueError(f"Unknown camera plan crop mode: {mode}")
+
+    x_expr = f"clip(iw*({focus_x_expr})-({crop_w_expr})/2,0,iw-({crop_w_expr}))"
+    y_expr = f"clip(ih*({focus_y_expr})-({crop_h_expr})/2,0,ih-({crop_h_expr}))"
+    return f"crop=w='{crop_w_expr}':h='{crop_h_expr}':x='{x_expr}':y='{y_expr}'"
+
+
 def _build_video_filtergraph(spec: ExportSpec) -> str:
     resolved_template = layout_preset_to_template(spec.layout_preset or spec.template)
     source_width = None
@@ -338,6 +504,7 @@ def _build_video_filtergraph(spec: ExportSpec) -> str:
         source_width=source_width,
         source_height=source_height,
         pip_spec=spec.layout_pip,
+        camera_plan=tuple(spec.camera_plan or ()),
     )
 
     # Optional subtitles burned-in.

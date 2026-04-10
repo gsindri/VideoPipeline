@@ -52,6 +52,7 @@ def build_metadata(
     ai_metadata: Optional[Dict[str, Any]] = None,
     caption_theme: Optional[str] = None,
     render_template: Optional[str] = None,
+    camera_plan: Optional[list[Dict[str, float]]] = None,
 ) -> Dict[str, Any]:
     """Build export metadata dictionary.
 
@@ -98,6 +99,7 @@ def build_metadata(
         "render_template": effective_template or template,
         "with_captions": with_captions,
         "caption_theme": caption_theme or None,
+        "camera_plan": camera_plan or None,
         "selection": {
             "id": selection.get("id"),
             "start_s": selection.get("start_s"),
@@ -106,6 +108,7 @@ def build_metadata(
             "candidate_score": selection.get("candidate_score"),
             "candidate_peak_time_s": selection.get("candidate_peak_time_s"),
             "variant_id": selection.get("variant_id"),
+            "camera_plan": camera_plan or None,
         },
         "platform_hints": {
             "shorts_max_seconds": 60,

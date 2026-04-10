@@ -15,7 +15,9 @@ from ..exporter import (
     ExportSpec,
     HookTextSpec,
     LayoutPipSpec,
+    camera_plan_to_dicts,
     layout_preset_to_template,
+    normalize_camera_plan,
     normalize_layout_preset,
     run_ffmpeg_export,
 )
@@ -186,6 +188,10 @@ class JobManager:
                 end_s = float(selection["end_s"])
                 layout_preset = normalize_layout_preset(template or selection.get("template"))
                 caption_theme_normalized = normalize_caption_theme(caption_theme)
+                camera_plan = normalize_camera_plan(
+                    selection.get("camera_plan") or selection.get("cameraPlan"),
+                    duration_s=max(0.0, end_s - start_s),
+                )
 
                 export_dir.mkdir(parents=True, exist_ok=True)
                 out_path = export_dir / f"{sel_id}_{layout_preset}_{width}x{height}.mp4"
@@ -269,6 +275,7 @@ class JobManager:
                     normalize_audio=normalize_audio,
                     layout_facecam=facecam,
                     layout_pip=LayoutPipSpec(**pip_cfg) if pip_cfg else None,
+                    camera_plan=camera_plan,
                     hook_text=hook_spec,
                 )
 
@@ -300,6 +307,7 @@ class JobManager:
                     ai_metadata=ai_metadata,
                     caption_theme=caption_theme_normalized,
                     render_template=layout_preset_to_template(layout_preset),
+                    camera_plan=camera_plan_to_dicts(camera_plan),
                 )
                 write_metadata(out_path.with_suffix(".metadata.json"), metadata)
 
@@ -311,6 +319,7 @@ class JobManager:
                     with_captions=with_captions,
                     caption_theme=caption_theme_normalized,
                     render_template=layout_preset_to_template(layout_preset),
+                    camera_plan=camera_plan_to_dicts(camera_plan),
                     status="succeeded",
                 )
 

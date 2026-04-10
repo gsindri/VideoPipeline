@@ -22,7 +22,12 @@ from ..ai.helpers import get_llm_complete_fn
 from ..analysis import run_analysis
 from ..analysis_director import DirectorConfig
 from ..analysis_highlights import CONTENT_TYPE_GUIDANCE
-from ..exporter import DEFAULT_LAYOUT_PRESET, normalize_layout_preset
+from ..exporter import (
+    DEFAULT_LAYOUT_PRESET,
+    camera_plan_to_dicts,
+    normalize_camera_plan,
+    normalize_layout_preset,
+)
 from ..ffmpeg import extract_video_frame_jpeg
 from ..ingest import IngestRequest, QualityCap, SpeedMode
 from ..ingest.ytdlp_runner import DownloadCancelled, download_url
@@ -1590,6 +1595,20 @@ def create_actions_router(
                                         "hashtags": {"type": "array", "items": {"type": "string"}},
                                         "tags": {"type": "array", "items": {"type": "string"}},
                                         "template": {"type": "string"},
+                                        "camera_plan": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "at_s": {"type": "number"},
+                                                    "focus_x": {"type": "number"},
+                                                    "focus_y": {"type": "number"},
+                                                    "zoom": {"type": "number"},
+                                                },
+                                                "required": ["at_s"],
+                                                "additionalProperties": True,
+                                            },
+                                        },
                                         "confidence": {"type": "number"},
                                         "reason": {"type": "string"},
                                         "reasons": {"type": "array", "items": {"type": "string"}},
@@ -5476,6 +5495,7 @@ def create_actions_router(
                 "template": export.metadata.get("template", ""),
                 "layout_preset": export.metadata.get("layout_preset", export.metadata.get("template", "")),
                 "caption_theme": export.metadata.get("caption_theme", ""),
+                "camera_plan": export.metadata.get("camera_plan"),
                 "privacy": str(export.metadata.get("privacy") or _publish_policy()["default_privacy"]).strip().lower() or "private",
                 "publish_at": str(export.metadata.get("publish_at") or "").strip() or None,
                 "selection_id": selection_id or None,
@@ -5506,6 +5526,7 @@ def create_actions_router(
                 )
                 or None,
                 "director_confidence": selection.get("director_confidence"),
+                "camera_plan": selection.get("camera_plan"),
             }
 
         clips: list[Dict[str, Any]] = []
@@ -5543,6 +5564,7 @@ def create_actions_router(
                     "description": director_pick.get("description"),
                     "hashtags": director_pick.get("hashtags") or director_pick.get("tags") or [],
                     "template": director_pick.get("template"),
+                    "camera_plan": director_pick.get("camera_plan"),
                     "confidence": director_pick.get("confidence"),
                     "reasons": director_pick.get("reasons") or [],
                     "chapter_index": director_pick.get("chapter_index"),
@@ -6551,6 +6573,20 @@ def create_actions_router(
             template = str(p.get("template") or "").strip()
             if not template or (allowed_templates and template not in allowed_templates):
                 template = template_default
+            camera_plan_raw = p.get("camera_plan")
+            if camera_plan_raw is None:
+                camera_plan_raw = p.get("cameraPlan")
+            camera_plan = normalize_camera_plan(camera_plan_raw, duration_s=duration_s)
+            if camera_plan_raw is not None and not camera_plan:
+                missing.append(
+                    {
+                        "candidate_rank": cand_rank,
+                        "candidate_id": cand_id or None,
+                        "variant_id": variant_id,
+                        "error": "invalid_camera_plan",
+                    }
+                )
+                continue
 
             pick = {
                 "rank": len(picks) + 1,
@@ -6567,6 +6603,7 @@ def create_actions_router(
                 "description": description,
                 "hashtags": tags,
                 "template": template,
+                "camera_plan": camera_plan_to_dicts(camera_plan) or None,
                 "packaging_source": packaging_provenance["source"],
                 "packaging_error": None,
                 "confidence": confidence,
@@ -6824,6 +6861,7 @@ def create_actions_router(
                         "candidate_peak_time_s": p.get("peak_time_s"),
                         "variant_id": variant_id,
                         "director_confidence": p.get("confidence"),
+                        "camera_plan": p.get("camera_plan"),
                     }
                 )
 

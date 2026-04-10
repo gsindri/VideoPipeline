@@ -125,6 +125,26 @@ class TestBuildMetadata:
         assert result["caption_theme"] == "impact"
         assert result["selection"]["variant_id"] == "medium"
 
+    def test_metadata_tracks_camera_plan(self):
+        selection = {
+            "id": "abc123",
+            "start_s": 10.0,
+            "end_s": 40.0,
+        }
+        camera_plan = [
+            {"at_s": 0.0, "focus_x": 0.45, "focus_y": 0.4, "zoom": 1.0},
+            {"at_s": 2.0, "focus_x": 0.6, "focus_y": 0.5, "zoom": 1.7},
+        ]
+        result = build_metadata(
+            selection=selection,
+            output_path=Path("/tmp/test.mp4"),
+            template="proof_overlay",
+            with_captions=False,
+            camera_plan=camera_plan,
+        )
+        assert result["camera_plan"] == camera_plan
+        assert result["selection"]["camera_plan"] == camera_plan
+
     def test_ai_metadata_priority(self):
         """AI metadata should override defaults."""
         selection = {
