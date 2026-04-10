@@ -39,3 +39,15 @@
 - Do not push broken partial states just to create a checkpoint.
 - Do not bundle unrelated dirty-worktree changes into the same commit. Stage and commit only the files that belong to the finished job.
 - When integration work spans both `VideoPipeline` and `Gondull_Platform`, prefer one coherent commit per repo rather than mixing unrelated repo state together.
+
+## Secrets and Auth
+
+- This repo uses Infisical as the default secret source when `.infisical.json` is present.
+- Do not ask the user to paste raw secret values into chat when a local terminal prompt or file import can be used instead.
+- Prefer `cx` over `codex` for new interactive Codex sessions in this repo so repo secrets are available automatically.
+- Prefer `with-secrets <command>` for commands that require repo secrets.
+- To add a new secret safely, use `infisical-secret-put SECRET_NAME` or `infisical-secret-put SECRET_NAME --from-file /path/to/file`.
+- For one-time migration from an existing local env file, prefer `infisical secrets set --file .env.local` or a similar explicit env file import.
+- Prefer `infisical login`; if the WSL browser callback is unreliable, use `infisical login -i`.
+- On this machine, prefer Infisical Cloud EU unless the user or repo explicitly says otherwise.
+- Detailed machine workflow reference: `/home/sindri/.config/codex/README.md`
