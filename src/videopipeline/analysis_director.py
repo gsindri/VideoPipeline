@@ -179,8 +179,14 @@ class DirectorConfig:
     # Templates
     default_template: str = "vertical_streamer_pip"
     allowed_templates: List[str] = field(default_factory=lambda: [
+        "speaker_broll",
+        "reaction_stack",
+        "proof_overlay",
+        "single_subject_punch",
         "vertical_streamer_pip",
+        "vertical_streamer_split",
         "vertical_blur",
+        "vertical_crop_center",
         "original",
     ])
 
@@ -208,7 +214,22 @@ class DirectorConfig:
             hook_max_chars=int(d.get("hook_max_chars", 80)),
             description_max_chars=int(d.get("description_max_chars", 220)),
             default_template=str(d.get("default_template", d.get("template", "vertical_streamer_pip"))),
-            allowed_templates=list(d.get("allowed_templates", ["vertical_streamer_pip", "vertical_blur", "original"])),
+            allowed_templates=list(
+                d.get(
+                    "allowed_templates",
+                    [
+                        "speaker_broll",
+                        "reaction_stack",
+                        "proof_overlay",
+                        "single_subject_punch",
+                        "vertical_streamer_pip",
+                        "vertical_streamer_split",
+                        "vertical_blur",
+                        "vertical_crop_center",
+                        "original",
+                    ],
+                )
+            ),
             hashtags=list(d.get("hashtags", ["#gaming", "#clips", "#stream"])),
             write_selections=bool(d.get("write_selections", False)),
         )

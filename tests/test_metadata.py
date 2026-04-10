@@ -105,6 +105,26 @@ class TestBuildMetadata:
         assert result["selection"]["id"] == "abc123"
         assert "#vertical" in result["hashtags"]
 
+    def test_metadata_tracks_caption_theme_and_render_template(self):
+        selection = {
+            "id": "abc123",
+            "start_s": 10.0,
+            "end_s": 40.0,
+            "variant_id": "medium",
+        }
+        result = build_metadata(
+            selection=selection,
+            output_path=Path("/tmp/test.mp4"),
+            template="proof_overlay",
+            with_captions=True,
+            caption_theme="impact",
+            render_template="vertical_blur",
+        )
+        assert result["layout_preset"] == "proof_overlay"
+        assert result["render_template"] == "vertical_blur"
+        assert result["caption_theme"] == "impact"
+        assert result["selection"]["variant_id"] == "medium"
+
     def test_ai_metadata_priority(self):
         """AI metadata should override defaults."""
         selection = {

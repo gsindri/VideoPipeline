@@ -17,6 +17,45 @@ from .utils import subprocess_flags as _subprocess_flags
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_LAYOUT_PRESET = "proof_overlay"
+LAYOUT_PRESET_TEMPLATE_MAP = {
+    "original": "original",
+    "proof_overlay": "vertical_blur",
+    "speaker_broll": "vertical_streamer_pip",
+    "reaction_stack": "vertical_streamer_split",
+    "single_subject_punch": "vertical_crop_center",
+}
+LAYOUT_PRESET_ALIASES = {
+    "original": "original",
+    "proof_overlay": "proof_overlay",
+    "proof-overlay": "proof_overlay",
+    "vertical_blur": "proof_overlay",
+    "speaker_broll": "speaker_broll",
+    "speaker-broll": "speaker_broll",
+    "vertical_streamer_pip": "speaker_broll",
+    "reaction_stack": "reaction_stack",
+    "reaction-stack": "reaction_stack",
+    "vertical_streamer_split": "reaction_stack",
+    "single_subject_punch": "single_subject_punch",
+    "single-subject-punch": "single_subject_punch",
+    "vertical_crop_center": "single_subject_punch",
+}
+LAYOUT_PRESETS = tuple(LAYOUT_PRESET_TEMPLATE_MAP.keys())
+
+
+def normalize_layout_preset(value: str | None, *, default: str = DEFAULT_LAYOUT_PRESET) -> str:
+    raw = str(value or "").strip().lower().replace(" ", "_")
+    if not raw:
+        return default
+    normalized = LAYOUT_PRESET_ALIASES.get(raw, raw)
+    return normalized if normalized in LAYOUT_PRESET_TEMPLATE_MAP else default
+
+
+def layout_preset_to_template(value: str | None, *, default: str = DEFAULT_LAYOUT_PRESET) -> str:
+    preset = normalize_layout_preset(value, default=default)
+    return LAYOUT_PRESET_TEMPLATE_MAP[preset]
+
+
 class ExportCancelledError(RuntimeError):
     """Raised when an export is cancelled while ffmpeg is running."""
 
@@ -48,6 +87,8 @@ class ExportSpec:
 
     # Template + output
     template: str = "vertical_blur"
+    layout_preset: Optional[str] = None
+    caption_theme: str = "clean"
     width: int = 1080
     height: int = 1920
     fps: int = 30
@@ -160,7 +201,7 @@ def filtergraph_for_template(
     pip_spec: Optional[LayoutPipSpec] = None,
 ) -> str:
     """Return ffmpeg filtergraph for a given layout template."""
-    template = template.lower().strip()
+    template = layout_preset_to_template(template)
 
     if template == "original":
         # No layout change.
@@ -281,15 +322,16 @@ def _resolve_hook_font(font: str) -> Optional[Path]:
 
 
 def _build_video_filtergraph(spec: ExportSpec) -> str:
+    resolved_template = layout_preset_to_template(spec.layout_preset or spec.template)
     source_width = None
     source_height = None
-    if spec.layout_facecam is not None or spec.template in {"vertical_streamer_pip", "vertical_streamer_split"}:
+    if spec.layout_facecam is not None or resolved_template in {"vertical_streamer_pip", "vertical_streamer_split"}:
         info = ffprobe_video_stream_info(spec.video_path)
         source_width = int(info.get("width") or 0)
         source_height = int(info.get("height") or 0)
 
     vf = filtergraph_for_template(
-        spec.template,
+        resolved_template,
         spec.width,
         spec.height,
         layout_facecam=spec.layout_facecam,

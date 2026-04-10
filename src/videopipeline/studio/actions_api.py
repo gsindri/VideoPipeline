@@ -22,6 +22,7 @@ from ..ai.helpers import get_llm_complete_fn
 from ..analysis import run_analysis
 from ..analysis_director import DirectorConfig
 from ..analysis_highlights import CONTENT_TYPE_GUIDANCE
+from ..exporter import DEFAULT_LAYOUT_PRESET, normalize_layout_preset
 from ..ffmpeg import extract_video_frame_jpeg
 from ..ingest import IngestRequest, QualityCap, SpeedMode
 from ..ingest.ytdlp_runner import DownloadCancelled, download_url
@@ -40,6 +41,7 @@ from ..publisher.accounts import AccountStore
 from ..publisher.connectors import get_connector
 from ..publisher.jobs import PublishJobStore
 from ..publisher.secrets import load_tokens
+from ..subtitles import DEFAULT_CAPTION_THEME, normalize_caption_theme
 from .dag_config import (
     apply_llm_mode_to_dag_config,
     build_dag_config,
@@ -650,6 +652,18 @@ def create_actions_router(
 
     _LLM_MODE_ENUM = ["local", "external", "external_strict"]
     _EXTERNAL_AI_SOURCES = {"chatgpt_actions", "external_ai", "gondull"}
+
+    def _resolve_export_layout_preset(export_cfg: Dict[str, Any], *, fallback: str = DEFAULT_LAYOUT_PRESET) -> str:
+        return normalize_layout_preset(
+            export_cfg.get("layout_preset") or export_cfg.get("template"),
+            default=fallback,
+        )
+
+    def _resolve_export_caption_theme(export_cfg: Dict[str, Any], cap_cfg: Dict[str, Any]) -> str:
+        return normalize_caption_theme(
+            export_cfg.get("caption_theme") or cap_cfg.get("theme"),
+            default=DEFAULT_CAPTION_THEME,
+        )
 
     def _extract_ai_provenance(
         body: Dict[str, Any],
@@ -2881,6 +2895,8 @@ def create_actions_router(
         hook_cfg = {**(profile.get("overlay", {}).get("hook_text", {}) or {}), **(hook_cfg or {})}
         pip_cfg = {**(profile.get("layout", {}).get("pip", {}) or {}), **(pip_cfg or {})}
         with_captions = bool(cap_cfg.get("enabled", False))
+        layout_preset = _resolve_export_layout_preset(export_cfg)
+        caption_theme = _resolve_export_caption_theme(export_cfg, cap_cfg)
 
         whisper_cfg = None
         if with_captions:
@@ -2897,7 +2913,6 @@ def create_actions_router(
         from ..project import add_selection_from_candidate
 
         top_n = _clamp_int(top, default=10, min_v=1, max_v=30)
-        template = str(export_cfg.get("template", "vertical_blur"))
         candidates = ((proj_data.get("analysis", {}) or {}).get("highlights", {}) or {}).get("candidates") or []
         if not candidates:
             JOB_MANAGER._set(job, status="failed", message="no_candidates", result={"project_id": project_id})
@@ -2908,7 +2923,7 @@ def create_actions_router(
             if not isinstance(cand, dict):
                 continue
             title = str(cand.get("title") or "")
-            sel_id = add_selection_from_candidate(proj, candidate=cand, template=template, title=title)
+            sel_id = add_selection_from_candidate(proj, candidate=cand, template=layout_preset, title=title)
             created_ids.append(sel_id)
 
         proj_data = get_project_data(proj)
@@ -2940,13 +2955,14 @@ def create_actions_router(
                     selection=selection,
                     export_dir=proj.exports_dir,
                     with_captions=with_captions,
-                    template=str(export_cfg.get("template", selection.get("template") or "vertical_blur")),
+                    template=layout_preset if "layout_preset" in export_cfg or "template" in export_cfg else str(selection.get("template") or layout_preset),
                     width=int(export_cfg.get("width", 1080)),
                     height=int(export_cfg.get("height", 1920)),
                     fps=int(export_cfg.get("fps", 30)),
                     crf=int(export_cfg.get("crf", 20)),
                     preset=str(export_cfg.get("preset", "veryfast")),
                     normalize_audio=bool(export_cfg.get("normalize_audio", False)),
+                    caption_theme=caption_theme,
                     whisper_cfg=whisper_cfg,
                     hook_cfg=hook_cfg,
                     pip_cfg=pip_cfg,
@@ -2996,7 +3012,9 @@ def create_actions_router(
                 "created_selection_ids": created_ids,
                 "outputs": outputs,
                 "export": {
-                    "template": str(export_cfg.get("template", "vertical_blur")),
+                    "template": layout_preset,
+                    "layout_preset": layout_preset,
+                    "caption_theme": caption_theme,
                     "width": int(export_cfg.get("width", 1080)),
                     "height": int(export_cfg.get("height", 1920)),
                     "fps": int(export_cfg.get("fps", 30)),
@@ -5456,6 +5474,8 @@ def create_actions_router(
                 "title": export.metadata.get("title", ""),
                 "description": export.metadata.get("description", ""),
                 "template": export.metadata.get("template", ""),
+                "layout_preset": export.metadata.get("layout_preset", export.metadata.get("template", "")),
+                "caption_theme": export.metadata.get("caption_theme", ""),
                 "privacy": str(export.metadata.get("privacy") or _publish_policy()["default_privacy"]).strip().lower() or "private",
                 "publish_at": str(export.metadata.get("publish_at") or "").strip() or None,
                 "selection_id": selection_id or None,
@@ -6700,6 +6720,8 @@ def create_actions_router(
         hook_cfg = {**(profile.get("overlay", {}).get("hook_text", {}) or {}), **(body.get("hook_text") or {})}
         pip_cfg = {**(profile.get("layout", {}).get("pip", {}) or {}), **(body.get("pip") or {})}
         with_captions = bool(body.get("with_captions", cap_cfg.get("enabled", False)))
+        layout_preset = _resolve_export_layout_preset(export_cfg)
+        caption_theme = _resolve_export_caption_theme(export_cfg, cap_cfg)
 
         whisper_cfg = None
         if with_captions:
@@ -6721,7 +6743,7 @@ def create_actions_router(
         export_ids: list[str] = []
         now = utc_now_iso()
 
-        template_default = str(export_cfg.get("template", "vertical_blur"))
+        template_default = layout_preset
 
         def _upd(d: Dict[str, Any]) -> None:
             nonlocal created_ids, export_ids
@@ -6835,13 +6857,14 @@ def create_actions_router(
                         selection=selection,
                         export_dir=proj.exports_dir,
                         with_captions=with_captions,
-                        template=str(export_cfg.get("template", selection.get("template") or template_default)),
+                        template=layout_preset if "layout_preset" in export_cfg or "template" in export_cfg else str(selection.get("template") or template_default),
                         width=int(export_cfg.get("width", 1080)),
                         height=int(export_cfg.get("height", 1920)),
                         fps=int(export_cfg.get("fps", 30)),
                         crf=int(export_cfg.get("crf", 20)),
                         preset=str(export_cfg.get("preset", "veryfast")),
                         normalize_audio=bool(export_cfg.get("normalize_audio", False)),
+                        caption_theme=caption_theme,
                         whisper_cfg=whisper_cfg,
                         hook_cfg=hook_cfg,
                         pip_cfg=pip_cfg,
@@ -6878,7 +6901,9 @@ def create_actions_router(
                     "created_selection_ids": created_ids,
                     "outputs": outputs,
                     "export": {
-                        "template": str(export_cfg.get("template", template_default)),
+                        "template": layout_preset,
+                        "layout_preset": layout_preset,
+                        "caption_theme": caption_theme,
                         "width": int(export_cfg.get("width", 1080)),
                         "height": int(export_cfg.get("height", 1920)),
                         "fps": int(export_cfg.get("fps", 30)),
@@ -6977,7 +7002,6 @@ def create_actions_router(
             from ..project import add_selection_from_candidate
 
             top_n = _clamp_int(top_from_candidates, default=10, min_v=1, max_v=30)
-            template = str(export_cfg.get("template", "vertical_blur"))
             candidates = (
                 (proj_data.get("analysis", {}) or {}).get("highlights", {}) or {}
             ).get("candidates") or []
@@ -6989,7 +7013,7 @@ def create_actions_router(
                 if not isinstance(cand, dict):
                     continue
                 title = str(cand.get("title") or "")
-                sel_id = add_selection_from_candidate(proj, candidate=cand, template=template, title=title)
+                sel_id = add_selection_from_candidate(proj, candidate=cand, template=layout_preset, title=title)
                 created_ids.append(sel_id)
 
             proj_data = get_project_data(proj)
@@ -7038,13 +7062,14 @@ def create_actions_router(
                         selection=selection,
                         export_dir=proj.exports_dir,
                         with_captions=with_captions,
-                        template=str(export_cfg.get("template", selection.get("template") or "vertical_blur")),
+                        template=layout_preset if "layout_preset" in export_cfg or "template" in export_cfg else str(selection.get("template") or layout_preset),
                         width=int(export_cfg.get("width", 1080)),
                         height=int(export_cfg.get("height", 1920)),
                         fps=int(export_cfg.get("fps", 30)),
                         crf=int(export_cfg.get("crf", 20)),
                         preset=str(export_cfg.get("preset", "veryfast")),
                         normalize_audio=bool(export_cfg.get("normalize_audio", False)),
+                        caption_theme=caption_theme,
                         whisper_cfg=whisper_cfg,
                         hook_cfg=hook_cfg,
                         pip_cfg=pip_cfg,
@@ -7082,7 +7107,9 @@ def create_actions_router(
                     "created_selection_ids": created_ids,
                     "outputs": outputs,
                     "export": {
-                        "template": str(export_cfg.get("template", "vertical_blur")),
+                        "template": layout_preset,
+                        "layout_preset": layout_preset,
+                        "caption_theme": caption_theme,
                         "width": int(export_cfg.get("width", 1080)),
                         "height": int(export_cfg.get("height", 1920)),
                         "fps": int(export_cfg.get("fps", 30)),

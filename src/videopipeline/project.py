@@ -1000,6 +1000,8 @@ def record_export(
     template: str,
     with_captions: bool,
     status: str,
+    caption_theme: str | None = None,
+    render_template: str | None = None,
 ) -> Dict[str, Any]:
     def _upd(d: Dict[str, Any]) -> None:
         d.setdefault("exports", [])
@@ -1009,7 +1011,10 @@ def record_export(
                 "selection_id": selection_id,
                 "output": str(output_path),
                 "template": template,
+                "layout_preset": template,
+                "render_template": render_template or template,
                 "with_captions": bool(with_captions),
+                "caption_theme": caption_theme or None,
                 "status": status,
             }
         )

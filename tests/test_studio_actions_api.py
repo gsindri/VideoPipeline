@@ -2682,7 +2682,17 @@ def test_actions_ai_apply_director_picks_enforces_overlap_and_normalizes_packagi
     assert len(pick["description"]) <= 220
     assert len(pick["hashtags"]) >= 3
     assert all(str(t).startswith("#") for t in pick["hashtags"])
-    assert pick["template"] in {"vertical_streamer_pip", "vertical_blur", "original"}
+    assert pick["template"] in {
+        "speaker_broll",
+        "reaction_stack",
+        "proof_overlay",
+        "single_subject_punch",
+        "vertical_streamer_pip",
+        "vertical_streamer_split",
+        "vertical_blur",
+        "vertical_crop_center",
+        "original",
+    }
 
 
 def test_actions_ai_apply_director_picks_rejects_generic_or_domain_anchored_packaging(tmp_path, monkeypatch):

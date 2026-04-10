@@ -10,11 +10,19 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from ..exporter import ExportCancelledError, ExportSpec, HookTextSpec, LayoutPipSpec, run_ffmpeg_export
+from ..exporter import (
+    ExportCancelledError,
+    ExportSpec,
+    HookTextSpec,
+    LayoutPipSpec,
+    layout_preset_to_template,
+    normalize_layout_preset,
+    run_ffmpeg_export,
+)
 from ..layouts import get_facecam_rect
 from ..metadata import build_metadata, derive_hook_text, write_metadata
 from ..project import Project, get_project_data, record_export
-from ..subtitles import SubtitleSegment, write_ass
+from ..subtitles import DEFAULT_CAPTION_THEME, SubtitleSegment, normalize_caption_theme, write_ass
 from ..transcribe import (
     TranscribeConfig,
     WhisperNotInstalledError,
@@ -156,6 +164,7 @@ class JobManager:
         crf: int,
         preset: str,
         normalize_audio: bool,
+        caption_theme: str = DEFAULT_CAPTION_THEME,
         whisper_cfg: Optional[TranscribeConfig] = None,
         hook_cfg: Optional[Dict[str, Any]] = None,
         pip_cfg: Optional[Dict[str, Any]] = None,
@@ -175,9 +184,11 @@ class JobManager:
                 sel_id = selection["id"]
                 start_s = float(selection["start_s"])
                 end_s = float(selection["end_s"])
+                layout_preset = normalize_layout_preset(template or selection.get("template"))
+                caption_theme_normalized = normalize_caption_theme(caption_theme)
 
                 export_dir.mkdir(parents=True, exist_ok=True)
-                out_path = export_dir / f"{sel_id}_{template}_{width}x{height}.mp4"
+                out_path = export_dir / f"{sel_id}_{layout_preset}_{width}x{height}.mp4"
 
                 proj_data = get_project_data(proj)
                 facecam = get_facecam_rect(proj_data.get("layout", {}))
@@ -203,7 +214,13 @@ class JobManager:
 
                     self._set(job, message="rendering captions")
                     ass_path = proj.analysis_dir / "subtitles" / f"{sel_id}.ass"
-                    subtitles_ass = write_ass(segments or [], ass_path, playres_x=width, playres_y=height)
+                    subtitles_ass = write_ass(
+                        segments or [],
+                        ass_path,
+                        playres_x=width,
+                        playres_y=height,
+                        theme=caption_theme_normalized,
+                    )
                 else:
                     tjson = proj.analysis_dir / "transcripts" / f"{sel_id}_{int(start_s)}_{int(end_s)}.json"
                     if tjson.exists():
@@ -241,6 +258,8 @@ class JobManager:
                     end_s=end_s,
                     output_path=out_path,
                     template=template,
+                    layout_preset=layout_preset,
+                    caption_theme=caption_theme_normalized,
                     width=width,
                     height=height,
                     fps=fps,
@@ -275,10 +294,12 @@ class JobManager:
                 metadata = build_metadata(
                     selection=selection,
                     output_path=out_path,
-                    template=template,
+                    template=layout_preset,
                     with_captions=with_captions,
                     segments=segments,
                     ai_metadata=ai_metadata,
+                    caption_theme=caption_theme_normalized,
+                    render_template=layout_preset_to_template(layout_preset),
                 )
                 write_metadata(out_path.with_suffix(".metadata.json"), metadata)
 
@@ -286,8 +307,10 @@ class JobManager:
                     proj,
                     selection_id=sel_id,
                     output_path=out_path,
-                    template=template,
+                    template=layout_preset,
                     with_captions=with_captions,
+                    caption_theme=caption_theme_normalized,
+                    render_template=layout_preset_to_template(layout_preset),
                     status="succeeded",
                 )
 
@@ -329,6 +352,7 @@ class JobManager:
         crf: int,
         preset: str,
         normalize_audio: bool,
+        caption_theme: str = DEFAULT_CAPTION_THEME,
         whisper_cfg: Optional[TranscribeConfig] = None,
         hook_cfg: Optional[Dict[str, Any]] = None,
         pip_cfg: Optional[Dict[str, Any]] = None,
@@ -352,6 +376,7 @@ class JobManager:
                         export_dir=export_dir,
                         with_captions=with_captions,
                         template=template or selection.get("template") or "vertical_blur",
+                        caption_theme=caption_theme,
                         width=width,
                         height=height,
                         fps=fps,

@@ -50,6 +50,8 @@ def build_metadata(
     with_captions: bool,
     segments: Optional[Iterable[SubtitleSegment]] = None,
     ai_metadata: Optional[Dict[str, Any]] = None,
+    caption_theme: Optional[str] = None,
+    render_template: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build export metadata dictionary.
 
@@ -82,7 +84,8 @@ def build_metadata(
     if not caption:
         caption = hook
 
-    if template.startswith("vertical"):
+    effective_template = str(render_template or template or "")
+    if effective_template.startswith("vertical"):
         if "#vertical" not in hashtags:
             hashtags.append("#vertical")
 
@@ -91,7 +94,10 @@ def build_metadata(
         "caption": caption,
         "hashtags": hashtags,
         "template": template,
+        "layout_preset": template,
+        "render_template": effective_template or template,
         "with_captions": with_captions,
+        "caption_theme": caption_theme or None,
         "selection": {
             "id": selection.get("id"),
             "start_s": selection.get("start_s"),
@@ -99,6 +105,7 @@ def build_metadata(
             "candidate_rank": selection.get("candidate_rank"),
             "candidate_score": selection.get("candidate_score"),
             "candidate_peak_time_s": selection.get("candidate_peak_time_s"),
+            "variant_id": selection.get("variant_id"),
         },
         "platform_hints": {
             "shorts_max_seconds": 60,
