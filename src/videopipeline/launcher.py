@@ -448,20 +448,67 @@ def _clear_runtime() -> None:
             pass
 
 
+def _windows_ffmpeg_path_candidates() -> list[Path]:
+    """Return best-effort Windows ffmpeg directories for PATH hydration."""
+    if os.name != "nt":
+        return []
+
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(path: Path) -> None:
+        normalized = str(path).strip().rstrip('\\/')
+        if not normalized:
+            return
+        key = normalized.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(Path(normalized))
+
+    raw = os.environ.get("FFMPEG_SHARED_BIN", "")
+    if raw:
+        for entry in raw.split(os.pathsep):
+            entry = entry.strip().strip('"')
+            if entry:
+                _add(Path(entry))
+
+    _add(Path(r"C:\Tools\ffmpeg-shared\bin"))
+
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        winget_root = (
+            Path(local_app_data)
+            / "Microsoft"
+            / "WinGet"
+            / "Packages"
+            / "yt-dlp.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
+        )
+        if winget_root.exists():
+            versioned_bins = sorted(winget_root.glob("**/bin"), reverse=True)
+            for path in versioned_bins:
+                _add(path)
+
+    return candidates
+
+
 def _maybe_add_ffmpeg_to_path() -> None:
     """
-    Add bundled ffmpeg to PATH if present.
+    Add bundled or well-known ffmpeg locations to PATH if present.
 
-    If ffmpeg.exe/ffprobe.exe are placed next to the .exe (or in ./ffmpeg/),
-    add that directory to PATH at runtime so ffmpeg lookup works.
+    This keeps yt-dlp merge/download flows working even when the process was
+    launched without the user's normal Windows PATH hydrated.
     """
     base = _exe_dir()
     candidates = [base, base / "ffmpeg"]
+    if os.name == "nt":
+        candidates.extend(_windows_ffmpeg_path_candidates())
     for c in candidates:
         ffmpeg_exe = c / "ffmpeg.exe" if os.name == "nt" else c / "ffmpeg"
         ffprobe_exe = c / "ffprobe.exe" if os.name == "nt" else c / "ffprobe"
         if ffmpeg_exe.exists() and ffprobe_exe.exists():
-            os.environ["PATH"] = str(c) + os.pathsep + os.environ.get("PATH", "")
+            current = os.environ.get("PATH", "")
+            os.environ["PATH"] = str(c) + (os.pathsep + current if current else "")
             return
 
 

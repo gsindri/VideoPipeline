@@ -1,5 +1,7 @@
 import json
 import logging
+import os
+import types
 
 from videopipeline import launcher
 
@@ -164,3 +166,61 @@ def test_await_running_instance_or_startup_slot_reuses_pending_start(monkeypatch
     assert lock_path is None
     assert existing == "http://127.0.0.1:57820"
     assert sleep_calls["count"] == 2
+
+
+def test_windows_ffmpeg_path_candidates_include_winget_bin(monkeypatch, tmp_path):
+    fake_env = {"LOCALAPPDATA": str(tmp_path), "PATH": "existing-bin"}
+    fake_os = types.SimpleNamespace(
+        name="nt",
+        environ=fake_env,
+        getenv=lambda key, default=None: fake_env.get(key, default),
+        pathsep=os.pathsep,
+    )
+    monkeypatch.setattr(launcher, "os", fake_os)
+
+    winget_bin = (
+        tmp_path
+        / "Microsoft"
+        / "WinGet"
+        / "Packages"
+        / "yt-dlp.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
+        / "ffmpeg-test"
+        / "bin"
+    )
+    winget_bin.mkdir(parents=True)
+
+    candidates = launcher._windows_ffmpeg_path_candidates()
+
+    assert winget_bin in candidates
+
+
+def test_maybe_add_ffmpeg_to_path_uses_windows_winget_install(monkeypatch, tmp_path):
+    fake_env = {"LOCALAPPDATA": str(tmp_path), "PATH": "existing-bin"}
+    fake_os = types.SimpleNamespace(
+        name="nt",
+        environ=fake_env,
+        getenv=lambda key, default=None: fake_env.get(key, default),
+        pathsep=os.pathsep,
+    )
+    monkeypatch.setattr(launcher, "os", fake_os)
+
+    base = tmp_path / "repo-root"
+    base.mkdir()
+    monkeypatch.setattr(launcher, "_exe_dir", lambda: base)
+
+    winget_bin = (
+        tmp_path
+        / "Microsoft"
+        / "WinGet"
+        / "Packages"
+        / "yt-dlp.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
+        / "ffmpeg-test"
+        / "bin"
+    )
+    winget_bin.mkdir(parents=True)
+    (winget_bin / "ffmpeg.exe").write_text("", encoding="utf-8")
+    (winget_bin / "ffprobe.exe").write_text("", encoding="utf-8")
+
+    launcher._maybe_add_ffmpeg_to_path()
+
+    assert launcher.os.environ["PATH"].startswith(str(winget_bin) + launcher.os.pathsep)

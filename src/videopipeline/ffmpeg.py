@@ -45,6 +45,18 @@ def _windows_cmd_fallback_path(cmd: str) -> str | None:
     # Common install location used by this repo setup scripts.
     candidates.append(Path(r"C:\Tools\ffmpeg-shared\bin"))
 
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        winget_root = (
+            Path(local_app_data)
+            / "Microsoft"
+            / "WinGet"
+            / "Packages"
+            / "yt-dlp.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
+        )
+        if winget_root.exists():
+            candidates.extend(sorted(winget_root.glob("**/bin"), reverse=True))
+
     for directory in candidates:
         exe = directory / exe_name
         if exe.exists():
