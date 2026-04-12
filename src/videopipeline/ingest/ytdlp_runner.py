@@ -22,7 +22,7 @@ from .models import (
     SiteType,
     SpeedMode,
 )
-from .policy import classify_url_heuristic, get_format_selector, get_policy, probe_url
+from .policy import classify_url_heuristic, get_format_selectors, get_policy, probe_url
 from .postprocess import postprocess_download
 from .tuner import (
     calculate_backoff_n,
@@ -73,6 +73,24 @@ def _sanitize_filename(name: str, max_length: int = 100) -> str:
         name = name[:max_length].strip()
 
     return name or "video"
+
+
+def _cleanup_retry_artifacts(output_dir: Path, partial_files: list[Path]) -> None:
+    """Clean up retry leftovers before a follow-up download attempt."""
+    for pf in partial_files:
+        try:
+            if pf.exists():
+                pf.unlink()
+        except Exception:
+            pass
+    partial_files.clear()
+
+    for pattern in ("*.part*", "*.ytdl"):
+        for retry_file in output_dir.glob(pattern):
+            try:
+                retry_file.unlink()
+            except Exception:
+                pass
 
 
 def download_url(
@@ -138,6 +156,8 @@ def download_url(
     max_attempts = 3
     last_error: Optional[Exception] = None
     info: Optional[dict[str, Any]] = None
+    format_selectors = get_format_selectors(request.quality_cap.value, site_type)
+    format_index = 0
 
     # Progress tracking
     download_progress = {"phase": "init", "last_percent": 0.0, "cancelled": False}
@@ -214,6 +234,8 @@ def download_url(
 
     # Step 3: Download with retry loop
     for attempt in range(max_attempts):
+        current_format = format_selectors[format_index]
+
         # Build yt-dlp options
         ydl_opts: dict[str, Any] = {
             "outtmpl": str(output_dir / "%(title).100s [%(id)s].%(ext)s"),
@@ -243,7 +265,7 @@ def download_url(
             ydl_opts["concurrent_fragment_downloads"] = current_n
 
         # Format selection based on quality cap
-        ydl_opts["format"] = get_format_selector(request.quality_cap.value)
+        ydl_opts["format"] = current_format
         ydl_opts["merge_output_format"] = "mp4"
 
         # Status message
@@ -254,7 +276,10 @@ def download_url(
                     badge += f" — Auto concurrency {current_n}"
                 on_progress(0.02, badge)
             else:
-                on_progress(0.02, f"Retrying with N={current_n}...")
+                retry_msg = f"Retrying with N={current_n}..."
+                if format_index > 0 and site_type == SiteType.YOUTUBE:
+                    retry_msg = "Retrying with YouTube progressive MP4 fallback..."
+                on_progress(0.02, retry_msg)
 
         try:
             with YoutubeDL(ydl_opts) as ydl:
@@ -271,30 +296,25 @@ def download_url(
 
             # Check for cancellation (yt-dlp wraps our exception)
             if download_progress.get("cancelled") or "cancelled" in str(e).lower():
-                # Clean up partial files
-                for pf in partial_files:
-                    try:
-                        if pf.exists():
-                            pf.unlink()
-                    except Exception:
-                        pass
-                # Also clean up any .part files in output_dir
-                for part_file in output_dir.glob("*.part*"):
-                    try:
-                        part_file.unlink()
-                    except Exception:
-                        pass
-                for ytdl_file in output_dir.glob("*.ytdl"):
-                    try:
-                        ytdl_file.unlink()
-                    except Exception:
-                        pass
+                _cleanup_retry_artifacts(output_dir, partial_files)
                 raise DownloadCancelled("Download cancelled by user")
+
+            if (
+                site_type == SiteType.YOUTUBE
+                and format_index < len(format_selectors) - 1
+                and looks_like_throttle(e)
+            ):
+                format_index += 1
+                _cleanup_retry_artifacts(output_dir, partial_files)
+                if on_progress:
+                    on_progress(0.02, "YouTube media fetch failed, retrying with progressive MP4 fallback...")
+                continue
 
             # Check for throttling
             if looks_like_throttle(e) and current_n > min_n:
                 old_n = current_n
                 current_n = calculate_backoff_n(current_n, min_n)
+                _cleanup_retry_artifacts(output_dir, partial_files)
 
                 if request.speed_mode == SpeedMode.AUTO:
                     update_domain_tuning(domain, current_n, "throttled")

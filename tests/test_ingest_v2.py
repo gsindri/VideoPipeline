@@ -18,6 +18,7 @@ from videopipeline.ingest.models import (
 from videopipeline.ingest.policy import (
     classify_url_heuristic,
     get_format_selector,
+    get_format_selectors,
     get_policy,
 )
 from videopipeline.ingest.postprocess import (
@@ -108,6 +109,17 @@ class TestGetFormatSelector:
         selector = get_format_selector("source")
         assert "bestvideo" in selector
         assert "bestaudio" in selector
+
+    def test_youtube_source_adds_progressive_fallback(self):
+        """YouTube source quality retries with a progressive MP4 fallback."""
+        selectors = get_format_selectors("source", SiteType.YOUTUBE)
+        assert selectors[0] == get_format_selector("source")
+        assert selectors[1] == "best[ext=mp4]/best"
+
+    def test_twitch_source_keeps_primary_selector_only(self):
+        """Twitch keeps the existing primary selector without a format fallback."""
+        selectors = get_format_selectors("source", SiteType.TWITCH_VOD)
+        assert selectors == [get_format_selector("source")]
 
     def test_1080p_quality(self):
         """1080p quality caps at 1080."""

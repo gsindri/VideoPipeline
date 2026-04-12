@@ -138,3 +138,28 @@ def get_format_selector(quality_cap: str) -> str:
         f"best[height<={height}]/"
         "best"
     )
+
+
+def get_format_selectors(quality_cap: str, site_type: SiteType = SiteType.GENERIC) -> list[str]:
+    """Get yt-dlp format selectors in retry order for a site/quality pair.
+
+    YouTube can reject separate DASH media fetches with 403 even when a progressive
+    MP4 remains downloadable. Keep the high-quality selector first, then allow a
+    progressive retry for YouTube only.
+    """
+    primary = get_format_selector(quality_cap)
+    selectors = [primary]
+
+    if site_type != SiteType.YOUTUBE:
+        return selectors
+
+    if quality_cap == "source":
+        progressive = "best[ext=mp4]/best"
+    else:
+        height = int(quality_cap)
+        progressive = f"best[height<={height}][ext=mp4]/best[height<={height}]/best[ext=mp4]/best"
+
+    if progressive not in selectors:
+        selectors.append(progressive)
+
+    return selectors

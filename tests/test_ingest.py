@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import ModuleType, SimpleNamespace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -183,7 +184,10 @@ class TestMockDownload:
         mock_ydl_instance.__enter__ = MagicMock(return_value=mock_ydl_instance)
         mock_ydl_instance.__exit__ = MagicMock(return_value=False)
 
-        with patch('yt_dlp.YoutubeDL', mock_ydl_class):
+        fake_yt_dlp = ModuleType('yt_dlp')
+        fake_yt_dlp.YoutubeDL = mock_ydl_class
+
+        with patch.dict('sys.modules', {'yt_dlp': fake_yt_dlp}):
             result = download_url(
                 'https://youtube.com/watch?v=abc123',
                 request=IngestRequest(url='https://youtube.com/watch?v=abc123', create_preview=False),
@@ -194,6 +198,103 @@ class TestMockDownload:
         assert result.video_id == 'abc123'
         assert result.extractor == 'youtube'
         assert result.duration_seconds == 120
+
+    def test_youtube_403_retries_with_progressive_fallback(self, tmp_path: Path):
+        """YouTube 403 retries with the progressive fallback selector."""
+        from videopipeline.ingest.models import SiteType
+        from videopipeline.ingest.policy import get_format_selectors
+        from videopipeline.ingest.ytdlp_runner import IngestRequest, download_url
+
+        output_file = tmp_path / 'Test Video [abc123].mp4'
+        output_file.write_bytes(b'fake video content')
+        seen_formats: list[str] = []
+
+        class FakeYDL:
+            def __init__(self, opts):
+                self.opts = opts
+                seen_formats.append(opts['format'])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def extract_info(self, url, download=True):
+                if len(seen_formats) == 1:
+                    raise Exception('HTTP Error 403: Forbidden')
+                return {
+                    'id': 'abc123',
+                    'title': 'Test Video',
+                    'extractor': 'youtube',
+                    'duration': 120,
+                }
+
+        fake_yt_dlp = ModuleType('yt_dlp')
+        fake_yt_dlp.YoutubeDL = lambda opts: FakeYDL(opts)
+
+        with patch.dict('sys.modules', {'yt_dlp': fake_yt_dlp}):
+            result = download_url(
+                'https://youtube.com/watch?v=abc123',
+                request=IngestRequest(url='https://youtube.com/watch?v=abc123', create_preview=False),
+                output_dir=tmp_path,
+            )
+
+        assert seen_formats == get_format_selectors('source', SiteType.YOUTUBE)
+        assert result.extractor == 'youtube'
+        assert result.video_id == 'abc123'
+
+    def test_twitch_403_backs_off_without_format_fallback(self, tmp_path: Path):
+        """Twitch keeps the same format and backs off concurrency on 403."""
+        from videopipeline.ingest.models import SiteType
+        from videopipeline.ingest.policy import get_format_selectors
+        from videopipeline.ingest.ytdlp_runner import IngestRequest, download_url
+
+        output_file = tmp_path / 'Test Video [abc123].mp4'
+        output_file.write_bytes(b'fake video content')
+        attempts: list[tuple[str, int]] = []
+
+        class FakeYDL:
+            def __init__(self, opts):
+                self.opts = opts
+                attempts.append((opts['format'], int(opts.get('concurrent_fragment_downloads', 1))))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def extract_info(self, url, download=True):
+                if len(attempts) == 1:
+                    raise Exception('HTTP Error 403: Forbidden')
+                return {
+                    'id': 'abc123',
+                    'title': 'Test Video',
+                    'extractor': 'twitch',
+                    'duration': 120,
+                }
+
+        fake_yt_dlp = ModuleType('yt_dlp')
+        fake_yt_dlp.YoutubeDL = lambda opts: FakeYDL(opts)
+
+        with (
+            patch.dict('sys.modules', {'yt_dlp': fake_yt_dlp}),
+            patch(
+                'videopipeline.ingest.ytdlp_runner.get_domain_tuning',
+                return_value=SimpleNamespace(N=8, min_N=2),
+            ),
+            patch('videopipeline.ingest.ytdlp_runner.update_domain_tuning'),
+        ):
+            result = download_url(
+                'https://www.twitch.tv/videos/123456',
+                request=IngestRequest(url='https://www.twitch.tv/videos/123456', create_preview=False),
+                output_dir=tmp_path,
+            )
+
+        expected_format = get_format_selectors('source', SiteType.TWITCH_VOD)[0]
+        assert attempts == [(expected_format, 8), (expected_format, 4)]
+        assert result.extractor == 'twitch'
 
 
 class TestProgressCallbacks:
@@ -219,7 +320,10 @@ class TestProgressCallbacks:
         mock_ydl_instance.__enter__ = MagicMock(return_value=mock_ydl_instance)
         mock_ydl_instance.__exit__ = MagicMock(return_value=False)
 
-        with patch('yt_dlp.YoutubeDL', return_value=mock_ydl_instance):
+        fake_yt_dlp = ModuleType('yt_dlp')
+        fake_yt_dlp.YoutubeDL = lambda opts: mock_ydl_instance
+
+        with patch.dict('sys.modules', {'yt_dlp': fake_yt_dlp}):
             download_url(
                 'https://example.com',
                 request=IngestRequest(url='https://example.com', create_preview=False),

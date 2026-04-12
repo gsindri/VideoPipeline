@@ -24,6 +24,7 @@ from .models import (
 from .policy import (
     classify_url_heuristic,
     get_format_selector,
+    get_format_selectors,
     get_policy,
     probe_url,
 )
@@ -67,6 +68,7 @@ __all__ = [
     # Policy
     "classify_url_heuristic",
     "get_format_selector",
+    "get_format_selectors",
     "get_policy",
     # Postprocess
     "create_preview",
