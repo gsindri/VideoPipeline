@@ -1,4 +1,9 @@
-from videopipeline.exporter import LayoutPipSpec, filtergraph_for_template, layout_preset_to_template, normalize_layout_preset
+from videopipeline.exporter import (
+    LayoutPipSpec,
+    filtergraph_for_template,
+    layout_preset_to_template,
+    normalize_layout_preset,
+)
 from videopipeline.layouts import RectNorm
 
 

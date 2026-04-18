@@ -473,8 +473,6 @@ def _windows_ffmpeg_path_candidates() -> list[Path]:
             if entry:
                 _add(Path(entry))
 
-    _add(Path(r"C:\Tools\ffmpeg-shared\bin"))
-
     local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
     if local_app_data:
         winget_root = (
@@ -488,6 +486,8 @@ def _windows_ffmpeg_path_candidates() -> list[Path]:
             versioned_bins = sorted(winget_root.glob("**/bin"), reverse=True)
             for path in versioned_bins:
                 _add(path)
+
+    _add(Path(r"C:\Tools\ffmpeg-shared\bin"))
 
     return candidates
 

@@ -3116,6 +3116,70 @@ ai:
     assert any("raw selections" in issue for issue in detail["issues"])
 
 
+def test_actions_export_batch_top_candidates_uses_resolved_export_defaults(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, token="secret")
+    hdr = {"Authorization": "Bearer secret"}
+
+    from videopipeline.studio.jobs import JOB_MANAGER
+    from videopipeline.subtitles import DEFAULT_CAPTION_THEME
+
+    pid = hashlib.sha256("twitch_export_batch_defaults".encode("utf-8")).hexdigest()
+    proj_dir = tmp_path / "outputs" / "projects" / pid
+    (proj_dir / "video").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "exports").mkdir(parents=True, exist_ok=True)
+    video_path = proj_dir / "video" / "video.mp4"
+    video_path.write_bytes(b"")
+
+    project_json = {
+        "project_id": pid,
+        "created_at": "now",
+        "video": {"path": str(video_path), "duration_seconds": 60.0},
+        "analysis": {
+            "highlights": {
+                "candidates": [
+                    {"rank": 1, "candidate_id": "cid1", "score": 1.0, "start_s": 10.0, "end_s": 20.0, "title": "clip title"},
+                ]
+            }
+        },
+        "layout": {},
+        "selections": [],
+        "exports": [],
+    }
+    (proj_dir / "project.json").write_text(json.dumps(project_json), encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    def fake_start_export(*, proj, selection, export_dir, **kwargs):
+        captured["selection"] = selection
+        captured["kwargs"] = kwargs
+        job = JOB_MANAGER.create("export")
+        JOB_MANAGER._set(job, status="succeeded", progress=1.0, message="done", result={"output": str(export_dir / "dummy.mp4")})
+        return job
+
+    monkeypatch.setattr(JOB_MANAGER, "start_export", fake_start_export)
+
+    r = client.post(
+        "/api/actions/export_batch",
+        headers=hdr,
+        json={
+            "project_id": pid,
+            "top": 1,
+            "llm_mode": "local",
+            "client_request_id": "export-batch-defaults-1",
+            "export": {"layout_preset": "speaker_broll"},
+        },
+    )
+    assert r.status_code == 200
+
+    job = _wait_for_terminal_job_state(r.json()["job_id"])
+    assert job is not None
+    assert job.status == "succeeded"
+    assert captured["selection"]["title"] == "clip title"
+    assert captured["kwargs"]["template"] == "speaker_broll"
+    assert captured["kwargs"]["caption_theme"] == DEFAULT_CAPTION_THEME
+
+
 @pytest.mark.parametrize("path", ["/api/actions/run_full_export_top", "/api/actions/run_full_export_top_unattended"])
 def test_actions_run_full_export_top_external_strict_requires_checkpoint(tmp_path, monkeypatch, path):
     client = _make_client(tmp_path, monkeypatch, token="secret")

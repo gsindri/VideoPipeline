@@ -7005,6 +7005,8 @@ def create_actions_router(
         hook_cfg = {**(profile.get("overlay", {}).get("hook_text", {}) or {}), **(body.get("hook_text") or {})}
         pip_cfg = {**(profile.get("layout", {}).get("pip", {}) or {}), **(body.get("pip") or {})}
         with_captions = bool(body.get("with_captions", cap_cfg.get("enabled", False)))
+        layout_preset = _resolve_export_layout_preset(export_cfg)
+        caption_theme = _resolve_export_caption_theme(export_cfg, cap_cfg)
 
         whisper_cfg = None
         if with_captions:
